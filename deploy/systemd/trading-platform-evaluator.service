@@ -18,8 +18,8 @@ Environment=GIT_CONFIG_VALUE_0=/opt/trading-bot
 Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/evaluation/numba-cache
 Environment=OMP_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2
-ExecStartPre=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process evaluation-runtime --validate
-ExecStart=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process evaluation-runtime
+ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process evaluation-runtime --validate
+ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process evaluation-runtime
 Restart=always
 RestartSec=5
 TimeoutStopSec=45

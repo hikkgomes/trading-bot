@@ -18,6 +18,7 @@ from src.data.database import (
 )
 from src.data.database import fill as fill_table
 from src.domain._codec import canonical_hash, timestamp
+from src.execution.stops import live_protected_instruments
 from src.portfolio.book_plans import allocate_book_fill
 from src.portfolio.books import load_book
 
@@ -559,6 +560,11 @@ def apply_internal_transfers(engine, connection, plan, positions):
     from src.domain.orders import Fill, OrderSide
 
     for index, transfer in enumerate(plan["internal_transfers"]):
+        source_book = load_book(engine, transfer["from_book"], connection=connection)
+        if transfer["instrument_id"] in live_protected_instruments(
+            engine, source_book["product_portfolio_id"], connection=connection
+        ):
+            raise ValueError("native protection ownership requires closing before book transfer")
         for key, side in (("from_book", OrderSide.SELL), ("to_book", OrderSide.BUY)):
             book = load_book(engine, transfer[key], connection=connection)
             identity = canonical_hash(

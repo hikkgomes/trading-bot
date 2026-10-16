@@ -69,3 +69,28 @@ def test_execution_identity_rejects_conflicting_or_incomplete_distribution_metad
     )
     with pytest.raises(RuntimeError, match="incomplete package metadata"):
         execution_identity.execution_engine_digest(root=root)
+
+
+def test_research_policy_identity_tracks_inference_without_binding_unrelated_services(
+    tmp_path, monkeypatch
+):
+    from src.config import PROJECT_ROOT
+    from src.research import policy_identity
+
+    for name in policy_identity.POLICY_SOURCES:
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((PROJECT_ROOT / name).read_bytes())
+    first = policy_identity.research_policy_engine_digest(root=tmp_path)
+    unrelated = tmp_path / "src/services/reporting.py"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("NEW_REPORT = True\n")
+    assert policy_identity.research_policy_engine_digest(root=tmp_path) == first
+    selection = tmp_path / "src/research/selection.py"
+    selection.write_text(selection.read_text() + "\nMETHOD_REVISION = 2\n")
+    assert policy_identity.research_policy_engine_digest(root=tmp_path) != first
+    selection.write_bytes((PROJECT_ROOT / "src/research/selection.py").read_bytes())
+    versions = {name: policy_identity.version(name) for name in policy_identity.POLICY_DEPENDENCIES}
+    versions["numpy"] += ".post1"
+    monkeypatch.setattr(policy_identity, "version", versions.__getitem__)
+    assert policy_identity.research_policy_engine_digest(root=tmp_path) != first

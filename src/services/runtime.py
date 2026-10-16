@@ -35,11 +35,14 @@ class ServiceRuntime:
         node_id: str,
         service_name: str,
         heartbeat_store: DatabaseHeartbeatStore,
+        heartbeat_interval_seconds: float = 0,
     ) -> None:
         self.config = config
         self.node = config.assert_service_assignment(node_id=node_id, service=service_name)
         self.service_name = service_name
         self.heartbeat_store = heartbeat_store
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.last_health: ServiceHealth | None = None
 
     @property
     def can_submit_orders(self) -> bool:
@@ -56,12 +59,15 @@ class ServiceRuntime:
             )
 
     def run_once(self, work: Work, *, observed_at: str | None = None) -> ServiceCycle:
-        observed_at = observed_at or utc_now()
         try:
             result = work()
             detail = dict(result or {})
             detail.setdefault("reason_code", "cycle_completed")
-            healthy = True
+            healthy = not bool(
+                detail.get("error_type")
+                or detail.get("error")
+                or str(detail["reason_code"]).endswith("_failed")
+            )
         except Exception as exc:
             detail = {
                 "reason_code": "service_cycle_failed",
@@ -69,7 +75,8 @@ class ServiceRuntime:
                 "error": str(exc),
             }
             healthy = False
-        self.heartbeat_store.record(
+        observed_at = observed_at or utc_now()
+        self._record_health(
             service_name=self.service_name,
             node_id=self.node.node_id,
             observed_at=observed_at,
@@ -82,6 +89,18 @@ class ServiceRuntime:
             healthy=healthy,
             observed_at=observed_at,
             detail=detail,
+        )
+
+    def _record_health(self, *, observed_at, healthy, **fields):
+        if self.last_health is not None and self.last_health.healthy == healthy:
+            elapsed = (
+                dt.datetime.fromisoformat(observed_at)
+                - dt.datetime.fromisoformat(self.last_health.observed_at)
+            ).total_seconds()
+            if 0 <= elapsed < self.heartbeat_interval_seconds:
+                return
+        self.last_health = self.heartbeat_store.record(
+            observed_at=observed_at, healthy=healthy, **fields
         )
 
     def heartbeat(

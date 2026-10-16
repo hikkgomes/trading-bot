@@ -35,7 +35,7 @@ from src.data.database import (
     holdout_claim,
     holdout_outcome,
     job,
-    job_attempt,
+    market_input_sources,
     nav_snapshot,
     platform_schedule,
     position,
@@ -62,9 +62,9 @@ from src.data.database import (
 )
 from src.domain._codec import timestamp, to_primitive
 from src.observability.decision_trace import SqlDecisionTraceStore
+from src.observability.queue_progress import active_candidate_jobs, queue_progress
 from src.observability.research_progress import (
     current_stages,
-    eligible_work,
     epoch_progress,
     measured_progress,
 )
@@ -188,8 +188,6 @@ class DatabasePlatformReport:
     ) -> dict[str, Any]:
         stages = current_stages(research["validation_stages"], self._rows(evidence_invalidation))
         identities = list(research["strategy_identities"])
-        jobs = self._rows(job)
-        attempts = self._rows(job_attempt)
         schedules = self._rows(platform_schedule)
         rejection_by_stage: dict[str, int] = {}
         rejection_reasons: dict[str, int] = {}
@@ -227,16 +225,7 @@ class DatabasePlatformReport:
             bundles=research["dataset_bundles"],
             snapshots=self._rows(dataset_snapshot),
         )
-        scheduled_jobs = [row for row in jobs if str(row.get("id") or "").startswith("scheduled:")]
-        started_job_ids = {str(row.get("job_id")) for row in attempts}
-        scheduled_by_schedule = _scheduled_job_progress(scheduled_jobs, started_job_ids)
-        candidate_job_ids = {
-            str(row.get("payload", {}).get("candidate_id"))
-            for row in jobs
-            if isinstance(row.get("payload"), dict)
-            and row.get("payload", {}).get("candidate_id") is not None
-            and row.get("state") in {"pending", "running"}
-        }
+        candidate_job_ids = active_candidate_jobs(self.engine)
         candidates_without_job_or_reason = _candidates_without_job_or_reason(
             experiments,
             candidate_job_ids=candidate_job_ids,
@@ -267,8 +256,8 @@ class DatabasePlatformReport:
             if isinstance(row.get("metadata"), dict)
         )
         return {
-            **measured_progress(self._rows(experiment_run), attempts),
-            **eligible_work(jobs, now=now),
+            **measured_progress(self._rows(experiment_run), ()),
+            **queue_progress(self.engine, now=now),
             **epoch_progress(self._rows(research_epoch), self._rows(research_round)),
             "theses_generated": self._count(research_thesis),
             "candidates_generated": len(experiments),
@@ -302,35 +291,12 @@ class DatabasePlatformReport:
                 _promotion_advanced(row.get("payload")) for row in research["promotion_events"]
             ),
             "first_blocked_stage": first_blocked,
-            "jobs_waiting": sum(row.get("state") == "pending" for row in jobs),
-            "jobs_running": sum(row.get("state") == "running" for row in jobs),
-            "jobs_completed": sum(row.get("state") == "completed" for row in jobs),
-            "jobs_dead_letter": sum(row.get("state") == "dead_letter" for row in jobs),
-            "jobs_failed_attempts": sum(
-                row.get("status") in {"failed", "expired"} for row in attempts
-            ),
-            "jobs_terminal_failures": [
-                {
-                    "job_id": row.get("id"),
-                    "name": row.get("name"),
-                    "attempts": row.get("attempts"),
-                    "terminal_reason": row.get("terminal_reason"),
-                }
-                for row in jobs
-                if row.get("state") == "dead_letter"
-            ],
             "candidates_never_evaluated": sorted(
                 str(row["id"]) for row in experiments if str(row["id"]) not in evaluated_ids
             ),
             "candidate_age_by_state": candidate_ages,
             "missing_stage_dataset_count": sum(missing_stage_datasets.values()),
             "missing_stage_datasets": missing_stage_datasets,
-            "scheduled_versus_started_jobs": {
-                "scheduled": len(scheduled_jobs),
-                "started": len(started_job_ids & {str(row["id"]) for row in scheduled_jobs}),
-                "not_started": len({str(row["id"]) for row in scheduled_jobs} - started_job_ids),
-                "by_schedule": scheduled_by_schedule,
-            },
             "schedule_states": {str(row["job_name"]): str(row["state"]) for row in schedules},
             "candidates_without_job_or_reason": candidates_without_job_or_reason,
         }
@@ -470,7 +436,16 @@ class DatabasePlatformReport:
                 detail = trace.stages[trace.first_blocked_stage]
                 key = f"{trace.first_blocked_stage}:{detail.get('reason_code', 'unknown')}"
                 blocked[key] = blocked.get(key, 0) + 1
-        jobs = self._rows(job, order_by=job.c.available_at)
+        with self.engine.connect() as connection:
+            jobs = [
+                to_primitive(dict(row))
+                for row in connection.execute(
+                    select(job)
+                    .where(job.c.state.in_(("pending", "running", "dead_letter")))
+                    .order_by(job.c.available_at)
+                    .limit(1000)
+                ).mappings()
+            ]
         account_authority = self._stale_account_authority(now)
         market_data = self._stale_market_data(now)
         missing_risk_data = self._missing_risk_data()
@@ -480,6 +455,8 @@ class DatabasePlatformReport:
         )
         operations = {
             "job_queue": jobs,
+            "job_queue_detail_limit": 1000,
+            "queue_progress": queue_progress(self.engine, now=now),
             "workers": self._rows(worker, order_by=worker.c.last_heartbeat.desc()),
             "heartbeats": [
                 heartbeat.__dict__ for heartbeat in DatabaseHeartbeatStore(self.engine).latest()
@@ -535,7 +512,7 @@ class DatabasePlatformReport:
         }
 
     def _stale_market_data(self, now: str) -> dict[str, Any]:
-        rows = self._rows(risk_snapshot, order_by=risk_snapshot.c.created_at.desc())
+        rows = self._latest_risk_rows("market_data_input", per_instrument=True)
         latest: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
             raw_payload = row.get("payload")
@@ -599,7 +576,7 @@ class DatabasePlatformReport:
     def _missing_risk_data(self) -> dict[str, Any]:
         missing: list[dict[str, Any]] = []
         latest: dict[str, dict[str, Any]] = {}
-        for row in self._rows(risk_snapshot, order_by=risk_snapshot.c.created_at.desc()):
+        for row in self._latest_risk_rows("canonical_portfolio_risk_state"):
             payload = row.get("payload")
             if not isinstance(payload, Mapping):
                 continue
@@ -624,6 +601,35 @@ class DatabasePlatformReport:
                     }
                 )
         return {"count": len(missing), "snapshots": missing}
+
+    def _latest_risk_rows(self, kind, *, per_instrument=False):
+        source = market_input_sources if kind == "market_data_input" else risk_snapshot
+        groups = [source.c.payload["product_id"].as_string()]
+        if per_instrument:
+            groups.append(source.c.payload["instrument_id"].as_string())
+        ranked = (
+            select(
+                source.c.id,
+                func.row_number()
+                .over(
+                    partition_by=groups,
+                    order_by=(source.c.created_at.desc(), source.c.id.desc()),
+                )
+                .label("recency"),
+            )
+            .where(source.c.payload["kind"].as_string() == kind)
+            .subquery()
+        )
+        with self.engine.connect() as connection:
+            return (
+                connection.execute(
+                    select(source)
+                    .join(ranked, ranked.c.id == source.c.id)
+                    .where(ranked.c.recency == 1)
+                )
+                .mappings()
+                .all()
+            )
 
     def _count(self, table) -> int:
         with self.engine.connect() as connection:
@@ -758,20 +764,6 @@ def _missing_stage_datasets(
         if not values or any(item is None or str(item) not in snapshot_ids for item in values):
             missing[role] = missing.get(role, 0) + 1
     return dict(sorted(missing.items()))
-
-
-def _scheduled_job_progress(
-    rows: list[dict[str, Any]], started_job_ids: set[str]
-) -> dict[str, dict[str, int]]:
-    progress: dict[str, dict[str, int]] = {}
-    for row in rows:
-        parts = str(row.get("id") or "").split(":", 2)
-        schedule = parts[1] if len(parts) > 1 else "unknown"
-        values = progress.setdefault(schedule, {"scheduled": 0, "started": 0})
-        values["scheduled"] += 1
-        if str(row["id"]) in started_job_ids:
-            values["started"] += 1
-    return dict(sorted(progress.items()))
 
 
 def _candidates_without_job_or_reason(

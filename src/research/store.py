@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
-from sqlalchemy import column, insert, select, table, update
+from sqlalchemy import column, func, insert, or_, select, table, text, update
 from sqlalchemy.engine import Connection, Engine
 
 from src.data.database import (
     experiment,
     experiment_metric,
     experiment_run,
+    research_epoch,
     strategy_definition,
     strategy_identity,
     strategy_version,
@@ -22,7 +25,12 @@ from src.data.database import (
 from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
 from src.domain.strategies import StrategyDefinition, StrategySourceType
-from src.research.coordinator import Candidate, CandidateState, ResearchResult
+from src.research.coordinator import (
+    Candidate,
+    CandidateState,
+    ResearchResult,
+    TrialCapacityError,
+)
 from src.research.datasets import CandidateDatasetPlan
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.rounds import assert_epoch_open, lock_epoch
@@ -62,10 +70,221 @@ def _definition_from_dict(payload: dict[str, object]) -> StrategyDefinition:
 
 
 class SqlResearchStore:
-    def __init__(self, engine: Engine, *, connection: Connection | None = None):
+    DAILY_TRIAL_BUDGET = 100
+    EPOCH_TRIAL_BUDGET = 100
+    CATALOGUE_EPOCH_SHARE = 0.8
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        connection: Connection | None = None,
+        daily_trial_budget: int = DAILY_TRIAL_BUDGET,
+        epoch_trial_budget: int = EPOCH_TRIAL_BUDGET,
+    ):
         self.engine = engine
         self.connection = connection
+        self.daily_trial_budget = daily_trial_budget
+        self.epoch_trial_budget = epoch_trial_budget
         self.candidates = _ADAPTIVE_CANDIDATE if engine.dialect.name == "postgresql" else experiment
+
+    def register_candidate(self, candidate: Candidate, *, producer: str) -> None:
+        """Reserve one unique trial and persist its candidate in one transaction."""
+        from src.research.theses import SqlThesisRegistry
+
+        day = candidate.submitted_at[:10]
+        with connection_scope(self.engine, self.connection, write=True) as connection:
+            lock_epoch(connection, candidate.definition.product)
+            self._lock_daily_capacity(connection, day)
+            if self._existing_candidate_matches(connection, candidate):
+                return
+            epoch = self._ensure_epoch(connection, candidate)
+            is_catalogue = producer == "catalogue" or producer.startswith(
+                "registered_strategy_catalogue"
+            )
+            self._assert_epoch_capacity(connection, epoch, candidate, is_catalogue)
+            self._assert_daily_capacity(connection, day)
+            SqlThesisRegistry(self.engine, connection=connection).claim_trial(
+                thesis_id=candidate.thesis_id,
+                candidate_id=candidate.candidate_id,
+                lineage_id=candidate.lineage_id,
+                claimed_at=candidate.submitted_at,
+            )
+            self._record_epoch_reservation(connection, epoch, candidate, is_catalogue)
+            stored_candidate = candidate
+            if is_catalogue:
+                stored_candidate = replace(
+                    candidate,
+                    metadata={**dict(candidate.metadata), "_research_producer": "catalogue"},
+                )
+            SqlResearchStore(self.engine, connection=connection).save_candidate(stored_candidate)
+
+    def _lock_daily_capacity(self, connection: Connection, day: str) -> None:
+        if self.engine.dialect.name == "postgresql":
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+                {"scope": f"research-trial-budget:{day}"},
+            )
+
+    def _assert_epoch_capacity(self, connection, epoch, candidate, is_catalogue) -> None:
+        if epoch is not None:
+            from src.research.rounds import EpochState
+
+            if epoch["state"] in {
+                EpochState.CLOSED_FOR_SELECTION.value,
+                EpochState.EXHAUSTED.value,
+            }:
+                raise TrialCapacityError("research epoch is closed to new candidates")
+            if epoch["consumed"] >= epoch["budget"]:
+                raise TrialCapacityError("research epoch trial budget is exhausted")
+            used = self._catalogue_consumed(connection, epoch, candidate)
+            budget = epoch["budget"]
+        else:
+            total, used = self._unbundled_usage(connection, candidate)
+            budget = self.epoch_trial_budget
+            if total >= budget:
+                raise TrialCapacityError("research epoch trial budget is exhausted")
+        if is_catalogue and used >= int(budget * self.CATALOGUE_EPOCH_SHARE):
+            raise TrialCapacityError("catalogue allocation reached its 80% epoch limit")
+
+    def _unbundled_usage(self, connection: Connection, candidate: Candidate) -> tuple[int, int]:
+        source = self.candidates.join(
+            strategy_version,
+            self.candidates.c.strategy_version_id == strategy_version.c.id,
+        ).join(
+            strategy_definition,
+            strategy_version.c.definition_id == strategy_definition.c.id,
+        )
+        scope = (
+            self.candidates.c.dataset_bundle_id.is_(None),
+            self.candidates.c.dataset_snapshot_hashes == list(candidate.dataset_snapshot_hashes),
+            strategy_definition.c.product_id == candidate.definition.product,
+        )
+        counts = connection.execute(
+            select(
+                func.count().label("total"),
+                func.count()
+                .filter(
+                    or_(
+                        self.candidates.c.provider == "registered_strategy_catalogue",
+                        self.candidates.c.metadata["_research_producer"].as_string() == "catalogue",
+                    )
+                )
+                .label("catalogue"),
+            )
+            .select_from(source)
+            .where(*scope)
+        ).one()
+        return int(counts.total), int(counts.catalogue)
+
+    def _catalogue_consumed(self, connection, epoch, candidate) -> int:
+        payload = dict(epoch["payload"] or {})
+        used = payload.get("catalogue_consumed")
+        if used is not None:
+            return int(used)
+        return int(
+            connection.execute(
+                select(func.count())
+                .select_from(self.candidates)
+                .where(
+                    self.candidates.c.dataset_bundle_id == candidate.dataset_bundle_id,
+                    or_(
+                        self.candidates.c.provider == "registered_strategy_catalogue",
+                        self.candidates.c.metadata["_research_producer"].as_string() == "catalogue",
+                    ),
+                )
+            ).scalar_one()
+        )
+
+    def _assert_daily_capacity(self, connection: Connection, day: str) -> None:
+        tomorrow = (dt.date.fromisoformat(day) + dt.timedelta(days=1)).isoformat()
+        used = connection.execute(
+            select(func.count())
+            .select_from(thesis_trial)
+            .where(
+                thesis_trial.c.claimed_at >= f"{day}T00:00:00+00:00",
+                thesis_trial.c.claimed_at < f"{tomorrow}T00:00:00+00:00",
+            )
+        ).scalar_one()
+        if used >= self.daily_trial_budget:
+            raise TrialCapacityError("daily research trial budget is exhausted")
+
+    def _record_epoch_reservation(self, connection, epoch, candidate, is_catalogue) -> None:
+        if epoch is None:
+            return
+        payload = dict(epoch["payload"] or {})
+        if is_catalogue:
+            payload["catalogue_consumed"] = (
+                self._catalogue_consumed(connection, epoch, candidate) + 1
+            )
+        connection.execute(
+            update(research_epoch)
+            .where(research_epoch.c.id == epoch["id"])
+            .values(consumed=research_epoch.c.consumed + 1, payload=payload)
+        )
+
+    def _ensure_epoch(self, connection: Connection, candidate: Candidate) -> dict[str, Any] | None:
+        if candidate.dataset_bundle_id is None:
+            return None
+        statement = select(research_epoch).where(
+            research_epoch.c.dataset_bundle_id == candidate.dataset_bundle_id
+        )
+        if self.engine.dialect.name == "postgresql":
+            statement = statement.with_for_update()
+        row = connection.execute(statement).mappings().first()
+        if row is not None:
+            return dict(row)
+        existing = list(
+            connection.execute(
+                select(
+                    self.candidates.c.id,
+                    self.candidates.c.provider,
+                    self.candidates.c.metadata,
+                ).where(self.candidates.c.dataset_bundle_id == candidate.dataset_bundle_id)
+            ).mappings()
+        )
+        existing_ids = [str(item["id"]) for item in existing]
+        catalogue_count = sum(
+            item["provider"] == "registered_strategy_catalogue"
+            or (item["metadata"] or {}).get("_research_producer") == "catalogue"
+            for item in existing
+        )
+        previous = connection.execute(
+            select(research_epoch.c.payload)
+            .where(research_epoch.c.product_id == candidate.definition.product)
+            .order_by(research_epoch.c.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        previous = dict(previous or {})
+        catalogue_closed = bool(previous.get("catalogue_closed", False))
+        catalogue_cursor = 0 if catalogue_closed else int(previous.get("catalogue_cursor", 0))
+        identity = canonical_hash(
+            {
+                "product_id": candidate.definition.product,
+                "bundle_id": candidate.dataset_bundle_id,
+                "engine_version": ECONOMIC_ENGINE_VERSION,
+            }
+        )
+        epoch = {
+            "id": identity,
+            "product_id": candidate.definition.product,
+            "dataset_bundle_id": candidate.dataset_bundle_id,
+            "state": "active",
+            "round_cursor": 0,
+            "budget": max(self.epoch_trial_budget, len(existing_ids)),
+            "consumed": len(existing_ids),
+            "created_at": candidate.submitted_at,
+            "payload": {
+                "engine_version": ECONOMIC_ENGINE_VERSION,
+                "adopted_candidate_ids": existing_ids,
+                "catalogue_consumed": catalogue_count,
+                "catalogue_cursor": catalogue_cursor,
+                "catalogue_closed": False,
+                "last_completion": None,
+            },
+        }
+        connection.execute(insert(research_epoch).values(**epoch))
+        return epoch
 
     def save_candidate(self, candidate: Candidate) -> None:
         definition_id = candidate.definition.definition_hash
@@ -336,6 +555,7 @@ class SqlResearchStore:
         ).scalar_one()
         metadata = dict(row["metadata"] or {})
         raw_plan = metadata.pop("_dataset_plan", None)
+        metadata.pop("_research_producer", None)
         dataset_plan = CandidateDatasetPlan.from_payload(raw_plan) if raw_plan is not None else None
         return Candidate(
             definition=_definition_from_dict(definition_payload),

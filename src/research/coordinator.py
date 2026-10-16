@@ -22,6 +22,10 @@ class CandidateState(StrEnum):
     FORWARD_PAPER = "forward_paper"
 
 
+class TrialCapacityError(ValueError):
+    """The shared daily or epoch research trial capacity is exhausted."""
+
+
 def _sha256_identity(value: str, *, field: str) -> str:
     value = non_empty(value, field=field)
     if not value.startswith("sha256:") or len(value) != 71:
@@ -190,13 +194,18 @@ class ResearchCoordinator:
         self._queue = {item.candidate_id: item for item in candidates}
         self._results = {item.candidate_id: item for item in results}
 
-    def submit(self, candidate: Candidate) -> str:
+    def submit(self, candidate: Candidate, *, producer: str | None = None) -> str:
         candidate_id = candidate.candidate_id
         existing = self._queue.get(candidate_id)
         if existing is not None:
             # Retain the first registration's provenance for this executable/data identity.
             return candidate_id
         if self.store is not None:
+            register_candidate = getattr(self.store, "register_candidate", None)
+            if register_candidate is not None:
+                register_candidate(candidate, producer=producer or candidate.provider)
+                self._queue[candidate_id] = candidate
+                return candidate_id
             claim_trial = getattr(self.store, "claim_trial", None)
             if claim_trial is not None:
                 claim_trial(candidate)
@@ -204,8 +213,10 @@ class ResearchCoordinator:
         self._queue[candidate_id] = candidate
         return candidate_id
 
-    def register(self, candidates: Iterable[Candidate]) -> tuple[str, ...]:
-        return tuple(self.submit(candidate) for candidate in candidates)
+    def register(
+        self, candidates: Iterable[Candidate], *, producer: str | None = None
+    ) -> tuple[str, ...]:
+        return tuple(self.submit(candidate, producer=producer) for candidate in candidates)
 
     def pending(self) -> tuple[Candidate, ...]:
         return tuple(self._queue[key] for key in sorted(self._queue) if key not in self._results)

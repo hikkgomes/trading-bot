@@ -369,7 +369,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
                 "c": "102000",
                 "v": "25",
                 "spread_bps": "1",
-                "visible_depth": "10000000",
+                "visible_depth_quote": "10000000",
                 "volatility": "0.2",
                 "funding": "0.0",
                 "x": True,
@@ -413,6 +413,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         store=snapshots,
         products={product_id: product},
         accounts=accounts,
+        health_node_id=prefix,
     )
     state_worker = DatabasePortfolioStateWorker(
         queue=queue,
@@ -511,10 +512,50 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         account_products={account_id: product_id},
     )
 
-    assert data_worker.run_once(now=now)["reason_code"] == "market_event_written"
+    for offset, close in ((2, 100000), (1, 101000)):
+        candle = market_event.payload["data"]
+        historical = normalise_public_event(
+            market="futures",
+            stream="btcusdt@kline_1m",
+            receive_timestamp=now,
+            payload={
+                **candle,
+                "E": close_ms + 1 - offset * 60000,
+                "k": {
+                    **candle["k"],
+                    "t": close_ms - 59999 - offset * 60000,
+                    "T": close_ms - offset * 60000,
+                    "c": str(close),
+                },
+            },
+        )
+        data_worker._publish_market_snapshots(event=historical, market="futures")
+    for name, message in (
+        ("bookTicker", {"b": "101999", "B": "10000", "a": "102001", "A": "10000"}),
+        ("markPriceUpdate", {"p": "102000", "r": "0", "T": close_ms + 1}),
+    ):
+        support = normalise_public_event(
+            market="futures",
+            stream="btcusdt@" + name,
+            receive_timestamp=now,
+            payload={"e": name, "E": close_ms + 1, "s": "BTCUSDT", **message},
+        )
+        queue.enqueue(
+            job_id=f"{prefix}:support:{name}",
+            name="market_event_write",
+            available_at=now,
+            payload={
+                "venue": "binance",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "event": to_primitive(support),
+            },
+        )
+    for _ in range(3):
+        assert data_worker.run_once(now=now)["reason_code"] == "market_event_written"
     DatabaseHeartbeatStore(database.engine).record(
         service_name="data-writer",
-        node_id="linux-optiplex",
+        node_id=prefix,
         observed_at=now,
         healthy=True,
         payload={"reason_code": "market_event_written"},

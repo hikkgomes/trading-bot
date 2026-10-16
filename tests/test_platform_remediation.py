@@ -1785,8 +1785,9 @@ def test_latest_ready_bundle_excludes_synthetic_diagnostic_data(tmp_path) -> Non
 
 @pytest.mark.parametrize("fixed_scope", [False, True])
 def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
-    tmp_path, fixed_scope
+    tmp_path, fixed_scope, monkeypatch
 ) -> None:
+    monkeypatch.setattr("src.services.research_jobs.utc_now", lambda: NOW)
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'dataset-service.sqlite3'}")
     database.create_schema()
     instrument = Instrument(
@@ -1944,14 +1945,15 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
         attempt=1,
         lease_expires_at="2026-08-30T10:01:00+00:00",
     )
-    catalogue = DatabaseResearchJobHandlers(
+    handlers = DatabaseResearchJobHandlers(
         SqlResearchStore(database.engine),
         dataset_bundle_service=DatabaseDatasetBundleService(database.engine, root, timeframe="1d"),
-    ).register_strategy_catalogue(
-        claimed,
-        lambda: claimed,
     )
-    assert catalogue["registered_candidates"] > 0
+    ready = handlers.register_strategy_catalogue(claimed, lambda: claimed)
+    assert ready["state"] == "dataset_ready"
+    bounded = replace(claimed, payload={**claimed.payload, **ready, "generation_budget": 12})
+    catalogue = handlers.register_strategy_catalogue(bounded, lambda: bounded)
+    assert 0 < catalogue["registered_candidates"] <= 12
 
 
 def test_dataset_service_keeps_delisted_symbols_in_their_historical_roles(tmp_path) -> None:

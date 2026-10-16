@@ -14,7 +14,7 @@ import numpy as np
 from src.domain._codec import canonical_hash
 from src.research.selection import METHOD, FrozenCohort, selection_adjusted_block_bootstrap
 
-GENERATOR_VERSION = "dependent_return_calibration/v1"
+GENERATOR_VERSION = "dependent_return_calibration/v2"
 CASES = ("null", "weak_edge", "cost_trap", "regime_limited", "leakage_trap", "flat")
 
 
@@ -56,11 +56,13 @@ def _causality(case: str, seed: int) -> bool:
     return causal_prefix_probe(function, prices)
 
 
-def _calibration_trial(case: str, seed: int, count: int, alpha: float) -> dict[str, Any]:
-    development = _returns("null", seed * 2, count, 3)
-    evaluation = _returns(case, seed * 2 + 1, count, 3)
+def _calibration_trial(
+    case: str, seed: int, count: int, alpha: float, candidates: int
+) -> dict[str, Any]:
+    development = _returns("null", seed * 2, count, candidates)
+    evaluation = _returns(case, seed * 2 + 1, count, candidates)
     cohort = FrozenCohort(
-        ("configuration-0", "configuration-1", "configuration-2"),
+        tuple(f"configuration-{index}" for index in range(candidates)),
         ("synthetic_leg",),
         "2026-01-01T00:00:00+00:00",
         canonical_hash(development.tolist()),
@@ -100,8 +102,14 @@ def calibrate(
     proposed_alpha: float = 0.1,
     test_alpha: float = 0.1,
     observations: int = 256,
+    candidates: int = 3,
 ) -> dict[str, Any]:
-    if not 1 <= replicates <= 500 or observations < 128 or maximum_seconds <= 0:
+    if (
+        not 1 <= candidates <= 100
+        or not 1 <= replicates <= 500
+        or observations < 128
+        or maximum_seconds <= 0
+    ):
         raise ValueError("calibration resource bounds are invalid")
     if not 0 < proposed_alpha < 1:
         raise ValueError("proposed false-qualification budget must be in (0, 1)")
@@ -115,7 +123,11 @@ def calibrate(
                 raise TimeoutError("calibration exceeded its declared time budget")
             trials.append(
                 _calibration_trial(
-                    case, seed + case_index * 10000 + replicate, observations, test_alpha
+                    case,
+                    seed + case_index * 10000 + replicate,
+                    observations,
+                    test_alpha,
+                    candidates,
                 )
             )
     summary = {
@@ -131,6 +143,8 @@ def calibrate(
             for name in ("selection.py", "calibration.py")
         },
         "seed": seed,
+        "candidates": candidates,
+        "calibration_scope": "selection_inference_kernel",
         "replicates": replicates,
         "observations": observations,
         "proposed_false_qualification_budget": proposed_alpha,
@@ -145,6 +159,7 @@ def calibrate(
             "finite_seed_sample",
             "specified_synthetic_dependence_model",
             "not_a_probability_of_future_trading_loss",
+            "economic_execution_and_lifecycle_require_separate_contract_validation",
         ],
     }
 
@@ -176,14 +191,16 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--policy", type=Path, default=Path("config/research.json"))
     parser.add_argument("--seed", type=int, default=731)
-    parser.add_argument("--replicates", type=int, default=40)
-    parser.add_argument("--maximum-seconds", type=float, default=120)
-    parser.add_argument("--test-alpha", type=float, default=0.1)
+    parser.add_argument("--replicates", type=int, default=100)
+    parser.add_argument("--maximum-seconds", type=float, default=7200)
+    parser.add_argument("--test-alpha", type=float, default=0.05)
     args = parser.parse_args()
+    policy = json.loads(args.policy.read_text())
     result = calibrate(
         seed=args.seed,
         replicates=args.replicates,
-        policy_hash=canonical_hash(json.loads(args.policy.read_text())),
+        policy_hash=canonical_hash(policy),
+        candidates=int(policy["search_budgets"]["maximum_candidates_per_epoch"]),
         maximum_seconds=args.maximum_seconds,
         test_alpha=args.test_alpha,
     )

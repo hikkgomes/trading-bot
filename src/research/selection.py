@@ -9,7 +9,7 @@ import numpy as np
 
 from src.domain._codec import canonical_hash, timestamp
 
-METHOD = "selection_adjusted_block_bootstrap/v1"
+METHOD = "selection_adjusted_block_bootstrap/v2"
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ def selection_adjusted_block_bootstrap(
         "seed": seed,
         "draws": draws,
         "block_lengths": lengths,
-        "studentizer": "frozen_Bartlett_HAC_per_block_length",
+        "studentizer": "resampled_Bartlett_HAC_per_block_length",
         "input_hash": canonical_hash(
             {
                 "net_returns": np.asarray(net_returns).tolist(),
@@ -134,12 +134,19 @@ def _aligned_returns(
 
 
 def _hac_variance(values: np.ndarray, block: int) -> np.ndarray:
-    centred = values - values.mean(axis=0)
-    variance = np.mean(centred * centred, axis=0)
-    for lag in range(1, block):
-        covariance = np.mean(centred[:-lag] * centred[lag:], axis=0)
-        variance += 2 * (1 - lag / block) * covariance
-    return variance
+    # Time is the penultimate axis for both the observed panel and batched draws.
+    values = np.asarray(values, dtype=float)
+    centred = values - values.mean(axis=-2, keepdims=True)
+    count = values.shape[-2]
+    prefix = np.concatenate(
+        (np.zeros_like(centred[..., :1, :]), np.cumsum(centred, axis=-2)), axis=-2
+    )
+    padding = [(0, 0)] * prefix.ndim
+    padding[-2] = (block - 1, block - 1)
+    prefix = np.pad(prefix, padding, mode="edge")
+    windows = prefix[..., block:, :] - prefix[..., :-block, :]
+    # All n+b-1 zero-extended windows give the exact Bartlett sum/n estimate.
+    return np.sum(windows * windows, axis=-2) / (count * block)
 
 
 def _bootstrap_length(
@@ -158,24 +165,30 @@ def _bootstrap_length(
     scale = np.sqrt(variance / count)
     observed = values.mean(axis=0) / scale
     centred = values - values.mean(axis=0)
-    exceedances = _maximum_statistic_counts(centred, scale, observed, block, seed, draws)
+    exceedances = _maximum_statistic_counts(centred, observed, block, seed, draws)
+    if exceedances is None:
+        return None
     return {"pvalues": (exceedances + 1) / (draws + 1), "effective_samples": effective}
 
 
 def _maximum_statistic_counts(
-    centred: np.ndarray, scale: np.ndarray, observed: np.ndarray, block: int, seed: int, draws: int
-) -> np.ndarray:
+    centred: np.ndarray, observed: np.ndarray, block: int, seed: int, draws: int
+) -> np.ndarray | None:
     rng = np.random.default_rng(seed)
     count = len(centred)
     blocks = (count + block - 1) // block
-    exceedances: np.ndarray = np.zeros(len(scale), dtype=int)
+    exceedances: np.ndarray = np.zeros(len(observed), dtype=int)
     # Bound peak memory independently of the requested number of draws.
     batch_size = max(1, min(64, 1_000_000 // max(1, centred.size)))
     for offset in range(0, draws, batch_size):
         size = min(batch_size, draws - offset)
         starts = rng.integers(0, count, size=(size, blocks, 1))
         indices = ((starts + np.arange(block)) % count).reshape(size, -1)[:, :count]
-        statistics = centred[indices].mean(axis=1) / scale
+        sample = centred[indices]
+        variance = _hac_variance(sample, block)
+        if not np.isfinite(variance).all() or np.any(variance <= 1e-16):
+            return None
+        statistics = sample.mean(axis=1) / np.sqrt(variance / count)
         maximum = statistics.max(axis=1)
         exceedances += (maximum[:, None] >= observed).sum(axis=0)
     return exceedances

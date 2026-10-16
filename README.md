@@ -1,7 +1,7 @@
 # Autonomous Crypto Trading Platform
 
 This repository contains one production architecture: a PostgreSQL-authoritative
-platform with immutable Parquet market data. The platform supports two products:
+platform with atomic market partitions and immutable research datasets. The platform supports two products:
 
 - `btc_accumulation`: Binance BTCUSDT spot, BTC-denominated accumulation against passive BTC holding, no leverage.
 - `active_income`: Binance USDT-margined futures, USDT-denominated day, swing, and scalp research, with bounded long and short risk.
@@ -15,7 +15,7 @@ schedulers cannot approve or submit live orders.
 
 ```text
 Binance market data
-        -> PostgreSQL events and immutable Parquet
+        -> PostgreSQL evidence and atomic market Parquet
         -> canonical features and strategy evaluator
         -> forecast -> portfolio -> six-scope risk
         -> paper or authorised live orders

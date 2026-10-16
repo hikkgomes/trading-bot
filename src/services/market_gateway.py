@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,11 @@ from src.data.event_capture import EventCaptureConfig, capture
 from src.data.parquet_store import DurableMarketBatchSpool, MarketEventBatchSegment
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.market_events import MarketEvent, MarketEventType
-from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
+from src.execution.rate_limit import (
+    ExchangeRateLimiter,
+    observe_http_response,
+    shared_exchange_rate_limiter,
+)
 from src.services.scheduler import DatabaseJobQueue
 
 _CLOCK_ENDPOINTS = {
@@ -49,6 +53,8 @@ _TESTNET_USER_STREAM_ENDPOINTS = {
 }
 _SPOT_USER_STREAM = "wss://ws-api.binance.com:443/ws-api/v3?returnRateLimits=false"
 _SPOT_TESTNET_USER_STREAM = "wss://ws-api.testnet.binance.vision/ws-api/v3?returnRateLimits=false"
+_QUEUE_RETENTION_INTERVAL_SECONDS = 5 * 60
+_MARKET_BATCH_RETENTION_TAG = "public_market_batch_completed_7d/v1"
 
 
 @dataclass(frozen=True)
@@ -94,6 +100,7 @@ class DatabaseGatewaySink:
         user_stream_job_name: str = "user_stream_event",
         user_stream_job_prefix: str = "user-stream",
         retention_seconds: int = 7 * 86_400,
+        coalesce_quotes: bool = False,
     ):
         self.queue = queue
         self.spool = spool
@@ -102,6 +109,8 @@ class DatabaseGatewaySink:
         if retention_seconds <= 0:
             raise ValueError("spool retention must be positive")
         self.retention_seconds = retention_seconds
+        self.coalesce_quotes = coalesce_quotes
+        self._quotes: dict[tuple[str, str, str], MarketEvent] = {}
         self.events = 0
         self.bytes = 0
         if self.spool is not None:
@@ -216,6 +225,31 @@ class DatabaseGatewaySink:
         )
 
     def _write_market_event(self, event: MarketEvent, *, market: str, symbol: str) -> None:
+        if self.coalesce_quotes and event.event_type in {
+            MarketEventType.BEST_BID_ASK,
+            MarketEventType.MARK_PRICE,
+            MarketEventType.FUNDING_RATE,
+        }:
+            key = (market, symbol, event.event_type.value)
+            previous = self._quotes.get(key)
+            if previous is None or event.exchange_timestamp >= previous.exchange_timestamp:
+                self._quotes[key] = replace(
+                    event,
+                    payload={
+                        **event.payload,
+                        "capture_policy": "latest_quote_per_flush/v1",
+                    },
+                )
+            return
+        if (
+            self.coalesce_quotes
+            and event.event_type is MarketEventType.CANDLE
+            and not event.payload.get("data", {}).get("k", {}).get("x")
+        ):
+            return
+        self._append_market_event(event, market=market, symbol=symbol)
+
+    def _append_market_event(self, event: MarketEvent, *, market: str, symbol: str) -> None:
         if self.spool is None:
             self._enqueue_market_event(event, venue="binance", market=market, symbol=symbol)
             return
@@ -234,6 +268,7 @@ class DatabaseGatewaySink:
                 "segment_hash": segment.content_hash,
                 "row_count": segment.row_count,
                 "producer_identity": "market-gateway",
+                "queue_retention_policy": _MARKET_BATCH_RETENTION_TAG,
             },
             available_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
             priority=10,
@@ -241,6 +276,9 @@ class DatabaseGatewaySink:
         )
 
     def flush(self) -> None:
+        quotes, self._quotes = self._quotes, {}
+        for (market, symbol, _kind), event in sorted(quotes.items()):
+            self._append_market_event(event, market=market, symbol=symbol)
         if self.spool is not None:
             segment = self.spool.flush()
             if segment is not None:
@@ -416,6 +454,7 @@ class BinanceUserStreams:
         method = session.put if current else session.post
         parameters = {"listenKey": current} if current else None
         async with method(endpoint, headers=headers, params=parameters) as response:
+            observe_http_response(self.rate_limiter, response)
             response.raise_for_status()
             payload = await response.json()
         listen_key = current or str(payload.get("listenKey") or "")
@@ -547,6 +586,8 @@ class DatabaseMarketGateway:
         self._task: asyncio.Task[dict[str, Any]] | None = None
         self._continuous_status: dict[str, Any] = {"reason_code": "market_gateway_not_started"}
         self._continuous_error: BaseException | None = None
+        self._queue_retention_checked_at: float | None = None
+        self._queue_retention_status: dict[str, Any] = {"reason_code": "queue_retention_not_run"}
 
     def start(self) -> None:
         """Start one persistent event loop for all public and authenticated streams."""
@@ -589,6 +630,30 @@ class DatabaseMarketGateway:
             time.sleep(0.05)
         return self.user_streams.connected(account_id)
 
+    async def _prune_queue_history(self) -> dict[str, Any]:
+        checked_at = time.monotonic()
+        if (
+            self._queue_retention_checked_at is not None
+            and checked_at - self._queue_retention_checked_at < _QUEUE_RETENTION_INTERVAL_SECONDS
+        ):
+            return self._queue_retention_status
+        self._queue_retention_checked_at = checked_at
+        try:
+            deleted = await asyncio.to_thread(self.queue.prune_completed_public_market_batches)
+        except Exception as exc:
+            self._queue_retention_status = {
+                "reason_code": "queue_retention_cleanup_failed",
+                "error_type": type(exc).__name__,
+            }
+        else:
+            self._queue_retention_status = {
+                "reason_code": "queue_retention_cleanup_completed",
+                "deleted_jobs": deleted,
+                "batch_limit": 1_000,
+                "retention_days": 7,
+            }
+        return self._queue_retention_status
+
     def _run_continuous_thread(self) -> None:
         loop = asyncio.new_event_loop()
         self._loop = loop
@@ -622,6 +687,7 @@ class DatabaseMarketGateway:
                 max_bytes=self.capture_config.max_file_bytes,
             ),
             retention_seconds=self.capture_config.retention_seconds,
+            coalesce_quotes=True,
         )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             clocks = await self._clock_status(session)
@@ -645,15 +711,18 @@ class DatabaseMarketGateway:
                 "user_stream_accounts": len(self.accounts),
             }
             try:
+                queue_retention = await self._prune_queue_history()
                 while True:
                     await asyncio.sleep(self.capture_config.flush_seconds)
                     sink.flush()
                     spool_status = sink.enforce_retention()
+                    queue_retention = await self._prune_queue_history()
                     self._continuous_status = {
                         **self._continuous_status,
                         "events_enqueued": sink.events,
                         "bytes_received": sink.bytes,
                         "spool": spool_status,
+                        "queue_retention": queue_retention,
                     }
                     failed = next(
                         (
@@ -724,6 +793,7 @@ class DatabaseMarketGateway:
     async def _run_once(self, *, maximum_seconds: float, maximum_events: int) -> dict[str, Any]:
         if maximum_seconds <= 0 or maximum_events <= 0:
             raise ValueError("market gateway bounds must be positive")
+        queue_retention = await self._prune_queue_history()
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
         sink = DatabaseGatewaySink(
             self.queue,
@@ -735,6 +805,7 @@ class DatabaseMarketGateway:
                 max_bytes=self.capture_config.max_file_bytes,
             ),
             retention_seconds=self.capture_config.retention_seconds,
+            coalesce_quotes=True,
         )
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -782,6 +853,7 @@ class DatabaseMarketGateway:
             "user_stream_accounts": len(self.accounts),
             "user_stream_errors": [],
             "spool": spool_status,
+            "queue_retention": queue_retention,
         }
 
     async def _clock_status(self, session: aiohttp.ClientSession) -> dict[str, Any]:
@@ -791,6 +863,7 @@ class DatabaseMarketGateway:
             await asyncio.to_thread(self.public_rate_limiter.acquire)
             started_ms = time.time_ns() / 1_000_000
             async with session.get(endpoint) as response:
+                observe_http_response(self.public_rate_limiter, response)
                 response.raise_for_status()
                 payload = await response.json()
             completed_ms = time.time_ns() / 1_000_000

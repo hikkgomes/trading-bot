@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -147,6 +148,7 @@ def _build_research_work(
             node_id=node_id,
             service_name=service,
             heartbeat_store=heartbeat_store,
+            heartbeat_interval_seconds=float(config.metrics.get("heartbeat_seconds", 15)),
         )
         for service in selected
     }
@@ -329,33 +331,60 @@ def _run_process_loop(
             node_id=args.node,
             service_name=service,
             heartbeat_store=heartbeat_store,
+            heartbeat_interval_seconds=float(config.metrics.get("heartbeat_seconds", 15)),
         )
         for service in work
     }
-    stopping = False
+    stopping = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
-        nonlocal stopping
-        stopping = True
+        stopping.set()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     with ThreadPoolExecutor(
         max_workers=max(1, len(work)), thread_name_prefix="platform-service"
     ) as pool:
-        while not stopping:
-            futures = {
-                service: pool.submit(runtimes[service].run_once, work[service]) for service in work
-            }
-            cycles = {service: future.result() for service, future in futures.items()}
-            if args.once:
-                _shutdown_work(work)
-                database.dispose()
-                return 0 if all(cycle.healthy for cycle in cycles.values()) else 1
-            time.sleep(args.interval_seconds)
+        futures = [
+            pool.submit(_service_loop, runtimes[service], cycle, stopping, args)
+            for service, cycle in work.items()
+        ]
+        healthy = [future.result() for future in futures]
     _shutdown_work(work)
     database.dispose()
-    return 0
+    return 0 if all(healthy) else 1
+
+
+def _service_loop(runtime, work, stopping, args):
+    try:
+        while not stopping.is_set():
+            cycle = runtime.run_once(work)
+            if args.once:
+                return cycle.healthy
+            delay = (
+                0.01
+                if cycle.detail.get("job_id")
+                else _idle_delay(runtime.service_name, args.interval_seconds)
+            )
+            stopping.wait(delay)
+    except BaseException:
+        stopping.set()
+        raise
+    return True
+
+
+def _idle_delay(service, configured):
+    consumers = {
+        "data-writer",
+        "feature-service",
+        "strategy-evaluator",
+        "portfolio-engine",
+        "risk-engine",
+        "execution-engine",
+        "paper-engine",
+        "accounting-service",
+    }
+    return min(configured, 1.0) if service in consumers else configured
 
 
 def _shutdown_work(work: Mapping[str, Callable[[], Mapping[str, Any] | None]]) -> None:

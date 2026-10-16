@@ -31,7 +31,8 @@ def _approval_calibration_fixture(configuration):
     from src.research.selection import METHOD
 
     trials = []
-    members = [f"configuration-{index}" for index in range(3)]
+    candidates = configuration["search_budgets"]["maximum_candidates_per_epoch"]
+    members = [f"configuration-{index}" for index in range(candidates)]
     times = [
         (dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(hours=index)).isoformat()
         for index in range(128)
@@ -71,6 +72,8 @@ def _approval_calibration_fixture(configuration):
         "source_hashes": calibration_source_hashes(),
         "qualification_authority": False,
         "policy_approval_required": True,
+        "candidates": candidates,
+        "calibration_scope": "selection_inference_kernel",
         "nominal_test_alpha": 0.05,
         "proposed_false_qualification_budget": 0.1,
         "replicates": 40,
@@ -169,7 +172,8 @@ def test_research_policy_approval_binds_reviewed_receipt_configuration_code_and_
         )
         with monkeypatch.context() as patch:
             patch.setattr(
-                "src.research.policy_approval.execution_engine_digest", lambda: "sha256:" + "0" * 64
+                "src.research.policy_approval.research_policy_engine_digest",
+                lambda: "sha256:" + "0" * 64,
             )
             assert current_approval(connection, **query) is None
     revoke_policy(
@@ -472,3 +476,29 @@ def test_calendar_or_manifest_mismatch_cannot_produce_a_statistic():
             opened_at="2026-09-07T00:01:00+00:00",
             seed=1,
         )
+
+
+def test_joint_bootstrap_t_matches_bartlett_quadratic_form_reference():
+    from src.research.selection import _bootstrap_length, _hac_variance
+
+    count, block, draws, seed = 64, 4, 2000, 51
+    values = np.random.default_rng(512).normal(0.0003, 0.01, (count, 2))
+    centred = values - values.mean(axis=0)
+    distance = np.abs(np.arange(count)[:, None] - np.arange(count)[None, :])
+    weights = np.maximum(0, 1 - distance / block)
+    observed_variance = np.diag(centred.T @ weights @ centred) / count
+    np.testing.assert_allclose(_hac_variance(values, block), observed_variance)
+    alternating = np.tile([1.0, -1.0], count // 2)[:, None]
+    assert _hac_variance(alternating, block)[0] >= 0
+    observed = values.mean(axis=0) / np.sqrt(observed_variance / count)
+    starts = np.random.default_rng(seed).integers(0, count, size=(draws, count // block, 1))
+    indices = ((starts + np.arange(block)) % count).reshape(draws, count)
+    exceedances = np.zeros(2, dtype=int)
+    for panel in centred[indices]:
+        residuals = panel - panel.mean(axis=0)
+        variance = np.diag(residuals.T @ weights @ residuals) / count
+        maximum = np.max(panel.mean(axis=0) / np.sqrt(variance / count))
+        exceedances += maximum >= observed
+    result = _bootstrap_length(values, block, seed, draws)
+    assert result is not None
+    np.testing.assert_array_equal(result["pvalues"], (exceedances + 1) / (draws + 1))

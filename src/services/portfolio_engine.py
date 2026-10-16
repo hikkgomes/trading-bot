@@ -87,6 +87,10 @@ class PortfolioInputsPending(ValueError):
     """A forecast is waiting for its own durable financial/risk inputs."""
 
 
+class InactivePortfolioForecast(ValueError):
+    """Queued work was superseded or expired before execution."""
+
+
 class DatabasePortfolioTargetBuilder:
     """Build one preliminary target from immutable forecast and account inputs."""
 
@@ -246,6 +250,8 @@ class DatabasePortfolioTargetBuilder:
         seed = self.repository.forecast(str(payload["forecast_id"]))
         if seed.product_id != product_id:
             raise ValueError("forecast product differs from target product")
+        if not seed.valid_from <= evaluated_at < seed.valid_until:
+            raise InactivePortfolioForecast("portfolio_forecast_expired")
         requested_assignment_id = str(payload.get("assignment_id") or "").strip()
         assignment_id = (
             requested_assignment_id or str(seed.metadata.get("assignment_id") or "").strip()
@@ -277,7 +283,7 @@ class DatabasePortfolioTargetBuilder:
             else all_forecasts
         )
         if seed not in forecasts:
-            raise ValueError("trigger forecast is not active in its assignment sleeve")
+            raise InactivePortfolioForecast("portfolio_forecast_superseded")
         return product_id, product, evaluated_at, seed, forecasts
 
     def _product_targets(
@@ -466,7 +472,7 @@ class DatabasePortfolioTargetBuilder:
             liquidity_fraction_caps={
                 key: min(
                     1.0,
-                    float(value["visible_depth"])
+                    float(value["visible_depth_quote"])
                     * float(clean["maximum_depth_participation"])
                     / equity,
                 )
@@ -654,7 +660,7 @@ def _target_risk_scopes(
     worst_spread = max(float(market[item.instrument_id]["spread_bps"]) for item in targets)
     worst_volatility = max(float(market[item.instrument_id]["volatility"]) for item in targets)
     depth_fraction = max(
-        amount / max(float(market[item.instrument_id]["visible_depth"]), 1e-12)
+        amount / max(_order_depth(item, current_positions, market), 1e-12)
         for item, amount in zip(targets, order_notionals, strict=True)
     )
     maximum_position = max(abs(value) for value in active_notionals) / equity
@@ -715,6 +721,14 @@ def _target_risk_scopes(
             "decision_id": identity("product"),
         },
     }
+
+
+def _order_depth(target, current_positions, market):
+    quote = market[target.instrument_id]
+    side = (
+        "ask" if target.target_quantity > current_positions.get(target.instrument_id, 0) else "bid"
+    )
+    return float(quote.get(f"{side}_depth_quote", quote["visible_depth_quote"]))
 
 
 def _strategy_risk_notional(target, notional, equity):
@@ -833,7 +847,7 @@ def _validate_state_sources(clean: Mapping[str, Any]) -> None:
 
 
 def _validate_state_market(clean: Mapping[str, Any]) -> None:
-    required = {"price", "spread_bps", "visible_depth", "volatility"}
+    required = {"price", "spread_bps", "visible_depth_quote", "volatility"}
     for instrument_id, values in clean["market"].items():
         if not isinstance(values, Mapping) or not required.issubset(values):
             raise ValueError(f"canonical market state is incomplete for {instrument_id}")
@@ -949,6 +963,10 @@ class DatabasePortfolioTargetWorker:
                 priority=18,
                 producer_identity=self.worker_id,
             )
+        except InactivePortfolioForecast as exc:
+            result = {"reason_code": str(exc), "targets": 0}
+            self.queue.complete(claimed, completed_at=now, outcome=result)
+            return {**result, "job_id": claimed.job_id}
         except PortfolioInputsPending as exc:
             from src.research.outcomes import OutcomeCategory
 

@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -221,6 +222,11 @@ def _portfolio_state_cycle(
         store=SqlRiskSnapshotStore(database.engine),
         products=products,
         accounts=accounts,
+        health_node_id=node_id,
+        required_health_services=("market-gateway", "data-writer"),
+        maximum_market_age_seconds=float(
+            configuration["risk"]["global"]["maximum_market_data_staleness_seconds"]
+        ),
     )
     worker = DatabasePortfolioStateWorker(
         queue=queue,
@@ -284,6 +290,11 @@ def _schedule_paper_book_states(database, configuration, queue, worker_id, produ
             store=snapshots,
             products=scoped_products,
             accounts=scoped_accounts,
+            health_node_id=worker_id.split(":", 1)[0],
+            required_health_services=("market-gateway", "data-writer"),
+            maximum_market_age_seconds=float(
+                configuration["risk"]["global"]["maximum_market_data_staleness_seconds"]
+            ),
         )
         worker = DatabasePortfolioStateWorker(
             queue=queue, worker_id=worker_id, store=snapshots, refresh_sources=sources.refresh
@@ -748,9 +759,12 @@ def _data_writer_cycle(
             engine=database.engine,
             root=root,
         ),
+        historical_executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="history"),
+        clock=utc_now,
         lease_seconds=300,
     )
-    return lambda: worker.run_once(now=utc_now())
+
+    return worker
 
 
 def _market_gateway_cycle(
@@ -1259,6 +1273,7 @@ def _research_cycle(
         worker_id=worker_id,
         handlers={name: all_handlers[name] for name in job_names},
         lease_seconds=maximum_runtime_seconds,
+        maximum_runtime_seconds=maximum_runtime_seconds,
         heavy_compute=HeavyComputeLeaseStore(database.engine),
         forbidden_secret_names=tuple(
             str(account[field])

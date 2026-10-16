@@ -142,14 +142,14 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
                 forecast.instrument_id: {
                     "price": 100.0,
                     "spread_bps": 1.0,
-                    "visible_depth": 100_000.0,
+                    "visible_depth_quote": 100_000.0,
                     "volatility": 0.1,
                     "funding": 0.0,
                 },
                 eth_instrument: {
                     "price": 10.0,
                     "spread_bps": 2.0,
-                    "visible_depth": 100_000.0,
+                    "visible_depth_quote": 100_000.0,
                     "volatility": 0.1,
                     "funding": 0.0,
                 },
@@ -210,3 +210,163 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
     assert refs.market_data_snapshot_id.startswith("sha256:")
     target_snapshot = snapshots.get(refs.target_position_snapshot_id)
     assert len(target_snapshot["targets"]) == 2
+
+
+def test_measured_evidence_is_limited_to_the_requested_stage() -> None:
+    from unittest.mock import patch
+
+    from src.domain._codec import canonical_hash
+    from src.research.executors import _measured_result
+    from src.research.generation import CAMPAIGNS, build_hypothesis
+
+    campaign = next(item for item in CAMPAIGNS if item.name == "futures_trend_following")
+    snapshot_id = canonical_hash({"fixture": "stage-scoped-measurement"})
+    candidate = build_hypothesis(
+        campaign,
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=(snapshot_id,),
+        submitted_at="2026-08-23T00:00:00+00:00",
+    ).candidate
+    context = {
+        "dataset_snapshot_ids": [snapshot_id],
+        "instrument_scope": ["binance:futures:BTCUSDT:USDT"],
+        "signals": [1, -1, 1],
+        "returns": [0.01, -0.005],
+        "fee_bps": 5.0,
+        "slippage_bps": 2.0,
+        "feature_rows": [{"trend": 1.0}],
+        "parity_receipt": {"schema": "fixture"},
+    }
+    forbidden = MagicMock(side_effect=AssertionError("stage-inapplicable diagnostics ran"))
+    robustness_diagnostics = {
+        "_negative_control_evidence": forbidden,
+        "_economic_control_returns": forbidden,
+        "_temporal_stress": forbidden,
+        "_stress_report": forbidden,
+        "_purged_walk_forward": forbidden,
+        "_pbo_measurements": forbidden,
+        "_trial_statistics": forbidden,
+        "_monte_carlo_blocks": forbidden,
+    }
+    other_stage_diagnostics = {
+        "_parameter_stability": forbidden,
+        "_cross_symbol_stability": forbidden,
+        "_portfolio_overlap": forbidden,
+        "_regime_breakdown": forbidden,
+    }
+    with patch.multiple(
+        "src.research.executors", **robustness_diagnostics, **other_stage_diagnostics
+    ):
+        with patch("src.metrics.bootstrap_sharpe_ci", side_effect=AssertionError):
+            screening = _measured_result(
+                candidate, {**context, "requested_stage": "screening"}, [1, -1, 1]
+            )
+    screening_evidence = screening.evidence
+    assert screening_evidence["compiled"] is True
+    assert (
+        screening_evidence["return_ledger"]["net_pnl"] == screening_evidence["cost_adjusted_return"]
+    )
+    assert not {
+        "parameter_stability",
+        "negative_control_results",
+        "walk_forward",
+        "bootstrap_confidence",
+        "probability_backtest_overfitting",
+        "deflated_sharpe",
+        "monte_carlo_return_blocks",
+    }.intersection(screening_evidence)
+
+    parameter_stability = MagicMock(
+        return_value={"status": "not_applicable", "passed": True, "results": []}
+    )
+    with patch.multiple(
+        "src.research.executors",
+        **robustness_diagnostics,
+        _parameter_stability=parameter_stability,
+    ):
+        with patch("src.metrics.bootstrap_sharpe_ci", side_effect=AssertionError):
+            development = _measured_result(
+                candidate, {**context, "requested_stage": "development"}, [1, -1, 1]
+            )
+    parameter_stability.assert_called_once()
+    assert development.evidence["parameter_stability"]["passed"] is True
+    assert "regime_breakdown" in development.evidence
+    assert "bootstrap_confidence" not in development.evidence
+    assert "negative_control_results" not in development.evidence
+
+    with patch.multiple(
+        "src.research.executors",
+        **robustness_diagnostics,
+        **other_stage_diagnostics,
+    ):
+        with patch("src.metrics.bootstrap_sharpe_ci", side_effect=AssertionError):
+            protected = _measured_result(
+                candidate, {**context, "requested_stage": "protected"}, [1, -1, 1]
+            )
+    assert "sample_evidence" in protected.evidence
+    assert "drawdown_stability" in protected.evidence
+    assert protected.evidence["return_ledger"]["net_returns"]
+    assert "parameter_stability" not in protected.evidence
+    assert "negative_control_results" not in protected.evidence
+
+
+def test_directional_executors_require_single_instrument_but_panels_do_not() -> None:
+    from src.domain._codec import canonical_hash
+    from src.domain.strategies import StrategySourceType
+    from src.research.executors import (
+        ProviderExecutorRegistry,
+        UnsupportedExecutorError,
+        _cross_symbol_stability,
+    )
+    from src.research.generation import CAMPAIGNS, build_hypothesis
+
+    snapshots = (canonical_hash({"fixture": "directional-scope"}),)
+    campaign = next(item for item in CAMPAIGNS if item.name == "futures_trend_following")
+    base = build_hypothesis(
+        campaign,
+        variant=0,
+        instrument_universe=("BTCUSDT", "ETHUSDT"),
+        dataset_snapshot_hashes=snapshots,
+        submitted_at="2026-08-23T00:00:00+00:00",
+    ).candidate
+    context = {
+        "instrument_scope": (
+            "binance:futures:BTCUSDT:USDT",
+            "binance:futures:ETHUSDT:USDT",
+        )
+    }
+    registry = ProviderExecutorRegistry.default()
+    for source_type in (
+        StrategySourceType.GENERATED_DSL,
+        StrategySourceType.REGISTERED_PYTHON,
+        StrategySourceType.MACHINE_LEARNING,
+    ):
+        candidate = replace(base, definition=replace(base.definition, source_type=source_type))
+        try:
+            registry.execute(candidate, context)
+        except UnsupportedExecutorError as exc:
+            assert "single instrument scope" in str(exc)
+        else:
+            raise AssertionError(f"{source_type.value} accepted a multi-instrument scope")
+
+    panel_campaign = next(item for item in CAMPAIGNS if item.name == "cross_sectional_momentum")
+    panel = build_hypothesis(
+        panel_campaign,
+        variant=0,
+        instrument_universe=("BTCUSDT", "ETHUSDT"),
+        dataset_snapshot_hashes=snapshots,
+        submitted_at="2026-08-23T00:00:00+00:00",
+    ).candidate
+    marker = object()
+    panel_registry = ProviderExecutorRegistry()
+    panel_registry.register(StrategySourceType.CROSS_SECTIONAL, lambda *_: marker)
+    assert panel_registry.execute(panel, context) is marker
+    joint_evidence = _cross_symbol_stability(context, [0.01, -0.01], joint_portfolio=True)
+    assert joint_evidence == {
+        "status": "not_applicable",
+        "passed": True,
+        "symbols": 2,
+        "per_symbol": {},
+        "reason": "joint_portfolio_is_the_economic_unit",
+    }

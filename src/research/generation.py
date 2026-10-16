@@ -33,6 +33,75 @@ class GenerationError(ValueError):
 
 
 @dataclass(frozen=True)
+class BtcAllocationLimits:
+    product_max_tactical_fraction: float
+    instrument_maximum_fraction: float
+    strategy_maximum_fraction: float
+    sleeve_maximum_fraction: float
+    minimum_btc_fraction: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "product_max_tactical_fraction",
+            "instrument_maximum_fraction",
+            "strategy_maximum_fraction",
+            "sleeve_maximum_fraction",
+            "minimum_btc_fraction",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise GenerationError(f"{name} must be a finite fraction from zero to one")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> BtcAllocationLimits:
+        required = (
+            "product_max_tactical_fraction",
+            "instrument_maximum_fraction",
+            "strategy_maximum_fraction",
+            "sleeve_maximum_fraction",
+            "minimum_btc_fraction",
+        )
+        if any(name not in values for name in required):
+            raise GenerationError("BTC allocation limits are incomplete")
+        try:
+            return cls(**{name: float(values[name]) for name in required})
+        except (TypeError, ValueError) as exc:
+            raise GenerationError("BTC allocation limits must be numeric") from exc
+
+    @classmethod
+    def conservative_default(cls) -> BtcAllocationLimits:
+        return cls(0.0, 0.0, 0.0, 0.0, 1.0)
+
+    @property
+    def maximum_tactical_fraction(self) -> float:
+        return min(
+            self.product_max_tactical_fraction,
+            self.instrument_maximum_fraction,
+            self.strategy_maximum_fraction,
+            self.sleeve_maximum_fraction,
+            1.0 - self.minimum_btc_fraction,
+        )
+
+    def to_payload(self) -> dict[str, float]:
+        return {
+            "product_max_tactical_fraction": self.product_max_tactical_fraction,
+            "instrument_maximum_fraction": self.instrument_maximum_fraction,
+            "strategy_maximum_fraction": self.strategy_maximum_fraction,
+            "sleeve_maximum_fraction": self.sleeve_maximum_fraction,
+            "minimum_btc_fraction": self.minimum_btc_fraction,
+            "maximum_tactical_fraction": self.maximum_tactical_fraction,
+        }
+
+
+def _btc_limits(value: BtcAllocationLimits | Mapping[str, Any] | None) -> BtcAllocationLimits:
+    if isinstance(value, BtcAllocationLimits):
+        return value
+    if isinstance(value, Mapping):
+        return BtcAllocationLimits.from_mapping(value)
+    return BtcAllocationLimits.conservative_default()
+
+
+@dataclass(frozen=True)
 class CampaignSpec:
     """One predeclared economic mechanism and its executable rule family."""
 
@@ -701,6 +770,7 @@ class HypothesisGenerator:
         allocator: GenerationAllocator | None = None,
         memory: HypothesisMemory | None = None,
         feedback_store: GenerationFeedbackStore | None = None,
+        btc_allocation_limits: BtcAllocationLimits | Mapping[str, Any] | None = None,
     ) -> None:
         self.product = non_empty(product, field="product")
         if not instrument_universe:
@@ -713,6 +783,7 @@ class HypothesisGenerator:
         self.allocator = allocator or GenerationAllocator()
         self.memory = memory
         self.feedback_store = feedback_store
+        self.btc_allocation_limits = _btc_limits(btc_allocation_limits)
 
     def generate(
         self,
@@ -726,7 +797,10 @@ class HypothesisGenerator:
         parent_thesis_ids: tuple[str, ...] = (),
         parent_candidates: Sequence[Candidate] = (),
         dataset_plan: Any | None = None,
+        instrument_cursor: int = 0,
     ) -> tuple[GeneratedHypothesis, ...]:
+        if instrument_cursor < 0:
+            raise GenerationError("instrument cursor cannot be negative")
         available_campaigns = CAMPAIGNS if campaigns is None else campaigns
         selected = tuple(
             campaign
@@ -742,19 +816,30 @@ class HypothesisGenerator:
         )
         by_name = {campaign.name: campaign for campaign in selected}
         generated: list[GeneratedHypothesis] = []
+        scope_cursor = instrument_cursor
         for campaign, variant in _allocated_variants(allocations, by_name):
             if len(generated) >= total_budget:
                 break
+            candidate_universe = self.instrument_universe
+            if (
+                self.product == "active_income"
+                and campaign.source_type is StrategySourceType.GENERATED_DSL
+            ):
+                candidate_universe = (
+                    self.instrument_universe[scope_cursor % len(self.instrument_universe)],
+                )
+                scope_cursor += 1
             try:
                 hypothesis = build_hypothesis(
                     campaign,
                     variant=variant,
-                    instrument_universe=self.instrument_universe,
+                    instrument_universe=candidate_universe,
                     dataset_snapshot_hashes=dataset_snapshot_hashes,
                     submitted_at=submitted_at,
                     dataset_bundle_id=dataset_bundle_id,
                     universe_snapshot_id=universe_snapshot_id,
                     parent_thesis_ids=parent_thesis_ids,
+                    btc_allocation_limits=self.btc_allocation_limits,
                 )
             except GenerationError as exc:
                 self._record_generation_failure(
@@ -910,6 +995,7 @@ def _derive_duplicate_hypothesis(
         for candidate in parent_candidates
         if candidate.definition.product == base.campaign.product
         and candidate.definition.family == base.campaign.family
+        and candidate.definition.universe == base.candidate.definition.universe
         and isinstance(candidate.definition.signal_model, Mapping)
     )
     if not parents:
@@ -946,6 +1032,11 @@ def _derive_hypothesis(
         parent_models,
         parents=parents,
         method=method,
+        btc_limits=_btc_limits(
+            base.candidate.definition.position_model.get("btc_allocation_limits")
+            if isinstance(base.candidate.definition.position_model, Mapping)
+            else None
+        ),
     )
     identity = f"{method}:{base.campaign.name}:{canonical_hash(source_payload).removeprefix('sha256:')[:16]}"
     definition = replace(
@@ -957,6 +1048,11 @@ def _derive_hypothesis(
             base.candidate.definition.position_model,
             base.campaign,
             method=method,
+            btc_limits=_btc_limits(
+                base.candidate.definition.position_model.get("btc_allocation_limits")
+                if isinstance(base.candidate.definition.position_model, Mapping)
+                else None
+            ),
         ),
         source_type=base.campaign.source_type,
         source_hash=canonical_hash(source_payload),
@@ -1000,13 +1096,19 @@ def _derived_source_payload(
     *,
     parents: Sequence[Candidate],
     method: str,
+    btc_limits: BtcAllocationLimits,
 ) -> dict[str, Any]:
     """Mutate the economic contract, not only a display threshold."""
 
     first = deepcopy(dict(parent_models[0]))
     if campaign.source_type is StrategySourceType.GENERATED_DSL:
         return _derived_dsl_source_payload(
-            campaign, first, parent_models, parents=parents, method=method
+            campaign,
+            first,
+            parent_models,
+            parents=parents,
+            method=method,
+            btc_limits=btc_limits,
         )
     contract = dict(first)
     contract["method"] = method
@@ -1015,7 +1117,7 @@ def _derived_source_payload(
         "mechanism": campaign.mechanism.value,
         "feature_space": list(campaign.permitted_features),
         "horizon": campaign.expected_horizon,
-        "position_model": _campaign_position_model(campaign),
+        "position_model": _campaign_position_model(campaign, btc_limits=btc_limits),
     }
     contract["parameters"] = _mutate_contract_parameters(
         campaign,
@@ -1050,6 +1152,7 @@ def _derived_dsl_source_payload(
     *,
     parents: Sequence[Candidate],
     method: str,
+    btc_limits: BtcAllocationLimits,
 ) -> dict[str, Any]:
     base_rule = first.get("rule")
     if not isinstance(base_rule, Mapping):
@@ -1085,6 +1188,8 @@ def _derived_dsl_source_payload(
         }
     if first.get("kind") != "btc_target_allocation":
         raise GenerationError("BTC derived strategy lost its allocation contract")
+    allocation_limits = btc_limits.to_payload()
+    maximum_tactical = btc_limits.maximum_tactical_fraction
     parameters = dict(first.get("parameters") or {})
     for group in ("negative_conditions", "positive_conditions"):
         conditions = rule.get(group)
@@ -1105,9 +1210,17 @@ def _derived_dsl_source_payload(
             "kind": "state_reversal_or_terminal_close",
             "horizon": campaign.expected_horizon,
         },
-        "target_states": dict(first.get("target_states") or {}),
-        "minimum_btc_fraction": float(first.get("minimum_btc_fraction", 0.7)),
-        "maximum_tactical_fraction": float(first.get("maximum_tactical_fraction", 0.3)),
+        "target_states": {
+            "risk_on": {"btc_fraction": 1.0, "tactical_fraction": 0.0},
+            "risk_off": {
+                "btc_fraction": 1.0 - maximum_tactical,
+                "tactical_fraction": maximum_tactical,
+            },
+            "reentry": {"btc_fraction": 1.0, "tactical_fraction": 0.0},
+        },
+        "minimum_btc_fraction": btc_limits.minimum_btc_fraction,
+        "maximum_tactical_fraction": maximum_tactical,
+        "btc_allocation_limits": allocation_limits,
         "parameters": parameters,
         "parameter_free": False,
         "parents": parent_ids,
@@ -1269,10 +1382,14 @@ def _mutated_feature_threshold(feature: str, threshold: float) -> float:
 
 
 def _derived_position_model(
-    base: Mapping[str, Any], campaign: CampaignSpec, *, method: str
+    base: Mapping[str, Any],
+    campaign: CampaignSpec,
+    *,
+    method: str,
+    btc_limits: BtcAllocationLimits,
 ) -> dict[str, Any]:
     result = deepcopy(dict(base))
-    result.update(_campaign_position_model(campaign))
+    result.update(_campaign_position_model(campaign, btc_limits=btc_limits))
     result["derived_method"] = method
     return result
 
@@ -1329,6 +1446,7 @@ def build_hypothesis(
     dataset_bundle_id: str | None = None,
     universe_snapshot_id: str | None = None,
     parent_thesis_ids: tuple[str, ...] = (),
+    btc_allocation_limits: BtcAllocationLimits | Mapping[str, Any] | None = None,
 ) -> GeneratedHypothesis:
     if campaign.unavailable_reason is not None:
         raise GenerationError(
@@ -1360,6 +1478,9 @@ def build_hypothesis(
             f"{campaign.name} requires at least two instruments for its economic contract"
         )
     market_type = MarketType.SPOT if campaign.product == "btc_accumulation" else MarketType.FUTURES
+    resolved_btc_limits = (
+        _btc_limits(btc_allocation_limits) if campaign.product == "btc_accumulation" else None
+    )
     instrument_ids = tuple(
         canonical_instrument_id(
             symbol,
@@ -1372,6 +1493,7 @@ def build_hypothesis(
         campaign,
         threshold=float(threshold),
         instrument_universe=instrument_ids,
+        btc_limits=resolved_btc_limits,
     )
     universe: dict[str, Any] = {
         "type": "fixed",
@@ -1397,9 +1519,16 @@ def build_hypothesis(
             "required_nodes": list(campaign.permitted_features),
         },
         signal_model=source_payload,
-        position_model=_campaign_position_model(campaign),
+        position_model=_campaign_position_model(campaign, btc_limits=resolved_btc_limits),
         execution_preferences={"policy": "market", "paper_only_until_approved": True},
-        risk_policy={"product_policy": campaign.product},
+        risk_policy={
+            "product_policy": campaign.product,
+            **(
+                {"btc_allocation_limits": resolved_btc_limits.to_payload()}
+                if resolved_btc_limits is not None
+                else {}
+            ),
+        },
         validation_policy={"evidence_type": campaign.evidence_type, "promotable": True},
         source_type=source_type,
         source_hash=canonical_hash(source_payload),
@@ -1439,9 +1568,13 @@ def _campaign_source_payload(
     *,
     threshold: float,
     instrument_universe: tuple[str, ...],
+    btc_limits: BtcAllocationLimits | None = None,
 ) -> dict[str, Any]:
     if campaign.source_type is StrategySourceType.GENERATED_DSL:
         if campaign.product == "btc_accumulation":
+            limits = btc_limits or BtcAllocationLimits.conservative_default()
+            allocation_limits = limits.to_payload()
+            maximum_tactical = limits.maximum_tactical_fraction
             risk_off: dict[str, Any] = {
                 "feature": campaign.feature,
                 "operator": campaign.operator,
@@ -1477,11 +1610,15 @@ def _campaign_source_payload(
                 },
                 "target_states": {
                     "risk_on": {"btc_fraction": 1.0, "tactical_fraction": 0.0},
-                    "risk_off": {"btc_fraction": 0.7, "tactical_fraction": 0.3},
+                    "risk_off": {
+                        "btc_fraction": 1.0 - maximum_tactical,
+                        "tactical_fraction": maximum_tactical,
+                    },
                     "reentry": {"btc_fraction": 1.0, "tactical_fraction": 0.0},
                 },
-                "minimum_btc_fraction": 0.7,
-                "maximum_tactical_fraction": 0.3,
+                "minimum_btc_fraction": limits.minimum_btc_fraction,
+                "maximum_tactical_fraction": maximum_tactical,
+                "btc_allocation_limits": allocation_limits,
                 "parameters": {
                     "feature": campaign.feature,
                     "threshold": threshold,
@@ -1593,13 +1730,19 @@ def _signed_campaign_rule(campaign: CampaignSpec, threshold: float) -> dict[str,
     }
 
 
-def _campaign_position_model(campaign: CampaignSpec) -> dict[str, Any]:
+def _campaign_position_model(
+    campaign: CampaignSpec,
+    *,
+    btc_limits: BtcAllocationLimits | None = None,
+) -> dict[str, Any]:
     if campaign.product == "btc_accumulation":
+        limits = btc_limits or BtcAllocationLimits.conservative_default()
         return {
             "kind": "target_allocation",
             "base_asset": "BTC",
-            "minimum_btc_fraction": 0.7,
-            "maximum_tactical_fraction": 0.3,
+            "minimum_btc_fraction": limits.minimum_btc_fraction,
+            "maximum_tactical_fraction": limits.maximum_tactical_fraction,
+            "btc_allocation_limits": limits.to_payload(),
             "states": ("risk_on", "risk_off", "reentry"),
             "signal_timing": "next_bar",
         }

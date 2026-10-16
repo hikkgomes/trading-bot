@@ -14,8 +14,8 @@ WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/agent.env
 Environment=PYTHONUNBUFFERED=1
 Environment=TRADING_PLATFORM_AGENT_API_URL=http://127.0.0.1:8088
-Environment=TRADING_PLATFORM_OPENCLAW_CONFIG=/opt/trading-bot/runtime/agent-worktrees/openclaw.json
-Environment=TRADING_PLATFORM_OPENCLAW_AGENT=research
+Environment=TRADING_PLATFORM_MODEL_BROKER_SOCKET=/run/trading-platform-model-broker/model.sock
+SupplementaryGroups=trading-model-broker
 ExecStartPre=/opt/trading-bot/.venv-agent/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process agent-runtime --validate
 ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process agent-runtime
 Restart=always

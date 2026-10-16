@@ -541,6 +541,54 @@ def test_load_dotenv_rejects_symlink_without_loading_target(tmp_path, monkeypatc
     assert "EXCHANGE" not in os.environ
 
 
+def test_shared_request_budget_conserves_capacity_and_reserves_recovery_headroom(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from src.execution.request_budget import SharedRequestBudget
+
+    path = tmp_path / "ip-budget.json"
+    first = SharedRequestBudget(path, clock=lambda: 1000.0)
+    restarted = SharedRequestBudget(path, clock=lambda: 1000.0)
+    assert first.reserve(100, background=True, funding=False) == 0
+    assert restarted.reserve(1, background=True, funding=False) > 0
+    assert restarted.reserve(100, background=False, funding=False) == 0
+    assert first.reserve(1, background=False, funding=False) > 0
+    first.backoff(60)
+    assert restarted.reserve(1, background=False, funding=False) >= 60
+    concurrent = tmp_path / "concurrent-ip.json"
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(
+                SharedRequestBudget(concurrent, clock=lambda: 1000.0).reserve,
+                100,
+                background=False,
+                funding=False,
+            )
+            for _ in range(8)
+        ]
+        delays = [future.result(timeout=5) for future in futures]
+    assert delays.count(0) == 2
+
+
+def test_ccxt_internal_requests_use_weighted_shared_budget(tmp_path, monkeypatch):
+    import json
+
+    import ccxt
+
+    from src.execution.rate_limit import ExchangeRateLimiter, RateLimitedExchangeClient
+    from src.execution.request_budget import SharedRequestBudget
+
+    client = ccxt.binance()
+    monkeypatch.setattr(client, "fetch", lambda *_args, **_kwargs: {"serverTime": 123})
+    path = tmp_path / "ccxt-budget.json"
+    proxy = RateLimitedExchangeClient(
+        client,
+        ExchangeRateLimiter(0, shared_budget=SharedRequestBudget(path, clock=lambda: 1000.0)),
+    )
+    assert proxy.fetch_time() == 123
+    assert json.loads(path.read_text())["weight"]["tokens"] == 199
+
+
 def test_ccxt_broker_without_ccxt_raises():
     pytest.importorskip  # noqa: B018 - sentinel; explicit branch below
     try:

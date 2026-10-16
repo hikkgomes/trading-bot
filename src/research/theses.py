@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, text
 from sqlalchemy.engine import Connection, Engine
 
 from src.data.database import research_thesis, thesis_trial
@@ -152,7 +152,10 @@ class SqlThesisRegistry:
         with connection_scope(self.engine, self.connection, write=True) as connection:
             statement = select(research_thesis).where(research_thesis.c.id == thesis_id)
             if self.engine.dialect.name == "postgresql":
-                statement = statement.with_for_update()
+                # Thesis records are append-only. Serialise lineage budgets without UPDATE rights.
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext('research-thesis-trials'))")
+                )
             thesis_row = connection.execute(statement).mappings().first()
             if thesis_row is None:
                 raise ThesisError(f"thesis is not registered: {thesis_id}")
@@ -167,11 +170,7 @@ class SqlThesisRegistry:
                 if existing["thesis_id"] != thesis_id or existing["lineage_id"] != lineage_id:
                     raise ThesisError("candidate trial identity collision")
                 return ThesisTrial(thesis_id, candidate_id, lineage_id, existing["ordinal"])
-            lineage_ids = _sql_lineage_ids(
-                connection,
-                thesis_id,
-                lock=self.engine.dialect.name == "postgresql",
-            )
+            lineage_ids = _sql_lineage_ids(connection, thesis_id)
             count = connection.execute(
                 select(func.count())
                 .select_from(thesis_trial)
@@ -248,10 +247,8 @@ def _thesis_from_payload(payload: dict[str, object]) -> ResearchThesis:
     )
 
 
-def _sql_lineage_ids(connection, thesis_id: str, *, lock: bool = False) -> tuple[str, ...]:
+def _sql_lineage_ids(connection, thesis_id: str) -> tuple[str, ...]:
     statement = select(research_thesis.c.id, research_thesis.c.payload)
-    if lock:
-        statement = statement.with_for_update()
     rows = connection.execute(statement).mappings()
     payloads = {str(row["id"]): row["payload"] for row in rows}
     lineage = {thesis_id}

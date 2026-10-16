@@ -1123,7 +1123,7 @@ def _refresh_reconciled_state(
             "values": {
                 "close": float(market_price),
                 "spread_bps": 1.0,
-                "visible_depth": 100_000_000.0,
+                "visible_depth_quote": 100_000_000.0,
                 "volatility": 0.2,
                 "funding": 0.0,
             },

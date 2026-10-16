@@ -17,8 +17,11 @@ class EvidenceApplicability:
     instrument_count: int | None = None
     tunable_parameter_count: int | None = None
     active_strategy_count: int | None = None
+    joint_portfolio: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.joint_portfolio) is not bool:
+            raise ValueError("joint portfolio applicability must be boolean")
         for value in (
             self.instrument_count,
             self.tunable_parameter_count,
@@ -33,7 +36,7 @@ class EvidenceApplicability:
         return {
             "parameter_stability": self.tunable_parameter_count == 0,
             "probability_backtest_overfitting": self.tunable_parameter_count == 0,
-            "cross_symbol_stability": self.instrument_count == 1,
+            "cross_symbol_stability": self.instrument_count == 1 or self.joint_portfolio,
             "cross_instrument": self.instrument_count == 1,
             "predeclared_universe_holdout": self.instrument_count == 1,
             "portfolio_overlap": self.active_strategy_count == 0,

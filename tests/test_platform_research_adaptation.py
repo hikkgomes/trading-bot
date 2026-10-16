@@ -325,3 +325,66 @@ def test_scheduler_round_restarts_without_duplicate_trials_and_uses_real_feedbac
     )
     assert replay["candidate_ids"] == first["candidate_ids"]
     database.dispose()
+
+
+def test_successor_keeps_pending_trials_and_consumed_holdout_closed(tmp_path):
+    import datetime as dt
+
+    from sqlalchemy import insert, select, update
+    from test_platform_candidate_lifecycle import NOW, _bundle, _candidate
+
+    from src.data.database import (
+        dataset_snapshot,
+        experiment,
+        selection_cohort,
+        selection_cohort_open,
+    )
+    from src.research.rounds import ResearchRoundCoordinator
+    from src.research.scheduling import _successor_at
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'successor.sqlite3'}")
+    database.create_schema()
+    bundle = _bundle(database)
+    candidate = _candidate(database, bundle)
+    ResearchRoundCoordinator(database.engine).close_finite(
+        bundle.bundle_id,
+        product_id="active_income",
+        candidate_ids=[candidate.candidate_id],
+        at=NOW,
+    )
+    product = {"dataset_timeframe": "1h"}
+    assert _successor_at(database.engine, bundle, product) is None
+    with database.engine.begin() as connection:
+        connection.execute(update(experiment).values(state="screening_rejected"))
+    assert (
+        _successor_at(database.engine, bundle, product)
+        == (dt.datetime.fromisoformat(bundle.created_at) + dt.timedelta(days=1)).isoformat()
+    )
+    with database.engine.begin() as connection:
+        connection.execute(update(experiment).values(state="development_deferred"))
+    assert _successor_at(database.engine, bundle, product) is None
+    cohort_id = canonical_hash({"fixture": "consumed protected interval"})
+    with database.engine.begin() as connection:
+        connection.execute(update(experiment).values(state="protected_rejected"))
+        connection.execute(
+            insert(selection_cohort).values(
+                id=cohort_id, scope_id=cohort_id, created_at=NOW, payload={}
+            )
+        )
+        connection.execute(
+            insert(selection_cohort_open).values(
+                id=cohort_id,
+                created_at=NOW,
+                payload={"protected_snapshot_id": bundle.stage_snapshot_ids["protected_holdout"]},
+            )
+        )
+        interval = connection.execute(
+            select(dataset_snapshot.c.payload["interval"]).where(
+                dataset_snapshot.c.id == bundle.stage_snapshot_ids["protected_holdout"]
+            )
+        ).scalar_one()
+    end, start = (dt.datetime.fromisoformat(interval[key]) for key in ("end", "start"))
+    assert dt.datetime.fromisoformat(_successor_at(database.engine, bundle, product)) >= end + (
+        end - start
+    )
+    database.dispose()

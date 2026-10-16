@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import statistics
 
 import pytest
+from sqlalchemy import select
 
 from src.data.binance_market import normalise_public_event
-from src.data.database import PlatformDatabase
+from src.data.database import PlatformDatabase, job, market_input_buffer, risk_snapshot
 from src.data.feature_graph import (
     AvailableValue,
     FeatureGraphError,
@@ -14,6 +16,7 @@ from src.data.feature_graph import (
     default_feature_engine,
 )
 from src.data.feature_store import SqlFeatureStore
+from src.data.parquet_store import partition_files
 from src.domain._codec import to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
@@ -26,6 +29,50 @@ from src.services.scheduler import DatabaseJobQueue
 from src.services.strategy_evaluator import DatabaseStrategyEvaluator
 
 NOW = "2026-08-24T00:00:00+00:00"
+
+
+def test_gateway_keeps_latest_quote_in_each_flush_and_ignores_delayed_updates(tmp_path):
+    from src.services.market_gateway import DatabaseGatewaySink
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'quote-coalescing.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=3)).isoformat()
+    queue.register_worker(
+        worker_id="writer",
+        node_id="fixture",
+        role="writer",
+        capabilities=("market_event_write",),
+        observed_at=NOW,
+    )
+    sink = DatabaseGatewaySink(queue, coalesce_quotes=True)
+    for offset in (1, 2, 0):
+        observed = dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=offset)
+        event = normalise_public_event(
+            market="futures",
+            stream="btcusdt@bookTicker",
+            receive_timestamp=later,
+            payload={
+                "e": "bookTicker",
+                "E": int(observed.timestamp() * 1000),
+                "s": "BTCUSDT",
+                "b": str(100 + offset),
+                "a": str(101 + offset),
+                "B": "10",
+                "A": "20",
+            },
+        )
+        sink._write_market_event(event, market="futures", symbol="BTCUSDT")
+    assert queue.claim(worker_id="writer", now=later, lease_seconds=60) is None
+    sink.flush()
+    claimed = queue.claim(worker_id="writer", now=later, lease_seconds=60)
+    assert claimed is not None
+    assert claimed.payload["event"]["payload"]["data"]["b"] == "102"
+    assert claimed.payload["event"]["payload"]["capture_policy"] == "latest_quote_per_flush/v1"
+    queue.complete(claimed, completed_at=later)
+    sink.flush()
+    assert queue.claim(worker_id="writer", now=later, lease_seconds=60) is None
+    database.dispose()
 
 
 def _inputs(closes: list[float]):
@@ -285,6 +332,14 @@ def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) ->
     results = [writer.run_once(now=NOW) for _ in market_events]
 
     assert all(result["market_snapshot_ids"] for result in results)
+    assert partition_files(writer.store.root, "raw/binance/futures/best_bid_ask/**/*.parquet") == ()
+    assert partition_files(writer.store.root, "raw/binance/futures/mark_price/**/*.parquet") == ()
+    assert partition_files(writer.store.root, "raw/binance/futures/candle/**/*.parquet")
+    with database.engine.connect() as connection:
+        immutable_ids = set(connection.execute(select(risk_snapshot.c.id)).scalars())
+        buffered_ids = set(connection.execute(select(market_input_buffer.c.id)).scalars())
+    assert results[0]["market_snapshot_ids"][0] in immutable_ids
+    assert {result["market_snapshot_ids"][0] for result in results[1:]} <= buffered_ids
     snapshots = [
         SqlRiskSnapshotStore(database.engine).get(result["market_snapshot_ids"][0])
         for result in results
@@ -299,7 +354,9 @@ def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) ->
     assert snapshots[1]["values"] == {
         "close": 102.0,
         "spread_bps": pytest.approx(1.9607843137),
-        "visible_depth": 1000.0,
+        "visible_depth_quote": 50995.0,
+        "bid_depth_quote": 50995.0,
+        "ask_depth_quote": 51005.0,
     }
     assert snapshots[2]["values"] == {"close": 102.0, "funding": 0.001}
 
@@ -355,8 +412,226 @@ def test_market_data_writer_publishes_partial_book_snapshot(tmp_path) -> None:
     assert snapshot["values"] == {
         "close": 100.0,
         "spread_bps": 100.0,
-        "visible_depth": 20.0,
+        "visible_depth_quote": 804.0,
+        "bid_depth_quote": 1194.0,
+        "ask_depth_quote": 804.0,
     }
+
+
+def test_feature_enqueue_pins_only_asof_microstructure_inputs(tmp_path, monkeypatch) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'feature-market-inputs.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    for worker_id, role, capability in (
+        ("linux-data", "data-writer", "market_event_write"),
+        ("linux-feature", "feature-service", "live_feature_calculation"),
+    ):
+        queue.register_worker(
+            worker_id=worker_id,
+            node_id="fixture",
+            role=role,
+            capabilities=(capability,),
+            observed_at=NOW,
+        )
+    store = SqlRiskSnapshotStore(database.engine)
+    writer = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="linux-data",
+        root=tmp_path / "data",
+        snapshot_store=store,
+        product_ids_by_market={"futures": ("active_income",)},
+    )
+    candle_close_ms = int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 1
+    instrument = Instrument(
+        venue="binance",
+        market_type=MarketType.FUTURES,
+        base_asset="BTC",
+        quote_asset="USDT",
+        settlement_asset="USDT",
+        exchange_symbol="BTCUSDT",
+        price_precision=2,
+        quantity_precision=3,
+        minimum_quantity=0.001,
+        minimum_notional=5.0,
+    )
+    _seed_strategy(
+        database,
+        {
+            "product_id": "active_income",
+            "portfolio_id": "active-income-portfolio",
+            "account_id": "futures",
+            "risk_policy_id": "active-income",
+            "promotion_policy_id": "active-income",
+            "base_accounting_asset": "USDT",
+        },
+        instrument,
+        "sha256:" + "1" * 64,
+        NOW,
+        "core-only-feature-scope",
+        strategy_name="sma_cross",
+    )
+    assert (
+        writer._active_feature_input_families(
+            event=normalise_public_event(
+                market="futures",
+                stream="btcusdt@bookTicker",
+                receive_timestamp=NOW,
+                payload={
+                    "e": "bookTicker",
+                    "E": candle_close_ms,
+                    "s": "BTCUSDT",
+                    "b": "99",
+                    "a": "100",
+                    "B": "1",
+                    "A": "1",
+                },
+            ),
+            market="futures",
+        )
+        == set()
+    )
+    monkeypatch.setattr(
+        writer,
+        "_active_feature_input_families",
+        lambda **_kwargs: {"order_book", "funding_open_interest"},
+    )
+    events = (
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@bookTicker",
+            receive_timestamp=NOW,
+            payload={
+                "e": "bookTicker",
+                "E": candle_close_ms - 2_000,
+                "s": "BTCUSDT",
+                "b": "99.9",
+                "B": "12",
+                "a": "100.1",
+                "A": "8",
+            },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@markPrice@1s",
+            receive_timestamp=NOW,
+            payload={
+                "e": "markPriceUpdate",
+                "E": candle_close_ms - 1_000,
+                "s": "BTCUSDT",
+                "p": "100",
+                "r": "0.001",
+                "T": candle_close_ms - 1_000,
+            },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@bookTicker",
+            receive_timestamp=NOW,
+            payload={
+                "e": "bookTicker",
+                "E": candle_close_ms + 1_000,
+                "s": "BTCUSDT",
+                "b": "109.9",
+                "B": "12",
+                "a": "110.1",
+                "A": "8",
+            },
+        ),
+    )
+    for index, event in enumerate(events):
+        queue.enqueue(
+            job_id=f"microstructure-{index}",
+            name="market_event_write",
+            payload={
+                "venue": "binance",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "event": to_primitive(event),
+            },
+            available_at=NOW,
+        )
+        assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
+    candle = normalise_public_event(
+        market="futures",
+        stream="btcusdt@kline_1m",
+        receive_timestamp=NOW,
+        payload={
+            "e": "kline",
+            "E": candle_close_ms + 1,
+            "s": "BTCUSDT",
+            "k": {
+                "t": candle_close_ms - 59_999,
+                "T": candle_close_ms,
+                "i": "1m",
+                "o": "100",
+                "h": "101",
+                "l": "99",
+                "c": "100",
+                "v": "1",
+                "x": True,
+            },
+        },
+    )
+    queue.enqueue(
+        job_id="microstructure-candle",
+        name="market_event_write",
+        payload={
+            "venue": "binance",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "event": to_primitive(candle),
+        },
+        available_at=NOW,
+    )
+    result = writer.run_once(now=NOW)
+    assert result["reason_code"] == "market_event_written"
+
+    with database.engine.connect() as connection:
+        payload = connection.execute(
+            select(job.c.payload).where(job.c.id == result["feature_job_id"])
+        ).scalar_one()
+        buffered_ids = set(connection.execute(select(market_input_buffer.c.id)).scalars())
+    references = payload["input_references"]
+    book_ids = references["order_book"]["source_snapshot_ids"]
+    funding_ids = references["funding_open_interest"]["source_snapshot_ids"]
+    assert len(book_ids) == 1
+    assert len(funding_ids) == 1
+    book = store.get(book_ids[0])
+    funding = store.get(funding_ids[0])
+    assert book["source_payload"]["data"]["b"] == "99.9"
+    assert book["source_sequence"] == events[0].sequence
+    assert book["source_event_time"] == events[0].exchange_timestamp
+    assert book["source_receive_time"] == events[0].receive_timestamp
+    assert funding["source_payload"]["data"]["r"] == "0.001"
+    assert events[2].event_id not in {book["source_event_id"], funding["source_event_id"]}
+    assert result["feature_job_id"] is not None
+
+    feature_worker = DatabaseFeatureWorker(
+        queue=queue,
+        worker_id="linux-feature",
+        store=SqlFeatureStore(database.engine),
+        job_names=("live_feature_calculation",),
+        parquet_root=tmp_path / "data",
+        snapshot_store=store,
+    )
+    decoded = feature_worker._resolve_input_references(
+        payload,
+        required_families={"order_book", "funding_open_interest"},
+        history_limit=1,
+    )
+    assert decoded["bid_price"] == pytest.approx(99.9)
+    assert decoded["ask_price"] == pytest.approx(100.1)
+    assert decoded["funding_rate"] == pytest.approx(0.001)
+    core_only = feature_worker._resolve_input_references(
+        payload, required_families=set(), history_limit=1
+    )
+    assert "bid_price" not in core_only
+    assert "funding_rate" not in core_only
+    assert set(book_ids + funding_ids).isdisjoint(buffered_ids)
+    assert partition_files(writer.store.root, "raw/binance/futures/best_bid_ask/**/*.parquet") == ()
+    assert partition_files(writer.store.root, "raw/binance/futures/mark_price/**/*.parquet") == ()
+    assert partition_files(writer.store.root, "raw/binance/futures/candle/**/*.parquet")
+    database.dispose()
 
 
 def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
@@ -450,9 +725,9 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
     )
     held = False
     last_time = start
-    for index in range(300):
+    for index in range(450):
         last_time = start + dt.timedelta(minutes=index + 1)
-        close = 120.0 - index * 0.1 if index < 99 else 200.0
+        close = 120.0 - index * 0.1 if index < 225 else 200.0
         close_ms = int(last_time.timestamp() * 1_000)
         event = normalise_public_event(
             market="futures",
@@ -487,7 +762,7 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
             available_at=last_time.isoformat(),
         )
         assert writer.run_once(now=last_time.isoformat())["reason_code"] == "market_event_written"
-        if index == 99:
+        if index == 225:
             graph_enabled = True
         featured = feature_worker.run_once(now=last_time.isoformat())
         assert featured["reason_code"] == "features_persisted"
@@ -562,3 +837,188 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
     macd_values = [item.value for item in feature_values if item.feature_name == "macd"]
     assert rsi_values and max(rsi_values) > 50.0
     assert macd_values and max(macd_values) > 0.0
+
+
+def test_closed_candle_auxiliary_filter_uses_close_and_availability_times() -> None:
+    through = dt.datetime.fromisoformat(NOW)
+    decision_time = through + dt.timedelta(seconds=3)
+    through_ms = int(through.timestamp() * 1_000)
+    rows = (
+        ("closed_after_close", 0, True, 0),
+        ("late_arrival", 0, True, 1_000),
+        ("open_update", 0, False, 0),
+        ("future_close", 1_000, True, 0),
+    )
+
+    resolved = {}
+    for event_id, close_offset_ms, closed, availability_offset_ms in rows:
+        close_ms = through_ms + close_offset_ms
+        close_time = dt.datetime.fromtimestamp(close_ms / 1_000, dt.UTC)
+        emitted_at = close_time + dt.timedelta(seconds=1)
+        available_at = decision_time + dt.timedelta(milliseconds=availability_offset_ms)
+        resolved[event_id] = DatabaseFeatureWorker._auxiliary_row(
+            {
+                "event_id": event_id,
+                "instrument_id": "binance:futures:BTCUSDT:USDT",
+                "event_type": "candle",
+                "sequence": None,
+                "exchange_timestamp": emitted_at.isoformat(),
+                "availability_time": available_at.isoformat(),
+                "payload_json": json.dumps(
+                    {"data": {"k": {"T": close_ms, "x": closed, "c": "100"}}}
+                ),
+            },
+            source_ids=set(),
+            event_types={"candle"},
+            instrument_id="binance:futures:BTCUSDT:USDT",
+            same_instrument=True,
+            available_at=decision_time,
+            through=through,
+        )
+
+    accepted = resolved["closed_after_close"]
+    assert accepted is not None
+    assert accepted["source_time"] == through
+    assert accepted["exchange_timestamp"] > through
+    assert resolved["late_arrival"] is None
+    assert resolved["open_update"] is None
+    assert resolved["future_close"] is None
+
+
+def test_snapshot_store_keeps_active_multitimeframe_candle_inputs(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'multitimeframe-inputs.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    for worker_id, role, capability in (
+        ("linux-data", "data-writer", "market_event_write"),
+        ("linux-feature", "feature-service", "live_feature_calculation"),
+    ):
+        queue.register_worker(
+            worker_id=worker_id,
+            node_id="fixture",
+            role=role,
+            capabilities=(capability,),
+            observed_at=NOW,
+        )
+    instrument = Instrument(
+        venue="binance",
+        market_type=MarketType.FUTURES,
+        base_asset="BTC",
+        quote_asset="USDT",
+        settlement_asset="USDT",
+        exchange_symbol="BTCUSDT",
+        price_precision=2,
+        quantity_precision=3,
+        minimum_quantity=0.001,
+        minimum_notional=5.0,
+    )
+    product = {
+        "product_id": "active_income",
+        "portfolio_id": "active-income-portfolio",
+        "account_id": "futures",
+        "risk_policy_id": "active-income",
+        "promotion_policy_id": "active-income",
+        "base_accounting_asset": "USDT",
+    }
+    _seed_strategy(
+        database,
+        product,
+        instrument,
+        "multi-timeframe-feature-scope",
+        NOW,
+        "multi-timeframe-feature-scope",
+        strategy_name="multi_tf_trend",
+    )
+    assignments = SqlActiveStrategyAssignmentRepository(database.engine)
+    snapshots = SqlRiskSnapshotStore(database.engine)
+    writer = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="linux-data",
+        root=tmp_path / "data",
+        snapshot_store=snapshots,
+        product_ids_by_market={"futures": ("active_income",)},
+    )
+    target_close_ms = int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 1
+    for close_ms, close in ((target_close_ms - 600_000, 100), (target_close_ms - 300_000, 110)):
+        event = normalise_public_event(
+            market="futures",
+            stream="btcusdt@kline_5m",
+            receive_timestamp=NOW,
+            payload={
+                "e": "kline",
+                "E": close_ms + 1,
+                "s": "BTCUSDT",
+                "k": {
+                    "t": close_ms - 299_999,
+                    "T": close_ms,
+                    "i": "5m",
+                    "o": str(close - 1),
+                    "h": str(close + 1),
+                    "l": str(close - 1),
+                    "c": str(close),
+                    "v": "10",
+                    "x": True,
+                },
+            },
+        )
+        writer.store.put(event, venue="binance", market="futures", symbol="BTCUSDT")
+    target = normalise_public_event(
+        market="futures",
+        stream="btcusdt@kline_1m",
+        receive_timestamp=NOW,
+        payload={
+            "e": "kline",
+            "E": target_close_ms + 1,
+            "s": "BTCUSDT",
+            "k": {
+                "t": target_close_ms - 59_999,
+                "T": target_close_ms,
+                "i": "1m",
+                "o": "119",
+                "h": "121",
+                "l": "119",
+                "c": "120",
+                "v": "5",
+                "x": True,
+            },
+        },
+    )
+    queue.enqueue(
+        job_id="multitimeframe-target-candle",
+        name="market_event_write",
+        payload={
+            "venue": "binance",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "event": to_primitive(target),
+        },
+        available_at=NOW,
+    )
+    result = writer.run_once(now=NOW)
+    assert result["reason_code"] == "market_event_written"
+    with database.engine.connect() as connection:
+        payload = connection.execute(
+            select(job.c.payload).where(job.c.id == result["feature_job_id"])
+        ).scalar_one()
+    higher_timeframe = payload["input_references"]["higher_timeframe"]
+    assert higher_timeframe["relative_pattern"].startswith("raw/binance/futures/")
+    feature_worker = DatabaseFeatureWorker(
+        queue=queue,
+        worker_id="linux-feature",
+        store=SqlFeatureStore(database.engine),
+        job_names=("live_feature_calculation",),
+        parquet_root=tmp_path / "data",
+        snapshot_store=snapshots,
+        active_assignments=lambda instrument_id: tuple(
+            assignment
+            for assignment in assignments.active_assignments("active_income", at=NOW)
+            if assignment.get("instrument_id") == instrument_id
+        ),
+        feature_graph_for_assignment=lambda _assignment: {"required_nodes": ["multi_timeframe"]},
+    )
+    resolved = feature_worker._resolve_input_references(
+        payload, required_families={"higher_timeframe"}, history_limit=1
+    )
+    assert resolved["higher_timeframe_return"] == pytest.approx(120 / 110 - 1)
+    assert feature_worker.run_once(now=NOW)["reason_code"] == "features_persisted"
+    database.dispose()

@@ -1,4 +1,4 @@
-"""Leased immutable Parquet writer for canonical market events."""
+"""Leased atomic persistence for canonical market events."""
 
 from __future__ import annotations
 
@@ -6,14 +6,17 @@ import datetime as dt
 import json
 import math
 import re
+import threading
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Executor, Future
 from pathlib import Path
 from typing import Any
 
 import requests
 from sqlalchemy import select
 
-from src.data.database import job
+from src.data.database import market_input_sources
+from src.data.feature_graph import FeatureGraphRegistry, FeatureNodeType
 from src.data.parquet_store import (
     DurableMarketBatchSpool,
     PartitionedBarStore,
@@ -25,9 +28,20 @@ from src.risk.engine import SqlRiskSnapshotStore
 from src.services.historical_bootstrap import HistoricalBootstrapError, HistoricalBootstrapService
 from src.services.market_gap_recovery import BinanceMarketGapRepair
 from src.services.scheduler import DatabaseJobQueue
-from src.services.storage_compaction import compact_data_root
 
 _PARTITION_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
+_AUXILIARY_FAMILIES_BY_NODE_TYPE = {
+    FeatureNodeType.MULTI_TIMEFRAME: {"higher_timeframe"},
+    FeatureNodeType.CROSS_SECTIONAL_RANK: {"cross_sectional"},
+    FeatureNodeType.FUNDING_OPEN_INTEREST: {"funding_open_interest"},
+    FeatureNodeType.SPOT_PERPETUAL_BASIS: {"spot_perpetual"},
+    FeatureNodeType.CORRELATION_BETA: {"correlation_beta", "linked_instruments"},
+    FeatureNodeType.ORDER_BOOK: {"order_book"},
+    FeatureNodeType.TRADE_FLOW: {"trade_flow"},
+    FeatureNodeType.LIQUIDATION: {"liquidation"},
+    FeatureNodeType.SENTIMENT: {"sentiment"},
+    FeatureNodeType.FROZEN_ML_FEATURE_SET: {"ml_manifest"},
+}
 
 
 class DatabaseMarketDataWriter:
@@ -41,9 +55,9 @@ class DatabaseMarketDataWriter:
         product_ids_by_market: Mapping[str, Iterable[str]] | None = None,
         gap_repair: Callable[[Mapping[str, Any]], Iterable[MarketEvent]] | None = None,
         historical_bootstrap_service: HistoricalBootstrapService | None = None,
+        historical_executor: Executor | None = None,
+        clock: Callable[[], str] | None = None,
         lease_seconds: int = 60,
-        compaction_interval_seconds: int = 3_600,
-        compaction_maximum_rows: int = 5_000,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -58,13 +72,17 @@ class DatabaseMarketDataWriter:
         self.sequence_tracker = ExchangeSequenceTracker()
         self.gap_repair = gap_repair or BinanceMarketGapRepair()
         self.historical_bootstrap_service = historical_bootstrap_service
-        if compaction_interval_seconds <= 0 or compaction_maximum_rows <= 0:
-            raise ValueError("storage compaction bounds must be positive")
-        self.compaction_interval_seconds = compaction_interval_seconds
-        self.compaction_maximum_rows = compaction_maximum_rows
-        self._last_compaction_at: dt.datetime | None = None
+        self.historical_executor = historical_executor
+        self.clock = clock or (lambda: dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat())
+        self._history_future: Future | None = None
+        self._stopping = threading.Event()
 
     def run_once(self, *, now: str) -> dict[str, Any]:
+        if self.snapshot_store is not None:
+            self.snapshot_store.expire_market_inputs(at=now)
+        if self._history_future is not None and self._history_future.done():
+            completed, self._history_future = self._history_future, None
+            return completed.result()
         self._cleanup_completed_spool_segments()
         claimed = self.queue.claim(
             worker_id=self.worker_id,
@@ -77,16 +95,19 @@ class DatabaseMarketDataWriter:
                 *(
                     ("historical_bootstrap",)
                     if self.historical_bootstrap_service is not None
+                    and self._history_future is None
                     else ()
                 ),
             ),
         )
         if claimed is None:
-            compaction = self._maybe_compact(now)
-            if compaction is not None:
-                return compaction
             return {"reason_code": "market_event_queue_empty"}
         if claimed.name == "historical_bootstrap":
+            if self.historical_executor is not None:
+                self._history_future = self.historical_executor.submit(
+                    self._run_historical_bootstrap, claimed, now=now
+                )
+                return {"reason_code": "historical_bootstrap_started", "job_id": claimed.job_id}
             return self._run_historical_bootstrap(claimed, now=now)
         if claimed.name == "market_data_gap_recovery":
             return self._run_gap_recovery(claimed, now=now)
@@ -94,9 +115,17 @@ class DatabaseMarketDataWriter:
             return self._run_batch_write(claimed, now=now)
         return self._run_single_event_write(claimed, now=now)
 
+    def __call__(self) -> dict[str, Any]:
+        return self.run_once(now=self.clock())
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self.historical_executor is not None:
+            self.historical_executor.shutdown(wait=True, cancel_futures=True)
+
     def _run_batch_write(self, claimed, *, now: str) -> dict[str, Any]:
         try:
-            result = self._write_batch(claimed.payload)
+            result = self._write_batch(claimed.payload, now=now)
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -138,13 +167,19 @@ class DatabaseMarketDataWriter:
             expected_prefix = f"{venue.lower()}:{market.lower()}:{symbol.upper()}"
             if not event.instrument_id.startswith(expected_prefix):
                 raise ValueError("market-event partition does not match its instrument")
-            path = self.store.put(event, venue=venue, market=market, symbol=symbol)
+            market_snapshot_ids = self._publish_market_snapshots(
+                event=event, market=market, retention_at=now
+            )
+            path = (
+                self.store.put(event, venue=venue, market=market, symbol=symbol)
+                if self._archive_event(event, market)
+                else None
+            )
             bar_path = (
                 self.bar_store.put(event, venue=venue, market=market, symbol=symbol)
                 if _is_closed_candle(event)
                 else None
             )
-            market_snapshot_ids = self._publish_market_snapshots(event=event, market=market)
             feature_job_id = self._enqueue_closed_candle_features(
                 event=event,
                 venue=venue,
@@ -177,7 +212,7 @@ class DatabaseMarketDataWriter:
         return {
             "reason_code": "market_event_written",
             "job_id": claimed.job_id,
-            "path": str(path),
+            "path": str(path) if path is not None else None,
             "bar_path": str(bar_path) if bar_path is not None else None,
             "feature_job_id": feature_job_id,
             "sequence_status": sequence_status,
@@ -194,7 +229,7 @@ class DatabaseMarketDataWriter:
             if self.queue.state(job_id) == "completed":
                 spool.delete(path)
 
-    def _write_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _write_batch(self, payload: dict[str, Any], *, now: str) -> dict[str, Any]:
         segment_path = Path(str(payload["segment_path"]))
         spool = DurableMarketBatchSpool(segment_path.parent.parent)
         segment_path = spool.claim(segment_path)
@@ -245,7 +280,19 @@ class DatabaseMarketDataWriter:
                         previous_sequence=previous_sequence,
                     )
                 )
-        paths = self.store.put_batch(events) if events else ()
+        snapshot_ids = [
+            snapshot_id
+            for event, _venue, market, _symbol in events
+            for snapshot_id in self._publish_market_snapshots(
+                event=event, market=market, retention_at=now
+            )
+        ]
+        archivable_events = tuple(
+            (event, venue, market, symbol)
+            for event, venue, market, symbol in events
+            if self._archive_event(event, market)
+        )
+        paths = self.store.put_batch(archivable_events) if archivable_events else ()
         closed_bars = [
             (event, venue, market, symbol)
             for event, venue, market, symbol in events
@@ -257,11 +304,6 @@ class DatabaseMarketDataWriter:
                 self._enqueue_closed_candle_features(
                     event=event, venue=venue, market=market, symbol=symbol
                 )
-        snapshot_ids = [
-            snapshot_id
-            for event, _venue, market, _symbol in events
-            for snapshot_id in self._publish_market_snapshots(event=event, market=market)
-        ]
         committed = spool.commit(segment_path)
         return {
             "segments": len(paths),
@@ -272,45 +314,13 @@ class DatabaseMarketDataWriter:
             "committed_segment": str(committed),
         }
 
-    def _maybe_compact(self, now: str) -> dict[str, Any] | None:
-        if self._storage_consumers_busy():
-            return None
-        observed = dt.datetime.fromisoformat(now)
-        if (
-            self._last_compaction_at is not None
-            and (observed - self._last_compaction_at).total_seconds()
-            < self.compaction_interval_seconds
-        ):
-            return None
-        result = compact_data_root(
-            self.store.root,
-            maximum_rows=self.compaction_maximum_rows,
-        )
-        self._last_compaction_at = observed
-        return {"reason_code": "storage_compacted", **result}
-
-    def _storage_consumers_busy(self) -> bool:
-        with self.queue.engine.connect() as connection:
-            rows = connection.execute(
-                select(job.c.state).where(
-                    job.c.name.in_(
-                        (
-                            "market_event_batch_write",
-                            "market_event_write",
-                            "live_feature_calculation",
-                            "historical_feature_calculation",
-                        )
-                    ),
-                    job.c.state.in_(("pending", "running")),
-                )
-            )
-            return next(iter(rows), None) is not None
-
     def _run_historical_bootstrap(self, claimed, *, now: str) -> dict[str, Any]:
         current = claimed
 
         def heartbeat():
             nonlocal current
+            if self._stopping.is_set():
+                raise HistoricalBootstrapError("history worker is stopping")
             current = self.queue.heartbeat(
                 current,
                 now=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
@@ -418,28 +428,34 @@ class DatabaseMarketDataWriter:
                 if event.instrument_id != claimed.payload["instrument_id"]:
                     raise ValueError("REST gap repair changed the instrument identity")
             repaired = tuple({event.event_id: event for event in repaired}.values())
-            raw_events = tuple((event, venue, market, symbol) for event in repaired)
-            raw_paths = self.store.put_batch(raw_events)
-            paths = [str(path) for path in raw_paths]
-            closed_bars = []
             for event in repaired:
                 self.sequence_tracker.observe(
                     event,
                     contiguous=_has_contiguous_sequence(event),
                 )
-                if _is_closed_candle(event):
-                    closed_bars.append((event, venue, market, symbol))
                 self._publish_market_snapshots(
                     event=event,
                     market=str(claimed.payload["market"]),
+                    retention_at=now,
                 )
+            raw_events = tuple(
+                (event, venue, market, symbol)
+                for event in repaired
+                if self._archive_event(event, market)
+            )
+            raw_paths = self.store.put_batch(raw_events) if raw_events else ()
+            paths = [str(path) for path in raw_paths]
+            closed_bars = [
+                (event, venue, market, symbol) for event in repaired if _is_closed_candle(event)
+            ]
+            bar_paths = self.bar_store.put_batch(closed_bars) if closed_bars else ()
+            for event, _bar_venue, _bar_market, _bar_symbol in closed_bars:
                 self._enqueue_closed_candle_features(
                     event=event,
                     venue=venue,
                     market=market,
                     symbol=symbol,
                 )
-            bar_paths = self.bar_store.put_batch(closed_bars) if closed_bars else ()
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -462,48 +478,61 @@ class DatabaseMarketDataWriter:
             "bar_paths": [str(path) for path in bar_paths],
         }
 
-    def _publish_market_snapshots(self, *, event: MarketEvent, market: str) -> tuple[str, ...]:
-        if self.snapshot_store is None:
+    def _publish_market_snapshots(
+        self, *, event: MarketEvent, market: str, retention_at: str | None = None
+    ) -> tuple[str, ...]:
+        store = self.snapshot_store
+        product_ids = self.product_ids_by_market.get(market, ())
+        if store is None:
+            if product_ids and _requires_market_input_buffer(event):
+                raise RuntimeError("high-rate market input requires the recent snapshot buffer")
+            return ()
+        if _requires_market_input_buffer(event) and not product_ids:
+            raise RuntimeError("high-rate market input has no product scope for snapshot storage")
+        if event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
             return ()
         values = _market_snapshot_values(event)
-        if values is None:
+        if values is None and not _requires_market_input_buffer(event):
             return ()
+        retained_at = retention_at or event.availability_timestamp
+        values = values or {}
+
+        def save(payload: dict[str, object], *, created_at: str) -> str:
+            if not _requires_market_input_buffer(event):
+                return store.save(payload, created_at=created_at)
+            return store.save_market_input(payload, created_at=created_at, retention_at=retained_at)
+
         identities = tuple(
-            self.snapshot_store.save(
-                {
-                    "kind": "market_data_input",
-                    "product_id": product_id,
-                    "instrument_id": event.instrument_id,
-                    "source_event_id": event.event_id,
-                    "source_event_type": event.event_type.value,
-                    "source_timeframe": event.payload.get("data", {}).get("k", {}).get("i"),
-                    "source_open_time_ms": event.payload.get("data", {}).get("k", {}).get("t"),
-                    "source_close_time_ms": event.payload.get("data", {}).get("k", {}).get("T"),
-                    "source_candle_closed": event.payload.get("data", {}).get("k", {}).get("x"),
-                    "source_event_time": event.exchange_timestamp,
-                    "availability_time": event.availability_timestamp,
-                    "values": values,
-                },
+            save(
+                _market_snapshot_payload(event, product_id, values),
                 created_at=event.availability_timestamp,
             )
-            for product_id in self.product_ids_by_market.get(market, ())
+            for product_id in product_ids
         )
 
         if _is_closed_candle(event):
-            from src.services.paper_protection import has_paper_protection
-
-            for product_id, identity in zip(
-                self.product_ids_by_market.get(market, ()), identities, strict=True
-            ):
-                if has_paper_protection(self.queue.engine, event.instrument_id, product_id):
-                    self.queue.enqueue_if_absent(
-                        job_id=f"paper-protection:{identity}",
-                        name="paper_protection_evaluate",
-                        payload={"market_snapshot_id": identity},
-                        available_at=event.availability_timestamp,
-                        priority=100,
-                    )
+            self._enqueue_paper_protection_snapshots(event, product_ids, identities)
         return identities
+
+    def _enqueue_paper_protection_snapshots(
+        self, event: MarketEvent, product_ids: tuple[str, ...], identities: tuple[str, ...]
+    ) -> None:
+        from src.services.paper_protection import has_paper_protection
+
+        for product_id, identity in zip(product_ids, identities, strict=True):
+            if has_paper_protection(self.queue.engine, event.instrument_id, product_id):
+                self.queue.enqueue_if_absent(
+                    job_id=f"paper-protection:{identity}",
+                    name="paper_protection_evaluate",
+                    payload={"market_snapshot_id": identity},
+                    available_at=event.availability_timestamp,
+                    priority=100,
+                )
+
+    def _archive_event(self, event: MarketEvent, market: str) -> bool:
+        if not _is_high_rate_event(event):
+            return True
+        return self.snapshot_store is None and not self.product_ids_by_market.get(market)
 
     def _enqueue_closed_candle_features(
         self,
@@ -519,6 +548,13 @@ class DatabaseMarketDataWriter:
         candle = raw_data["k"]
         source_event_time = _milliseconds_time(candle.get("t"), field="candle open time")
         source_close_time = _milliseconds_time(candle.get("T"), field="candle close time")
+        required_families = self._active_feature_input_families(event=event, market=market)
+        pinned_inputs = self._pin_feature_market_inputs(
+            event=event,
+            market=market,
+            through_close_time=source_close_time,
+            required_families=required_families,
+        )
         bar_reference = {
             "kind": "partitioned_bar_window",
             "relative_pattern": (
@@ -552,21 +588,25 @@ class DatabaseMarketDataWriter:
             "liquidation": ("liquidation_snapshot", ("liquidation",)),
         }
         for name, (kind, event_types) in auxiliary_specs.items():
-            pattern = (
-                f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
-                if name in {"cross_sectional", "correlation_beta", "linked_instruments"}
-                else f"raw/{venue.lower()}/**/candle/{symbol.upper()}/**/*.parquet"
-                if name == "spot_perpetual"
-                else f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"
-            )
             reference = {
                 "kind": kind,
-                "relative_pattern": pattern,
                 "event_types": list(event_types),
                 "through_close_time": source_close_time,
                 "availability_time": event.availability_timestamp,
                 "source_event_ids": [],
             }
+            if self.snapshot_store is not None and name in {
+                "order_book",
+                "funding_open_interest",
+            }:
+                reference["snapshot_source"] = "market_input"
+                reference["source_snapshot_ids"] = pinned_inputs.get(name, [])
+            elif self.snapshot_store is not None and name == "trade_flow":
+                reference["snapshot_source"] = "disabled"
+            else:
+                reference["relative_pattern"] = self._legacy_auxiliary_pattern(
+                    name=name, venue=venue, market=market, symbol=symbol
+                )
             references[name] = {
                 **reference,
                 "content_hash": canonical_hash(reference),
@@ -594,6 +634,131 @@ class DatabaseMarketDataWriter:
             priority=10,
         )
         return job_id
+
+    @staticmethod
+    def _legacy_auxiliary_pattern(*, name: str, venue: str, market: str, symbol: str) -> str:
+        if name in {"cross_sectional", "correlation_beta", "linked_instruments"}:
+            return f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
+        if name == "spot_perpetual":
+            return f"raw/{venue.lower()}/**/candle/{symbol.upper()}/**/*.parquet"
+        return f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"
+
+    def _active_feature_input_families(self, *, event: MarketEvent, market: str) -> set[str]:
+        product_ids = self.product_ids_by_market.get(market, ())
+        if self.snapshot_store is None or not product_ids:
+            return set()
+        from src.research.canonical import (
+            SqlActiveStrategyAssignmentRepository,
+            SqlStrategyArtefactRepository,
+        )
+
+        assignments = SqlActiveStrategyAssignmentRepository(self.queue.engine)
+        artefacts = SqlStrategyArtefactRepository(self.queue.engine)
+        registry = FeatureGraphRegistry.default()
+        families: set[str] = set()
+        for product_id in product_ids:
+            for assignment in assignments.active_assignments(
+                product_id, at=event.availability_timestamp
+            ):
+                if assignment.get("instrument_id") not in {None, event.instrument_id}:
+                    continue
+                artefact = artefacts.get(str(assignment["artefact_hash"]))
+                definition = artefact.get("definition")
+                graph_spec = (
+                    definition.get("feature_graph") if isinstance(definition, Mapping) else None
+                )
+                if not isinstance(graph_spec, Mapping):
+                    continue
+                required = graph_spec.get("required_nodes", graph_spec.get("nodes", ()))
+                if not isinstance(required, list | tuple) or not required:
+                    continue
+                nodes = tuple(
+                    str(item["name"] if isinstance(item, Mapping) else item) for item in required
+                )
+                graph = registry.graph(
+                    nodes, version=str(graph_spec.get("version") or "canonical-features/v2")
+                )
+                for node in graph.nodes:
+                    families.update(_AUXILIARY_FAMILIES_BY_NODE_TYPE.get(node.node_type, ()))
+        return families
+
+    def _pin_feature_market_inputs(
+        self,
+        *,
+        event: MarketEvent,
+        market: str,
+        through_close_time: str,
+        required_families: set[str],
+    ) -> dict[str, list[str]]:
+        if self.snapshot_store is None:
+            return {}
+        product_ids = self.product_ids_by_market.get(market, ())
+        inputs = {
+            "order_book": ("best_bid_ask", "depth_update"),
+            "funding_open_interest": ("mark_price", "funding_rate"),
+        }
+        selected: dict[str, dict[str, str]] = {}
+        for family, event_types in inputs.items():
+            if family not in required_families:
+                continue
+            by_event: dict[str, str] = {}
+            for product_id in product_ids:
+                for event_type in event_types:
+                    candidate = self._latest_feature_market_input(
+                        event=event,
+                        product_id=product_id,
+                        event_type=event_type,
+                        through_close_time=through_close_time,
+                    )
+                    if candidate is not None:
+                        event_id, identity = candidate
+                        by_event.setdefault(event_id, identity)
+            selected[family] = by_event
+        result: dict[str, list[str]] = {}
+        for family, by_event in selected.items():
+            identities = sorted(by_event.values())
+            for identity in identities:
+                self.snapshot_store.get(identity)
+            result[family] = identities
+        return result
+
+    def _latest_feature_market_input(
+        self,
+        *,
+        event: MarketEvent,
+        product_id: str,
+        event_type: str,
+        through_close_time: str,
+    ) -> tuple[str, str] | None:
+        with self.queue.engine.connect() as connection:
+            rows = connection.execute(
+                select(market_input_sources.c.id, market_input_sources.c.payload)
+                .where(
+                    market_input_sources.c.payload["product_id"].as_string() == product_id,
+                    market_input_sources.c.payload["instrument_id"].as_string()
+                    == event.instrument_id,
+                    market_input_sources.c.payload["source_event_type"].as_string() == event_type,
+                    market_input_sources.c.payload["source_event_time"].as_string()
+                    <= through_close_time,
+                    market_input_sources.c.payload["availability_time"].as_string()
+                    <= event.availability_timestamp,
+                    market_input_sources.c.created_at <= event.availability_timestamp,
+                )
+                .order_by(
+                    market_input_sources.c.payload["source_event_time"].as_string().desc(),
+                    market_input_sources.c.payload["availability_time"].as_string().desc(),
+                    market_input_sources.c.id.desc(),
+                )
+                .limit(100)
+            ).mappings()
+            for row in rows:
+                payload = row["payload"]
+                if not isinstance(payload, Mapping):
+                    continue
+                event_id = payload.get("source_event_id")
+                if isinstance(payload.get("source_payload"), Mapping) and isinstance(event_id, str):
+                    return event_id, str(row["id"])
+        return None
 
 
 def _retry_at(value: str, seconds: int) -> str:
@@ -631,6 +796,58 @@ def _has_contiguous_sequence(event: MarketEvent) -> bool:
     )
 
 
+def _requires_market_input_buffer(event: MarketEvent) -> bool:
+    return event.event_type in {
+        MarketEventType.BEST_BID_ASK,
+        MarketEventType.DEPTH_UPDATE,
+        MarketEventType.MARK_PRICE,
+    } or (
+        event.event_type is MarketEventType.FUNDING_RATE
+        and bool(event.payload.get("source_event_id"))
+    )
+
+
+def _is_high_rate_event(event: MarketEvent) -> bool:
+    return (
+        _requires_market_input_buffer(event)
+        or event.event_type
+        in {
+            MarketEventType.TRADE,
+            MarketEventType.AGGREGATE_TRADE,
+        }
+        or (event.event_type is MarketEventType.CANDLE and not _is_closed_candle(event))
+    )
+
+
+def _market_snapshot_payload(
+    event: MarketEvent, product_id: str, values: Mapping[str, Any]
+) -> dict[str, Any]:
+    payload = {
+        "kind": "market_data_input",
+        "product_id": product_id,
+        "instrument_id": event.instrument_id,
+        "source_event_id": event.event_id,
+        "source_event_type": event.event_type.value,
+        "source_timeframe": event.payload.get("data", {}).get("k", {}).get("i"),
+        "source_open_time_ms": event.payload.get("data", {}).get("k", {}).get("t"),
+        "source_close_time_ms": event.payload.get("data", {}).get("k", {}).get("T"),
+        "source_candle_closed": event.payload.get("data", {}).get("k", {}).get("x"),
+        "source_event_time": event.exchange_timestamp,
+        "availability_time": event.availability_timestamp,
+        "values": dict(values),
+    }
+    if _requires_market_input_buffer(event):
+        payload.update(
+            {
+                "source_sequence": event.sequence,
+                "source_receive_time": event.receive_timestamp,
+                "source_close_time": event.close_timestamp,
+                "source_payload": dict(event.payload),
+            }
+        )
+    return payload
+
+
 def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
     raw_data = event.payload.get("data")
     if not isinstance(raw_data, Mapping):
@@ -651,7 +868,7 @@ def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
         return None
     if "close" in values and values["close"] <= 0:
         return None
-    if values.get("visible_depth", 0.0) < 0:
+    if values.get("visible_depth_quote", 0.0) < 0:
         return None
     return values
 
@@ -707,11 +924,17 @@ def _book_snapshot_values(
             ask, ask_depth = _book_level(ask_level[0])
     if bid is None or ask is None or bid <= 0 or ask < bid:
         return None
+    if bid_depth is None or ask_depth is None or min(bid_depth, ask_depth) < 0:
+        return None
     midpoint = (bid + ask) / 2.0
+    bid_quote = bid * bid_depth
+    ask_quote = ask * ask_depth
     return {
         "close": midpoint,
         "spread_bps": (ask - bid) / midpoint * 10_000.0,
-        "visible_depth": max(0.0, bid_depth or 0.0) + max(0.0, ask_depth or 0.0),
+        "bid_depth_quote": bid_quote,
+        "ask_depth_quote": ask_quote,
+        "visible_depth_quote": min(bid_quote, ask_quote),
     }
 
 

@@ -3,14 +3,14 @@
 Adaptive research runs on the Linux research service. The separate evaluator
 seals datasets and runs frozen evaluations, including protected holdouts.
 PostgreSQL is the lifecycle
-authority. Parquet is immutable input. Queue payloads contain identities and
+authority. Frozen datasets are immutable input; daily market partitions are published atomically. Queue payloads contain identities and
 commands, not results or raw datasets.
 
 ## Data supply chain
 
 1. `data-writer` stores closed market events and bars in partitioned Parquet.
 2. `universe-service` records a point-in-time eligible universe.
-3. The scheduled catalogue job resolves the latest eligible universe and builds a canonical bundle from available bars.
+3. The scheduler pins BTC spot or up to 12 eligible futures markets with sufficient listing history. The catalogue first builds the frozen dataset, then admits bounded candidate pages.
 4. The bundle records source partition hashes, intervals, availability times, feature manifest, cost model, and parameter-set identity.
 5. Missing universe, manifests, or complete history returns `waiting_for_dataset`; invalid partitions return `blocked_dataset`.
 6. Diagnostic or synthetic bootstrap bundles are excluded from catalogue and readiness authority.
@@ -25,6 +25,12 @@ and mutable deferral details remain available only to trusted operational reader
 Fixed-market studies use `SqlUniverseStore.record_fixed_research_scope`. These record
 the selection time and specification hash without asserting historical liquidity
 eligibility. Dynamic universe studies still require historical membership.
+The selected history cutoff is separate from download and bundle creation time.
+Retries retain the original bar interval while accepting evidence downloaded later.
+Fixed research scopes never become live capture universes. Successor epochs must
+have a non-overlapping protected interval after an opening. If a completed
+epoch rejected every candidate without opening protected data, a new daily
+epoch can continue within the shared admission budget.
 
 ## Candidate lifecycle
 
@@ -62,6 +68,24 @@ forward evidence is deferred. Missing or contradictory authority data fails
 closed. Statistical diagnostics such as PBO, bootstrap intervals, and regime
 breadth are not universal substitutes for economic evidence.
 
+Screening computes the executable contract and costed account path. Development
+adds its stability checks. Robustness owns perturbations and statistical
+diagnostics. Protected evaluation runs only the frozen strategy and its economic
+checks. It does not search parameters on the protected sample. A cross-sectional
+portfolio is evaluated as a portfolio; raw market returns are not evidence that
+its individual legs have independent edges.
+
+Research confidence approval binds the inference source and its numerical
+dependencies, not unrelated deployment tools. Live approval separately binds the
+full execution source and installed environment.
+
+Protected data stays unopened until the current research confidence policy has
+reviewed calibration approval. Calibration covers the configured maximum cohort,
+reports uncertainty on negative-control error rates, and is labelled as selection
+inference calibration. The joint bootstrap-t recalculates Bartlett HAC uncertainty
+for every resampled panel, retaining cross-candidate dependence. Economic execution and lifecycle contracts require their
+own validation. Neither calibration nor paper progress authorises live capital.
+
 ## Generation and agents
 
 Native generation persists an epoch and round cursor. Retries use the same
@@ -70,6 +94,14 @@ trial. For an explicitly finite campaign, the coordinator calls
 `ResearchRoundCoordinator.close_finite` with the complete registered candidate
 set before protected evaluation. A missing epoch leaves protected access
 pending. Closure cannot replace an adaptive epoch or admit another candidate.
+An admission-created epoch with no started rounds can be sealed as a finite
+campaign when its complete declaration matches all reserved trials.
+
+All providers share atomic daily and epoch trial limits. Catalogue pages contain
+at most 12 candidates and consume at most 80% of an epoch, leaving capacity for
+adaptive proposals. Family/symbol rotation survives restarts and epoch changes.
+Directional futures candidates have one symbol each. BTC tactical allocations
+use the smallest applicable product, instrument, strategy and sleeve cap.
 
 The separate `research_exploration` evaluator, grammar and file memory have
 been removed. Use the canonical generator, dataset and evaluation services
@@ -99,29 +131,46 @@ The transport credential cannot use operator routes. An accepted reply is stored
 before compilation intake; retries and expired-lease recovery finish that same
 reply without creating another proposal. New replies after the deadline fail.
 
-The bounded consumer is `python -m src.agents.consumer --api-url
-http://127.0.0.1:8088 --executable /absolute/path/to/openclaw --config
-/private/research-openclaw/openclaw.json --agent research --prompt
-config/openclaw_daily_review_prompt.md`. It performs one leased review per call.
-Its dedicated OpenClaw 2026.6 configuration requires an `agents.list` entry with
-that ID, a separate workspace, `tools.deny: ["*"]`, and sandbox mode `all` with
-workspace access `none`. The child receives a fresh local session and a minimal
-environment, with no transport, database or exchange credentials. The server's
-OpenClaw profile, provider access and service handover must be verified before
-enabling this consumer; the old bridge must be retired after that proof.
+The `agent-runtime` process polls the scoped API and sends the sealed request to
+`/run/trading-platform-model-broker/model.sock`. It never receives a model or
+operator credential. The local broker admits only the `trading-agent` peer,
+validates the request and its expiry, limits new attempts to four per hour, and
+caches successful request-bound proposals for idempotent delivery.
 
-The `agent-runtime` process runs this consumer repeatedly and never opens a
-database. Its `agent.env` must contain the scoped transport key and
-`TRADING_PLATFORM_OPENCLAW_EXECUTABLE`; the unit supplies the private configuration
-path, agent ID and loopback API URL. Database and configured exchange credentials
-cause startup to fail. Authenticated polling records its heartbeat through the
-control service. Trusted review creation, compilation and code checks run as
-`agent-coordinator` in the research process. Code checks use research-owned
-workspaces and do not commit by default. The agent user has no Git metadata access.
-Installed service-cycle checks require a separate
-`TRADING_PLATFORM_INSTALLED_TEST_DATABASE_URL`; the production database URL is
-not used for those checks. The installed agent ACL check verifies that the agent
-cannot read research state, Git metadata or other service environment files.
+The optional `trading-platform-model-broker.service` runs as the existing OpenClaw
+owner. Set its trusted executable and separate configuration paths in
+`/etc/trading-platform/model-broker/model-broker.env`. It uses the original
+OpenClaw authentication and shared refresh locks in place. Global state and
+session lookup are mounted into private service storage, so a research turn
+cannot restore or prune the main agent’s session registry;
+model credentials are not copied into the trading service. The separate research
+configuration must declare `tools.deny: ["*"]`, `skills: []`, sandbox mode `off`,
+workspace access `none`, and disabled hooks. Only the bundled native OpenAI
+provider plugin is allowed, with the embedded runtime selected explicitly.
+Installed provider overrides, additional plugin paths and source overlays are
+rejected; the native package recovery directory is hidden from the service. Its workspace and
+`agentDir` are separate directories under the existing OpenClaw state root.
+The broker command, agent, prompt and model configuration are fixed server-side.
+It cannot deliver messages or select another agent from a client request.
+
+The installer installs the broker unit but leaves it disabled until its paths,
+permissions and native authentication are verified. The broker group receives
+traversal-only access to the platform configuration parent; other service
+credentials and Docker sockets remain inaccessible. Trusted executable, prompt
+and configuration paths must not be group- or world-writable. The research
+process owns proposal compilation and code checks. The model-facing transport
+has no Git metadata access and does not commit changes.
+
+Installed database-cycle checks require three separate service URLs:
+`TRADING_PLATFORM_INSTALLED_RUNTIME_DATABASE_URL`,
+`TRADING_PLATFORM_INSTALLED_RESEARCH_DATABASE_URL`, and
+`TRADING_PLATFORM_INSTALLED_EVALUATOR_DATABASE_URL`. All three must target one
+isolated test database, with a distinct service-specific login for each domain.
+The verifier rejects the production database name before running a cycle. It
+does not load production service environment files into test processes, and it
+forces `TRADING_LIVE=0`.
+The installed agent ACL check verifies that the agent cannot read research
+state, Git metadata or other service environment files.
 
 ## Forward paper and promotion
 

@@ -157,11 +157,20 @@ def test_openclaw_compiler_rejects_specialised_or_hedged_scalar_theses(tmp_path)
 def test_openclaw_http_transport_compiles_a_candidate_into_the_normal_queue(
     tmp_path, monkeypatch
 ) -> None:
+    import os
     from pathlib import Path
+    from unittest.mock import Mock
 
     from test_platform_candidate_lifecycle import _bundle as market_bundle
 
     from src.agents.consumer import consume_review
+    from src.agents.model_broker import (
+        ModelBrokerError,
+        OpenClawModelBroker,
+        OpenClawModelBrokerServer,
+        peer_credentials_available,
+        request_model_proposal,
+    )
     from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
     from src.services.config import load_split_configuration
     from src.services.research_jobs import DatabaseResearchJobHandlers
@@ -194,6 +203,9 @@ def test_openclaw_http_transport_compiles_a_candidate_into_the_normal_queue(
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    broker_server = None
+    broker_thread = None
+    socket_dir = None
 
     def post(path, payload):
         request = Request(
@@ -226,51 +238,189 @@ def test_openclaw_http_transport_compiles_a_candidate_into_the_normal_queue(
         with pytest.raises(HTTPError) as denied:
             post("/agent/responses", tampered)
         assert denied.value.code == 400
-        workspace = tmp_path / "research-workspace"
+        state_dir = tmp_path / "openclaw-state"
+        state_dir.mkdir()
+        workspace = state_dir / "research-workspace"
         workspace.mkdir()
+        agent_dir = state_dir / "agents" / "research" / "agent"
+        agent_dir.mkdir(parents=True)
+        main_workspace = state_dir / "workspace"
+        main_workspace.mkdir()
+        main_agent_dir = state_dir / "agents" / "main" / "agent"
+        main_agent_dir.mkdir(parents=True)
         agent_config = tmp_path / "openclaw.json"
         agent_config.write_text(
             json.dumps(
                 {
+                    "plugins": {"enabled": False},
+                    "hooks": {"enabled": False},
                     "agents": {
+                        "defaults": {
+                            "workspace": str(main_workspace),
+                            "agentDir": str(main_agent_dir),
+                        },
                         "list": [
                             {
                                 "id": "research",
                                 "workspace": str(workspace),
+                                "agentDir": str(agent_dir),
+                                "skills": [],
                                 "tools": {"deny": ["*"]},
-                                "sandbox": {"mode": "all", "workspaceAccess": "none"},
+                                "sandbox": {"mode": "off", "workspaceAccess": "none"},
                             }
-                        ]
-                    }
+                        ],
+                    },
                 }
             )
         )
         executable = tmp_path / "openclaw-test-process"
-        output = json.dumps({"payloads": [{"text": json.dumps(payload)}]})
+        response_path = tmp_path / "fake-model-response.json"
+        invalid_payload = {
+            **payload,
+            "provenance": {**payload["provenance"], "review_id": "wrong-review"},
+        }
+        response_path.write_text(json.dumps({"payloads": [{"text": json.dumps(invalid_payload)}]}))
+        base_payload = json.dumps(payload)
+        call_log = tmp_path / "model-calls.log"
         executable.write_text(
             f"#!{sys.executable}\n"
             "import json, os, sys, uuid\n"
-            "assert '--local' in sys.argv and '--deliver' not in sys.argv\n"
+            "assert sys.argv[1:3] == ['agent', '--local']\n"
+            "assert '--deliver' not in sys.argv and '--model' not in sys.argv\n"
+            "assert sys.argv[sys.argv.index('--agent') + 1] == 'research'\n"
             "uuid.UUID(sys.argv[sys.argv.index('--session-id') + 1])\n"
+            "message = sys.argv[sys.argv.index('--message') + 1]\n"
+            "sealed_request = json.loads(message.split('Sealed review request:\\n', 1)[1])\n"
+            "assert 'Return one research proposal as JSON.' in message\n"
+            "assert 'Sealed review request:' in message\n"
+            f"assert os.environ['OPENCLAW_STATE_DIR'] == {str(state_dir)!r}\n"
+            f"assert os.environ['OPENCLAW_CONFIG_PATH'] == {str(agent_config)!r}\n"
+            f"assert os.environ['HOME'] == {str(workspace)!r} and os.getcwd() == {str(workspace)!r}\n"
             "assert not any(key.startswith(('TRADING_', 'EXCHANGE_')) for key in os.environ)\n"
-            f"print({output!r})\n"
+            f"open({str(call_log)!r}, 'a').write(sys.argv[sys.argv.index('--session-id') + 1] + '\\n')\n"
+            f"fixed_response = json.load(open({str(response_path)!r}))\n"
+            "if fixed_response is None:\n"
+            f"    model_proposal = json.loads({base_payload!r})\n"
+            "    model_proposal['created_at'] = sealed_request['requested_at']\n"
+            "    model_proposal['provenance'] = dict(model_proposal['provenance'], review_id=sealed_request['review_id'])\n"
+            "    fixed_response = {'payloads': [{'text': json.dumps(model_proposal)}]}\n"
+            "print(json.dumps(fixed_response))\n"
         )
         executable.chmod(0o700)
+        agent_config.chmod(0o600)
+        prompt_path = tmp_path / "prompt.md"
+        prompt_path.write_text("Return one research proposal as JSON.")
+        prompt_path.chmod(0o600)
+        ledger_path = tmp_path / "model-broker.sqlite3"
+        socket_dir = Path("/tmp") / f"model-broker-{os.urandom(4).hex()}"
+        socket_dir.mkdir(mode=0o700)
+        socket_path = socket_dir / "broker.sock"
+        broker = OpenClawModelBroker(
+            executable=executable,
+            config_path=agent_config,
+            state_dir=state_dir,
+            agent_id="research",
+            prompt_path=prompt_path,
+            ledger_path=ledger_path,
+        )
+        peer_uid_reader = None
+        if not peer_credentials_available():
+            peer_uid_reader = Mock(return_value=os.getuid())
+
+        server_arguments = (
+            {"peer_uid_reader": peer_uid_reader} if peer_uid_reader is not None else {}
+        )
+        broker_server = OpenClawModelBrokerServer(
+            socket_path,
+            broker,
+            allowed_uids=frozenset({os.getuid()}),
+            **server_arguments,
+        )
+        broker_thread = threading.Thread(target=broker_server.serve_forever, daemon=True)
+        broker_thread.start()
         monkeypatch.setenv("TRADING_PLATFORM_AGENT_TRANSPORT_KEY", key.hex())
         monkeypatch.setenv("EXCHANGE_API_KEY", "fixture-only-secret")
         now = (dt.datetime.fromisoformat(now) + dt.timedelta(minutes=11)).isoformat()
+        with pytest.raises(ModelBrokerError, match="proposal_request_binding_mismatch"):
+            request_model_proposal(socket_path, request, timeout=5)
+        response_path.write_text("null")
+        assert request_model_proposal(socket_path, request, timeout=5) == payload
         received = consume_review(
             api_url=f"http://127.0.0.1:{server.server_port}",
             key=key,
-            executable=executable,
-            config_path=agent_config,
-            agent_id="research",
-            prompt="Return one research proposal as JSON.",
+            broker_socket=socket_path,
         )
+        assert request_model_proposal(socket_path, request, timeout=5) == payload
+        with pytest.raises(ModelBrokerError, match="invalid_request"):
+            request_model_proposal(socket_path, {}, timeout=5)
+        for index in range(1, 3):
+            review_id = f"synthetic-review-{index}"
+            next_request = {**request, "review_id": review_id, "proposal_id": review_id}
+            synthetic = request_model_proposal(socket_path, next_request, timeout=5)
+            assert synthetic["provenance"]["review_id"] == review_id
+        limited_request = {**request, "review_id": "synthetic-review-3"}
+        limited_request["proposal_id"] = limited_request["review_id"]
+        with pytest.raises(ModelBrokerError, match="rate_limited"):
+            request_model_proposal(socket_path, limited_request, timeout=5)
+        sessions = call_log.read_text().splitlines()
+        assert len(sessions) == 4 and len(set(sessions)) == 4
         replay = post("/agent/responses", envelope)
         assert replay["proposal_id"] == received["proposal_id"]
         assert received["state"] == "responded"
+        broker_server.shutdown()
+        broker_server.server_close()
+        broker_thread.join(timeout=5)
+
+        broker = OpenClawModelBroker(
+            executable=executable,
+            config_path=agent_config,
+            state_dir=state_dir,
+            agent_id="research",
+            prompt_path=prompt_path,
+            ledger_path=ledger_path,
+        )
+        broker_server = OpenClawModelBrokerServer(
+            socket_path,
+            broker,
+            allowed_uids=frozenset({os.getuid()}),
+            **server_arguments,
+        )
+        broker_thread = threading.Thread(target=broker_server.serve_forever, daemon=True)
+        broker_thread.start()
+        assert request_model_proposal(socket_path, request, timeout=5) == payload
+        assert len(call_log.read_text().splitlines()) == 4
+        with pytest.raises(ModelBrokerError, match="rate_limited"):
+            request_model_proposal(
+                socket_path,
+                {
+                    **request,
+                    "review_id": "synthetic-review-4",
+                    "proposal_id": "synthetic-review-4",
+                },
+                timeout=5,
+            )
+
+        broker_server.shutdown()
+        broker_server.server_close()
+        broker_thread.join(timeout=5)
+        denied_broker_server = OpenClawModelBrokerServer(
+            socket_path,
+            broker,
+            allowed_uids=frozenset({os.getuid() + 1}),
+            **server_arguments,
+        )
+        broker_server = denied_broker_server
+        broker_thread = threading.Thread(target=broker_server.serve_forever, daemon=True)
+        broker_thread.start()
+        with pytest.raises(ModelBrokerError, match="unauthorised_peer"):
+            request_model_proposal(socket_path, request, timeout=5)
     finally:
+        if broker_thread is not None and broker_thread.is_alive():
+            broker_server.shutdown()
+            broker_server.server_close()
+            broker_thread.join(timeout=5)
+        if socket_dir is not None:
+            socket_dir.rmdir()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
@@ -493,3 +643,78 @@ def test_scheduled_agent_review_exposes_adaptive_failures_without_holdout_data()
     assert context.values["failure_reasons"] == {"negative_return": 3}
     assert "holdout_outcomes" not in context.values
     assert "protected_holdout" not in str(context.values).lower()
+
+
+def test_native_research_profile_rejects_plugin_overrides(tmp_path, monkeypatch):
+    import sqlite3
+
+    from src.agents.consumer import isolated_agent_environment
+
+    state = tmp_path / "state-root"
+    workspace = state / "research-workspace"
+    agent = state / "agents/research/agent"
+    workspace.mkdir(parents=True)
+    agent.mkdir(parents=True)
+    private = tmp_path / "private" / "openclaw-state"
+    private.mkdir(parents=True)
+    (state / "state").symlink_to(private, target_is_directory=True)
+    monkeypatch.setenv("TRADING_PLATFORM_OPENCLAW_PRIVATE_STATE", str(private))
+    registry = state / "state/openclaw.sqlite"
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "CREATE TABLE installed_plugin_index (index_key TEXT, install_records_json TEXT, plugins_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', '{}', '[]')"
+        )
+    config = {
+        "plugins": {
+            "enabled": True,
+            "allow": ["openai"],
+            "load": {"paths": []},
+            "entries": {"openai": {"enabled": True}},
+        },
+        "hooks": {"enabled": False},
+        "models": {
+            "providers": {
+                "openai": {
+                    "auth": "oauth",
+                    "api": "openai-chatgpt-responses",
+                    "baseUrl": "https://chatgpt.com/backend-api/codex",
+                    "agentRuntime": {"id": "openclaw"},
+                    "models": [{"id": "gpt-5.6-luna", "agentRuntime": {"id": "openclaw"}}],
+                }
+            }
+        },
+        "agents": {
+            "defaults": {"models": {"openai/gpt-5.6-luna": {"agentRuntime": {"id": "openclaw"}}}},
+            "list": [
+                {
+                    "id": "research",
+                    "workspace": str(workspace),
+                    "agentDir": str(agent),
+                    "tools": {"deny": ["*"]},
+                    "skills": [],
+                    "sandbox": {"mode": "off", "workspaceAccess": "none"},
+                }
+            ],
+        },
+    }
+    config["session"] = {"store": str(private.parent / "sessions/{agentId}/sessions.json")}
+    path = tmp_path / "research.json"
+    path.write_text(json.dumps(config))
+    environment = isolated_agent_environment(path, agent_id="research", state_dir=state)
+    assert environment["OPENCLAW_DISABLE_BUNDLED_SOURCE_OVERLAYS"] == "1"
+    config["plugins"]["load"]["paths"] = ["/tmp/custom-provider"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="only the bundled"):
+        isolated_agent_environment(path, agent_id="research", state_dir=state)
+    config["plugins"]["load"]["paths"] = []
+    path.write_text(json.dumps(config))
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "UPDATE installed_plugin_index SET install_records_json=?",
+            (json.dumps({"openai": {"source": "npm"}}),),
+        )
+    with pytest.raises(ValueError, match="overridden"):
+        isolated_agent_environment(path, agent_id="research", state_dir=state)

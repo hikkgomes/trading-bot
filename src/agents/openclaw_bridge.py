@@ -67,6 +67,8 @@ def build_agent_proposal(payload: dict[str, Any]) -> AgentProposal:
         thesis = raw_thesis
     else:
         raise AgentThesisError("OpenClaw thesis must be text or a typed object")
+    files = payload.get("files")
+    provenance = payload.get("provenance")
     return AgentProposal(
         proposal_id=str(payload.get("proposal_id") or ""),
         role=AgentRole(str(payload.get("role") or "")),
@@ -75,9 +77,9 @@ def build_agent_proposal(payload: dict[str, Any]) -> AgentProposal:
         created_at=str(payload.get("created_at") or ""),
         thesis=thesis,
         economic_thesis=economic_thesis,
-        files=payload.get("files") if isinstance(payload.get("files"), dict) else {},
+        files=files if isinstance(files, dict) else {},
         research_jobs=tuple(payload.get("research_jobs") or ()),
-        provenance=payload.get("provenance") if isinstance(payload.get("provenance"), dict) else {},
+        provenance=provenance if isinstance(provenance, dict) else {},
     )
 
 

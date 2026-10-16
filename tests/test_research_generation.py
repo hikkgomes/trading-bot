@@ -5,11 +5,13 @@ from dataclasses import replace
 
 from src.data.database import PlatformDatabase
 from src.domain._codec import canonical_hash
-from src.research.coordinator import ResearchCoordinator
+from src.research.catalogue import registered_strategy_candidate_page
+from src.research.coordinator import ResearchCoordinator, TrialCapacityError
 from src.research.datasets import RESEARCH_BUNDLE_ROLES, CanonicalResearchDatasetBuilder
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.generation import (
     CAMPAIGNS,
+    BtcAllocationLimits,
     GenerationAllocator,
     GenerationFeedback,
     HypothesisGenerator,
@@ -156,6 +158,234 @@ def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None
         "binance:futures:BTCUSDT:USDT",
     ]
     assert hypothesis.semantic_signature == hypothesis_signature(hypothesis.candidate.definition)
+
+
+def test_active_income_directional_generation_isolated_but_cross_sectional_stays_panel() -> None:
+    snapshots = (canonical_hash({"snapshot": "scope"}),)
+    directional = next(item for item in CAMPAIGNS if item.name == "futures_trend_following")
+    generated = HypothesisGenerator(
+        product="active_income", instrument_universe=("BTCUSDT", "ETHUSDT")
+    ).generate(
+        dataset_snapshot_hashes=snapshots,
+        submitted_at=NOW,
+        total_budget=2,
+        campaigns=(directional,),
+    )
+    assert len(generated) == 2
+    assert {tuple(item.candidate.definition.universe["symbols"]) for item in generated} == {
+        ("BTCUSDT",),
+        ("ETHUSDT",),
+    }
+
+    panel = next(item for item in CAMPAIGNS if item.name == "cross_sectional_momentum")
+    panel_candidate = (
+        HypothesisGenerator(product="active_income", instrument_universe=("BTCUSDT", "ETHUSDT"))
+        .generate(
+            dataset_snapshot_hashes=snapshots,
+            submitted_at=NOW,
+            total_budget=1,
+            campaigns=(panel,),
+        )[0]
+        .candidate
+    )
+    assert tuple(panel_candidate.definition.universe["symbols"]) == ("BTCUSDT", "ETHUSDT")
+
+
+def test_btc_allocation_uses_minimum_risk_cap_and_mutations_preserve_it(tmp_path) -> None:
+    limits = BtcAllocationLimits.from_mapping(
+        {
+            "product_max_tactical_fraction": 0.3,
+            "instrument_maximum_fraction": 0.2,
+            "strategy_maximum_fraction": 0.25,
+            "sleeve_maximum_fraction": 0.5,
+            "minimum_btc_fraction": 0.7,
+        }
+    )
+    campaign = next(item for item in CAMPAIGNS if item.name == "btc_trend_breakout")
+    snapshots = (canonical_hash({"snapshot": "btc-limits"}),)
+    first = build_hypothesis(
+        campaign,
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=snapshots,
+        submitted_at=NOW,
+        btc_allocation_limits=limits,
+    )
+    definition = first.candidate.definition
+    assert limits.maximum_tactical_fraction == 0.2
+    assert definition.signal_model["maximum_tactical_fraction"] == 0.2
+    assert definition.position_model["maximum_tactical_fraction"] == 0.2
+    assert definition.risk_policy["btc_allocation_limits"] == limits.to_payload()
+    lower_cap = BtcAllocationLimits.from_mapping(
+        {**limits.to_payload(), "product_max_tactical_fraction": 0.1}
+    )
+    lower = build_hypothesis(
+        campaign,
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=snapshots,
+        submitted_at=NOW,
+        btc_allocation_limits=lower_cap,
+    )
+    assert first.semantic_signature != lower.semantic_signature
+
+    database = _database(tmp_path)
+    SqlThesisRegistry(database.engine).register(first.thesis)
+    ResearchCoordinator(SqlResearchStore(database.engine)).submit(first.candidate)
+    mutation = HypothesisGenerator(
+        product="btc_accumulation",
+        instrument_universe=("BTCUSDT",),
+        memory=SqlHypothesisMemory(database.engine),
+        btc_allocation_limits=limits,
+    ).generate(
+        dataset_snapshot_hashes=snapshots,
+        submitted_at=NOW,
+        total_budget=1,
+        campaigns=(campaign,),
+        parent_candidates=(first.candidate,),
+    )[0]
+    assert mutation.candidate.definition.position_model["maximum_tactical_fraction"] == 0.2
+    assert (
+        mutation.candidate.definition.signal_model["btc_allocation_limits"] == limits.to_payload()
+    )
+    database.dispose()
+
+
+def test_catalogue_pages_round_robin_families_and_symbols() -> None:
+    snapshots = (canonical_hash({"snapshot": "catalogue-page"}),)
+    first, cursor, first_closed = registered_strategy_candidate_page(
+        product="active_income",
+        dataset_snapshot_hashes=snapshots,
+        instrument_universe=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+        cursor=0,
+        limit=12,
+        submitted_at=NOW,
+    )
+    second, next_cursor, second_closed = registered_strategy_candidate_page(
+        product="active_income",
+        dataset_snapshot_hashes=snapshots,
+        instrument_universe=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+        cursor=cursor,
+        limit=12,
+        submitted_at=NOW,
+    )
+    assert len(first) == len(second) == 12
+    assert len({item.candidate_id for item in (*first, *second)}) == 24
+    assert (
+        len(
+            {
+                (
+                    str(item.definition.metadata["manifest_family"]),
+                    str(item.definition.universe["symbols"][0]),
+                )
+                for item in first
+            }
+        )
+        >= 6
+    )
+    assert len({str(item.definition.universe["symbols"][0]) for item in first}) == 3
+    assert not first_closed and next_cursor > cursor
+    assert isinstance(second_closed, bool)
+
+
+def test_registration_reserves_catalogue_and_total_epoch_capacity(tmp_path) -> None:
+    database = _database(tmp_path)
+    store = SqlResearchStore(database.engine, epoch_trial_budget=2, daily_trial_budget=10)
+    campaign = next(item for item in CAMPAIGNS if item.name == "futures_trend_following")
+    snapshots = (canonical_hash({"snapshot": "unbundled-budget"}),)
+    candidates = tuple(
+        build_hypothesis(
+            campaign,
+            variant=variant,
+            instrument_universe=("BTCUSDT",),
+            dataset_snapshot_hashes=snapshots,
+            submitted_at=NOW,
+        )
+        for variant in range(3)
+    )
+    SqlThesisRegistry(database.engine).register(candidates[0].thesis)
+    coordinator = ResearchCoordinator(store)
+    coordinator.submit(candidates[0].candidate, producer="catalogue")
+    try:
+        coordinator.submit(candidates[1].candidate, producer="catalogue")
+    except TrialCapacityError as exc:
+        assert "80%" in str(exc)
+    else:
+        raise AssertionError("catalogue registration must leave epoch capacity available")
+    coordinator.submit(candidates[1].candidate, producer="adaptive")
+    try:
+        coordinator.submit(candidates[2].candidate, producer="adaptive")
+    except TrialCapacityError as exc:
+        assert "epoch" in str(exc)
+    else:
+        raise AssertionError("unique candidate registration must enforce the epoch limit")
+    database.dispose()
+
+
+def test_finite_closure_preserves_admission_epoch_and_rejects_started_round(tmp_path) -> None:
+    from sqlalchemy import select
+    from test_platform_candidate_lifecycle import _bundle, _candidate
+
+    from src.data.database import research_epoch
+    from src.research.rounds import ResearchRoundCoordinator
+
+    database = _database(tmp_path)
+    rounds = ResearchRoundCoordinator(database.engine)
+    bundle = _bundle(database)
+    candidate = _candidate(database, bundle)
+    with database.engine.connect() as connection:
+        before = connection.execute(select(research_epoch)).mappings().one()
+    epoch_id = rounds.close_finite(
+        bundle.bundle_id,
+        product_id="active_income",
+        candidate_ids=[candidate.candidate_id],
+        at=NOW,
+    )
+    with database.engine.connect() as connection:
+        closed = connection.execute(select(research_epoch)).mappings().one()
+    assert epoch_id == before["id"] == closed["id"]
+    assert closed["budget"] == before["budget"]
+    assert closed["consumed"] == before["consumed"] == 1
+    assert closed["round_cursor"] == before["round_cursor"] == 0
+    assert closed["state"] == "closed_for_selection"
+    assert closed["payload"]["closure_reason"] == "finite_campaign"
+    assert closed["payload"]["finite_campaign_id"]
+    assert (
+        rounds.close_finite(
+            bundle.bundle_id,
+            product_id="active_income",
+            candidate_ids=[candidate.candidate_id],
+            at=NOW,
+        )
+        == epoch_id
+    )
+
+    adaptive_bundle = _bundle(database, source_revision=1)
+    adaptive_candidate = _candidate(database, adaptive_bundle)
+    request = rounds.claim(
+        {
+            "product_id": "active_income",
+            "dataset_bundle_id": adaptive_bundle.bundle_id,
+            "generation_budget": 1,
+            "producer": "catalogue",
+        },
+        now=NOW,
+        epoch_budget=100,
+        daily_budget=100,
+    )
+    assert request is not None
+    try:
+        rounds.close_finite(
+            adaptive_bundle.bundle_id,
+            product_id="active_income",
+            candidate_ids=[adaptive_candidate.candidate_id],
+            at=NOW,
+        )
+    except ValueError as exc:
+        assert "adaptive epoch" in str(exc)
+    else:
+        raise AssertionError("a started research round must reject finite closure")
+    database.dispose()
 
 
 def test_hypothesis_generator_records_and_skips_an_exact_duplicate(tmp_path) -> None:

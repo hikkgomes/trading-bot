@@ -15,10 +15,10 @@ from src.data.database import (
     account_snapshot,
     balance_snapshot,
     exchange_order,
+    market_input_sources,
     order_intent,
     position,
     reconciliation_event,
-    risk_snapshot,
     service_heartbeat,
 )
 from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
@@ -87,12 +87,18 @@ class DatabasePortfolioSourceService:
         products: Mapping[str, Mapping[str, Any]],
         accounts: Mapping[str, Mapping[str, Any]],
         health_node_id: str | None = None,
+        maximum_market_age_seconds: float = 5.0,
+        required_health_services: tuple[str, ...] = (),
     ) -> None:
         self.engine = engine
         self.store = store
         self.products = {str(key): dict(value) for key, value in products.items()}
         self.accounts = {str(key): dict(value) for key, value in accounts.items()}
         self.health_node_id = health_node_id
+        self.required_health_services = required_health_services
+        if not math.isfinite(maximum_market_age_seconds) or maximum_market_age_seconds <= 0:
+            raise ValueError("market freshness limit must be positive")
+        self.maximum_market_age_seconds = maximum_market_age_seconds
         self.risk_calculator = PortfolioRiskCalculator(engine)
         self.accounting = AccountingService(engine=engine)
 
@@ -142,7 +148,7 @@ class DatabasePortfolioSourceService:
         observed_at = max(
             value for value in (balance_at, positions_at, orders_at, market_at) if value is not None
         )
-        health_values, health_at = self._health(now)
+        health_values, health_at = self._health(now, market_at=market_at)
         if not health_values:
             return
         drift_values, drift_at = self._drift(
@@ -497,7 +503,14 @@ class DatabasePortfolioSourceService:
         latest_times: dict[str, str] = {}
         field_times: dict[str, dict[str, str]] = {}
 
-        for row in rows:
+        for row in sorted(
+            rows,
+            key=lambda item: (
+                item["payload"].get("source_event_time") or item["created_at"],
+                item["id"],
+            ),
+            reverse=True,
+        ):
             self._capture_market_row(
                 row,
                 product_id=product_id,
@@ -511,7 +524,7 @@ class DatabasePortfolioSourceService:
             instrument_ids=tuple(latest_values),
             timeframe=str(product.get("dataset_timeframe") or "1m"),
         )
-        return self._complete_market(
+        market = self._complete_market(
             latest_values=latest_values,
             latest_times=latest_times,
             field_times=field_times,
@@ -519,7 +532,19 @@ class DatabasePortfolioSourceService:
             market_type=market_type,
             product=product,
             at=at,
+            maximum_market_age_seconds=self.maximum_market_age_seconds,
         )
+        self._pin_market_inputs(market[0])
+        return market
+
+    def _pin_market_inputs(self, market: Mapping[str, Mapping[str, Any]]) -> None:
+        identities: set[str] = set()
+        for values in market.values():
+            source_ids = values.get("source_snapshot_ids")
+            if isinstance(source_ids, Mapping):
+                identities.update(str(identity) for identity in source_ids.values())
+        for identity in identities:
+            self.store.get(identity)
 
     def _market_rows(self, product_id: str, at: str):
         product = self.products.get(product_id, {})
@@ -528,27 +553,74 @@ class DatabasePortfolioSourceService:
             2 * timeframe_seconds(str(product.get("dataset_timeframe") or "1m")),
         )
         oldest = (dt.datetime.fromisoformat(at) - dt.timedelta(seconds=horizon)).isoformat()
+        scope = tuple(product.get("instrument_ids", ()))
+        if not scope and product_id == "btc_accumulation":
+            scope = ("binance:spot:BTCUSDT",)
+        elif not scope and product.get("live_exchange_symbols"):
+            scope = tuple(
+                f"binance:futures:{symbol}:USDT" for symbol in product["live_exchange_symbols"]
+            )
+        if scope:
+            return self._latest_market_fields(product_id, scope, at, oldest)
+        source = market_input_sources
         with self.engine.connect() as connection:
             return connection.execute(
-                select(risk_snapshot.c.id, risk_snapshot.c.payload, risk_snapshot.c.created_at)
+                select(source.c.id, source.c.payload, source.c.created_at)
                 .where(
-                    risk_snapshot.c.created_at <= at,
-                    risk_snapshot.c.created_at >= oldest,
+                    source.c.created_at <= at,
+                    source.c.created_at >= oldest,
                     or_(
-                        risk_snapshot.c.payload["availability_time"].as_string().is_(None),
-                        risk_snapshot.c.payload["availability_time"].as_string() <= at,
+                        source.c.payload["availability_time"].as_string().is_(None),
+                        source.c.payload["availability_time"].as_string() <= at,
                     ),
-                    risk_snapshot.c.payload["kind"].as_string() == "market_data_input",
-                    risk_snapshot.c.payload["product_id"].as_string() == product_id,
+                    source.c.payload["product_id"].as_string() == product_id,
                     or_(
                         product.get("book_id") is None,
-                        risk_snapshot.c.payload["instrument_id"]
+                        source.c.payload["instrument_id"]
                         .as_string()
                         .in_(product.get("instrument_ids", ())),
                     ),
                 )
-                .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
+                .order_by(source.c.created_at.desc(), source.c.id.desc())
             ).mappings()
+
+    def _latest_market_fields(self, product_id, scope, at, oldest):
+        source = market_input_sources
+        values = source.c.payload["values"]
+        fields = (
+            or_(values["close"].as_float().is_not(None), values["price"].as_float().is_not(None)),
+            values["visible_depth_quote"].as_float().is_not(None),
+            or_(
+                values["funding"].as_float().is_not(None),
+                values["funding_rate"].as_float().is_not(None),
+            ),
+        )
+        rows = {}
+        with self.engine.connect() as connection:
+            for instrument_id in scope:
+                for present in fields:
+                    row = (
+                        connection.execute(
+                            select(source)
+                            .where(
+                                source.c.payload["product_id"].as_string() == product_id,
+                                source.c.payload["instrument_id"].as_string() == instrument_id,
+                                source.c.created_at.between(oldest, at),
+                                or_(
+                                    source.c.payload["availability_time"].as_string().is_(None),
+                                    source.c.payload["availability_time"].as_string() <= at,
+                                ),
+                                present,
+                            )
+                            .order_by(source.c.created_at.desc(), source.c.id.desc())
+                            .limit(1)
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    if row is not None:
+                        rows[row["id"]] = row
+        return sorted(rows.values(), key=lambda row: (row["created_at"], row["id"]), reverse=True)
 
     @staticmethod
     def _capture_market_row(
@@ -571,11 +643,10 @@ class DatabasePortfolioSourceService:
         if not instrument_id or not isinstance(raw, Mapping):
             return
         values = latest_values.setdefault(instrument_id, {})
+        _capture_book_fields(raw, values, field_times.setdefault(instrument_id, {}), row)
         for source_name, target_name in {
             "close": "price",
             "price": "price",
-            "spread_bps": "spread_bps",
-            "visible_depth": "visible_depth",
             "volatility": "volatility",
             "funding": "funding",
             "funding_rate": "funding",
@@ -587,7 +658,9 @@ class DatabasePortfolioSourceService:
                 continue
             values[target_name] = value
             values.setdefault("source_snapshot_ids", {})[target_name] = str(row["id"])
-            field_times.setdefault(instrument_id, {})[target_name] = str(row["created_at"])
+            field_times.setdefault(instrument_id, {})[target_name] = str(
+                payload.get("source_event_time") or row["created_at"]
+            )
             latest_times.setdefault(instrument_id, str(row["created_at"]))
 
     @staticmethod
@@ -600,8 +673,9 @@ class DatabasePortfolioSourceService:
         market_type: str,
         product: Mapping[str, Any],
         at: str,
+        maximum_market_age_seconds: float = 5.0,
     ) -> tuple[dict[str, dict[str, Any]], str | None]:
-        required = {"price", "spread_bps", "visible_depth", "volatility"}
+        required = {"price", "spread_bps", "visible_depth_quote", "volatility"}
         market: dict[str, dict[str, Any]] = {}
         latest_at: str | None = None
         for instrument_id, values in latest_values.items():
@@ -621,15 +695,22 @@ class DatabasePortfolioSourceService:
                 at=at,
             ):
                 continue
-            if not required.issubset(values):
+            times = field_times.get(instrument_id, {})
+            quote_fields = {"price", "spread_bps", "visible_depth_quote"}
+            if not required.issubset(values) or not _fresh_market_fields(
+                times, quote_fields, at, maximum_market_age_seconds
+            ):
                 continue
             values["market_type"] = market_type
+            values["field_times"] = dict(times)
             market[instrument_id] = values
-            row_time = latest_times[instrument_id]
-            latest_at = row_time if latest_at is None else max(latest_at, row_time)
+            row_time = min(times[field] for field in quote_fields)
+            latest_at = row_time if latest_at is None else min(latest_at, row_time)
         return market, latest_at
 
-    def _health(self, at: str) -> tuple[dict[str, Any], str | None]:
+    def _health(
+        self, at: str, *, market_at: str | None = None
+    ) -> tuple[dict[str, Any], str | None]:
         statement = select(
             service_heartbeat.c.service_name,
             service_heartbeat.c.node_id,
@@ -639,6 +720,10 @@ class DatabasePortfolioSourceService:
         ).where(service_heartbeat.c.observed_at <= at)
         if self.health_node_id is not None:
             statement = statement.where(service_heartbeat.c.node_id == self.health_node_id)
+        if self.required_health_services:
+            statement = statement.where(
+                service_heartbeat.c.service_name.in_(self.required_health_services)
+            )
         statement = statement.order_by(
             service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc()
         )
@@ -659,19 +744,24 @@ class DatabasePortfolioSourceService:
             if key in latest:
                 continue
             payload = row["payload"] if isinstance(row["payload"], Mapping) else {}
-            latest[key] = (bool(row["healthy"]), payload)
+            age = (
+                dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(observed_at)
+            ).total_seconds()
+            latest[key] = (bool(row["healthy"]) and 0 <= age <= 60, payload)
         if not latest:
             return {}, None
         statuses = {
             f"{service}@{node}": healthy[0] for (service, node), healthy in sorted(latest.items())
         }
-        market_age = self._latest_market_age(at)
+        for service in set(self.required_health_services) - {key[0] for key in latest}:
+            statuses[f"{service}@{self.health_node_id or 'missing'}"] = False
+        market_age = (
+            (dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(market_at)).total_seconds()
+            if market_at is not None
+            else float("inf")
+        )
         clock_skew = max(
-            (
-                abs(_number(payload.get("clock_skew_seconds")))
-                for _healthy, payload in latest.values()
-                if payload.get("clock_skew_seconds") is not None
-            ),
+            (_clock_skew(payload) for _healthy, payload in latest.values()),
             default=0.0,
         )
         return (
@@ -683,31 +773,6 @@ class DatabasePortfolioSourceService:
                 "services": statuses,
             },
             latest_observed_at,
-        )
-
-    def _latest_market_age(self, at: str) -> float:
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(risk_snapshot.c.created_at, risk_snapshot.c.payload)
-                .where(risk_snapshot.c.created_at <= at)
-                .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
-            ).mappings()
-            observed_at = next(
-                (
-                    row["created_at"]
-                    for row in rows
-                    if isinstance(row["payload"], Mapping)
-                    and row["payload"].get("kind") == "market_data_input"
-                ),
-                None,
-            )
-        if observed_at is None:
-            return float("inf")
-        return max(
-            0.0,
-            (
-                dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(str(observed_at))
-            ).total_seconds(),
         )
 
     def _database_healthy(self) -> bool:
@@ -1036,6 +1101,45 @@ def portfolio_state_policies(
             "sleeve_budgets": {name: sleeve_budget for name in sleeves},
         }
     return result
+
+
+def _clock_skew(payload):
+    clocks = payload.get("clock_status", {})
+    values = [abs(_number(payload.get("clock_skew_seconds")))]
+    if isinstance(clocks, Mapping):
+        values.extend(
+            abs(_number(value["skew_ms"])) / 1000
+            for value in clocks.values()
+            if isinstance(value, Mapping) and "skew_ms" in value
+        )
+    return max(values)
+
+
+def _capture_book_fields(raw, values, times, row):
+    required = {"spread_bps", "visible_depth_quote"}
+    sides = {"bid_depth_quote", "ask_depth_quote"}
+    if required & values.keys() or not required.issubset(raw):
+        return
+    if sides & raw.keys() and not sides.issubset(raw):
+        return
+    fields = required | (sides & raw.keys())
+    measured = {key: float(raw[key]) for key in fields}
+    if any(not math.isfinite(value) or value < 0 for value in measured.values()):
+        return
+    values.update(measured)
+    values.setdefault("source_snapshot_ids", {}).update(dict.fromkeys(fields, str(row["id"])))
+    observed_at = str(row["payload"].get("source_event_time") or row["created_at"])
+    times.update(dict.fromkeys(fields, observed_at))
+
+
+def _fresh_market_fields(
+    times: Mapping[str, str], fields: set[str], at: str, maximum_age: float
+) -> bool:
+    now = dt.datetime.fromisoformat(at)
+    return fields.issubset(times) and all(
+        0 <= (now - dt.datetime.fromisoformat(times[field])).total_seconds() <= maximum_age
+        for field in fields
+    )
 
 
 def _number(value: object) -> float:

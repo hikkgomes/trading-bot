@@ -95,9 +95,14 @@ def quarantine_legacy_research_jobs(
     return {"schema": "platform.upgrade/v1", "already_applied": False, **marker_payload}
 
 
-def _quarantine_batch(connection, rows, observed_at: str) -> list[str]:
+def _quarantine_batch(
+    connection,
+    rows,
+    observed_at: str,
+    *,
+    reason: str = "legacy_research_queue_excluded_from_platform_v2",
+) -> list[str]:
     ids = [str(row["id"]) for row in rows]
-    reason = "legacy_research_queue_excluded_from_platform_v2"
     existing = set(
         connection.execute(
             select(job_quarantine.c.job_id).where(job_quarantine.c.job_id.in_(ids))

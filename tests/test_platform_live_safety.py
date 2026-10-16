@@ -36,6 +36,116 @@ NOW = "2026-09-09T00:00:00+00:00"
 INSTRUMENT = "binance:futures:BTCUSDT:USDT"
 
 
+@pytest.mark.parametrize(
+    "side,observed_at,accepted",
+    [
+        (OrderSide.BUY, NOW, False),
+        (OrderSide.SELL, NOW, True),
+        (OrderSide.SELL, "2026-09-08T23:59:00+00:00", False),
+        (OrderSide.SELL, "2026-09-09T00:00:01+00:00", False),
+        (OrderSide.SELL, None, False),
+    ],
+)
+def test_final_entry_guard_uses_exchange_time_and_execution_side(
+    tmp_path, side, observed_at, accepted
+):
+    from src.risk.engine import SqlRiskSnapshotStore
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'entry-quote.sqlite3'}")
+    database.create_schema()
+    SqlRiskSnapshotStore(database.engine).save(
+        {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": INSTRUMENT,
+            "source_event_time": observed_at,
+            "values": {
+                "close": 100,
+                "spread_bps": 1,
+                "bid_depth_quote": 2000,
+                "ask_depth_quote": 50,
+            },
+        },
+        created_at=NOW,
+    )
+    guard = ApprovedLiveExecution.__new__(ApprovedLiveExecution)
+    guard.engine = database.engine
+    guard.products = {"active_income": {"account_id": "account"}}
+    guard.risk_configuration = {
+        "global": {"maximum_market_data_staleness_seconds": 5},
+        "instrument": {"maximum_visible_depth_fraction": 0.1, "maximum_slippage_bps": 25},
+    }
+    intent = OrderIntent(
+        "entry",
+        "portfolio",
+        INSTRUMENT,
+        side,
+        1,
+        OrderType.MARKET,
+        NOW,
+        valid_until="2026-09-09T00:01:00+00:00",
+    )
+    if accepted:
+        guard._assert_market_admission({"product_id": "active_income"}, intent)
+    else:
+        with pytest.raises(PermissionError):
+            guard._assert_market_admission({"product_id": "active_income"}, intent)
+    guard._assert_market_admission(
+        {"product_id": "active_income"}, replace(intent, reduce_only=True)
+    )
+    database.dispose()
+
+
+def test_recovery_replay_is_idempotent_but_later_equal_exposure_gets_a_new_order(tmp_path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'flatten-identity.sqlite3'}")
+    database.create_schema()
+    orders = OrderManager(SqlOrderStore(database.engine))
+    recovery = ApprovedLiveExecution.__new__(ApprovedLiveExecution)
+    recovery.engine = database.engine
+    recovery.order_manager = orders
+    recovery.positions = PositionManager(SqlPositionStore(database.engine))
+    recovery.product_portfolios = {"active_income": "portfolio"}
+    recovery.products = {
+        "active_income": {"account_id": "account", "base_accounting_asset": "USDT"}
+    }
+    recovery.accounts = {
+        "account": {"account_id": "account", "environment": "testnet", "venue": "binance"}
+    }
+    recovery.venues = {
+        "active_income": SimpleNamespace(
+            instruments={INSTRUMENT: SimpleNamespace(exchange_symbol="BTCUSDT")},
+            broker=SimpleNamespace(get_price=lambda _: 100),
+            submit=orders.create,
+        )
+    }
+    first = recovery.recover_action(
+        "active_income",
+        RecoveryAction(
+            RecoveryActionType.EMERGENCY_FLATTEN, INSTRUMENT, 1, operation_id="incident-1"
+        ),
+    )
+    identity = first["order_id"]
+    orders.persist_for_submission(identity)
+    orders.submitted(identity)
+    orders.apply_fill(Fill("recovery-fill", identity, INSTRUMENT, OrderSide.SELL, 1, 100, 0, NOW))
+    replay = recovery.recover_action(
+        "active_income",
+        RecoveryAction(
+            RecoveryActionType.EMERGENCY_FLATTEN, INSTRUMENT, 1, operation_id="incident-1"
+        ),
+    )
+    assert replay["order_id"] == identity and len(orders.all()) == 1
+    later = recovery.recover_action(
+        "active_income",
+        RecoveryAction(
+            RecoveryActionType.EMERGENCY_FLATTEN, INSTRUMENT, 1, operation_id="incident-2"
+        ),
+    )
+    assert later["order_id"] != identity and len(orders.all()) == 2
+    assert all(order.reduce_only for order in orders.all())
+    database.dispose()
+
+
 class NativeBroker:
     def __init__(self):
         self.trades = {}

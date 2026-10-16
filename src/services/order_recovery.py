@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from src.domain._codec import canonical_hash, timestamp
@@ -90,7 +91,12 @@ class DatabaseLiveRecoveryWorker:
             action_results: tuple[dict[str, Any], ...] = ()
             if self.execute_action is not None:
                 action_results = tuple(
-                    dict(self.execute_action(product_id, action)) for action in plan.actions
+                    dict(
+                        self.execute_action(
+                            product_id, replace(action, operation_id=claimed.job_id)
+                        )
+                    )
+                    for action in plan.actions
                 )
                 verification = self.reconcile_product(product_id)
                 if verification.recovery_required:

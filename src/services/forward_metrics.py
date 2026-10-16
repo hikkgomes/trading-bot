@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from src.data.database import (
     account_snapshot,
@@ -16,6 +16,7 @@ from src.data.database import (
     book_fill_allocation,
     exchange_order,
     fill,
+    market_input_sources,
     nav_snapshot,
     order_intent,
     position,
@@ -840,23 +841,32 @@ class ForwardEvidenceCollector:
         return None
 
     def _opening_market_price(self, product_id: str, instrument_id: str, at: str) -> float | None:
+        source = market_input_sources
         with self.engine.connect() as connection:
             row = (
                 connection.execute(
-                    select(risk_snapshot.c.payload)
+                    select(source.c.id)
                     .where(
-                        risk_snapshot.c.created_at <= at,
-                        risk_snapshot.c.payload["kind"].as_string() == "market_data_input",
-                        risk_snapshot.c.payload["product_id"].as_string() == product_id,
-                        risk_snapshot.c.payload["instrument_id"].as_string() == instrument_id,
+                        source.c.created_at <= at,
+                        source.c.payload["product_id"].as_string() == product_id,
+                        source.c.payload["instrument_id"].as_string() == instrument_id,
+                        or_(
+                            source.c.payload["availability_time"].as_string().is_(None),
+                            source.c.payload["availability_time"].as_string() <= at,
+                        ),
                     )
-                    .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
+                    .order_by(source.c.created_at.desc(), source.c.id.desc())
                     .limit(1)
                 )
                 .mappings()
                 .one_or_none()
             )
-        return _latest_market_price((row,)) if row is not None else None
+        if row is None:
+            return None
+        from src.risk.engine import SqlRiskSnapshotStore
+
+        payload = SqlRiskSnapshotStore(self.engine).get(str(row["id"]))
+        return _latest_market_price(({"payload": payload},))
 
     def _capacity_and_budget(
         self,
@@ -880,7 +890,7 @@ class ForwardEvidenceCollector:
             values = payload.get("values") if isinstance(payload, Mapping) else None
             if not isinstance(values, Mapping):
                 continue
-            depth = _positive_or_zero(values.get("visible_depth"))
+            depth = _positive_or_zero(values.get("visible_depth_quote"))
             price = _positive_or_zero(values.get("close", values.get("price")))
             instrument_id = (
                 str(payload.get("instrument_id") or "") if isinstance(payload, Mapping) else ""

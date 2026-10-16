@@ -96,6 +96,93 @@ class ExecutionResult:
 Executor = Callable[[Candidate, Mapping[str, Any]], ExecutionResult]
 ContextCandidate: TypeAlias = Candidate | CandidateEvaluationView
 ContextBuilder = Callable[[ContextCandidate, Mapping[str, Any]], Mapping[str, Any]]
+_DIRECTIONAL_SOURCES = frozenset(
+    {
+        StrategySourceType.REGISTERED_PYTHON,
+        StrategySourceType.GENERATED_DSL,
+        StrategySourceType.MACHINE_LEARNING,
+        StrategySourceType.PARAMETER_SEARCH,
+        StrategySourceType.MUTATION,
+        StrategySourceType.CROSSOVER,
+        StrategySourceType.AGENT_GENERATED_PYTHON,
+    }
+)
+_MEASURED_STAGES = frozenset({"screening", "development", "robustness", "protected", "forward"})
+_COMMON_STAGE_FIELDS = frozenset(
+    {
+        "evidence_policy_hash",
+        "data_integrity",
+        "semantic_parity",
+        "realistic_costs",
+        "family_evidence",
+        "cost_adjusted_return",
+        "return_ledger",
+        "product_accounting",
+        "objective_status",
+        "objective_unit",
+        "objective_value",
+        "benchmark_value",
+        "objective_excess",
+        "objective_excess_fraction",
+        "accounting",
+        "accounting_return",
+        "fees",
+        "slippage",
+        "funding",
+        "funding_pnl",
+        "output_hash",
+        "observations",
+        "behaviour_hash",
+        "parity_receipt",
+    }
+)
+_STAGE_EVIDENCE_FIELDS = {
+    "screening": _COMMON_STAGE_FIELDS
+    | frozenset(
+        {
+            "compiled",
+            "features_valid",
+            "causality_valid",
+            "signal_frequency",
+            "turnover",
+        }
+    ),
+    "development": _COMMON_STAGE_FIELDS
+    | frozenset(
+        {
+            "chronological",
+            "regime_breakdown",
+            "parameter_stability",
+            "sample_evidence",
+            "cross_symbol_stability",
+            "universe_evidence",
+            "portfolio_overlap",
+        }
+    ),
+    "protected": _COMMON_STAGE_FIELDS
+    | frozenset(
+        {
+            "chronological",
+            "sample_evidence",
+            "drawdown_stability",
+        }
+    ),
+    "forward": _COMMON_STAGE_FIELDS
+    | frozenset(
+        {
+            "production_equivalent",
+            "exact_strategy_identity",
+            "exact_artefact_hash",
+            "exact_engine_hash",
+            "exact_cost_model",
+            "drift_checks",
+            "duration",
+            "evidence_units",
+            "sample_evidence",
+            "forward_duration",
+        }
+    ),
+}
 
 
 class ProviderContextBuilderRegistry:
@@ -163,10 +250,9 @@ class ProviderExecutorRegistry:
             raise ExecutorError(f"no executor registered for {source_type.value}") from exc
 
     def execute(self, candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
-        diagnostic = any(
-            metadata.get("diagnostic") is True or metadata.get("promotable") is False
-            for metadata in (candidate.metadata, candidate.definition.metadata)
-        )
+        diagnostic = _diagnostic_execution(candidate, context)
+        if not diagnostic:
+            _enforce_directional_scope(candidate, context)
         reason = _unsupported_economic_contract(candidate)
         if reason is not None and not diagnostic:
             raise UnsupportedExecutorError(reason)
@@ -187,6 +273,37 @@ class ProviderExecutorRegistry:
         registry.register(StrategySourceType.ENSEMBLE, execute_ensemble)
         registry.register(StrategySourceType.AGENT_GENERATED_PYTHON, execute_agent_generated_python)
         return registry
+
+
+def _diagnostic_execution(candidate: Candidate, context: Mapping[str, Any]) -> bool:
+    return context.get("diagnostic") is True or any(
+        metadata.get("diagnostic") is True or metadata.get("promotable") is False
+        for metadata in (candidate.metadata, candidate.definition.metadata)
+    )
+
+
+def _enforce_directional_scope(candidate: Candidate, context: Mapping[str, Any]) -> None:
+    if candidate.definition.source_type not in _DIRECTIONAL_SOURCES:
+        return
+    scope = context.get("instrument_scope") or context.get("expected_symbols")
+    if not scope:
+        universe = candidate.definition.universe
+        scope = universe.get("instrument_ids") or universe.get("symbols") or ()
+    if isinstance(scope, Mapping):
+        scope = tuple(scope)
+    if isinstance(scope, str):
+        scope = (scope,)
+    if not isinstance(scope, Sequence):
+        return
+    instruments = {
+        str(item.get("instrument_id") or item.get("symbol") or "").strip()
+        if isinstance(item, Mapping)
+        else str(item).strip()
+        for item in scope
+    }
+    instruments.discard("")
+    if len(instruments) > 1:
+        raise UnsupportedExecutorError("directional executors require a single instrument scope")
 
 
 def _unsupported_economic_contract(candidate: Candidate) -> str | None:
@@ -217,6 +334,72 @@ def _unsupported_economic_contract(candidate: Candidate) -> str | None:
         if name == "funding_adjusted_ranking":
             return "funding-aware multi-leg settlement accounting is not implemented"
     return unavailable.get(source)
+
+
+def _measurement_stage(context: Mapping[str, Any]) -> str | None:
+    stage = context.get("requested_stage")
+    if stage is not None and stage not in _MEASURED_STAGES:
+        raise ExecutorError(f"unsupported measurement stage: {stage}")
+    return stage
+
+
+def _sample_evidence(
+    candidate: Candidate,
+    snapshots: tuple[str, ...],
+    returns: list[float],
+    aligned: int,
+    completed: Any,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "passed": aligned >= 3,
+        "status": "measured" if completed is not None else "unavailable",
+        "observations": aligned,
+        "closed_trades": completed,
+        "completed_episodes": completed,
+        "independence_estimated": False,
+        "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
+        "calendar_days": float(context.get("calendar_days", 0.0)),
+        "run_id": canonical_hash(
+            {
+                "kind": "sample_evidence/v1",
+                "candidate_id": candidate.candidate_id,
+                "dataset_snapshot_ids": list(snapshots),
+                "returns": returns,
+            }
+        ),
+        "input_hash": canonical_hash({"dataset_snapshot_ids": list(snapshots), "returns": returns}),
+    }
+
+
+def _universe_evidence(candidate: Candidate, context: Mapping[str, Any]) -> dict[str, Any]:
+    definition = candidate.definition.universe
+    declared_symbols = definition.get("symbols")
+    declared_ids = definition.get("instrument_ids")
+    declared = tuple(
+        str(item)
+        for values in (declared_symbols, declared_ids)
+        if isinstance(values, list | tuple)
+        for item in values
+    )
+    scope = tuple(str(item) for item in context.get("instrument_scope", ()))
+    predeclared = bool(declared)
+    if scope:
+        predeclared = predeclared and all(
+            observed in declared
+            or any(
+                observed.endswith(f":{symbol}") or observed.endswith(f":{symbol}:USDT")
+                for symbol in declared
+            )
+            for observed in scope
+        )
+    return {
+        "passed": predeclared,
+        "predeclared": predeclared,
+        "declared_symbols": list(declared_symbols or ()),
+        "declared_instrument_ids": list(declared_ids or ()),
+        "observed_symbols": list(scope),
+    }
 
 
 def _pbo_measurements(
@@ -296,11 +479,9 @@ def _trial_statistics(
     return trial_sharpes, trial_count, trial_sharpe_std, dsr
 
 
-def _measured_result(
+def _measured_components(
     candidate: Candidate, context: Mapping[str, Any], output: Any
-) -> ExecutionResult:
-    from src.metrics import bootstrap_sharpe_ci
-
+) -> dict[str, Any]:
     snapshots = tuple(str(item) for item in context.get("dataset_snapshot_ids", ()))
     if not snapshots:
         raise ExecutorError("executor requires canonical dataset snapshot identities")
@@ -309,7 +490,7 @@ def _measured_result(
     returns = _market_returns(context, len(signals))
     if not signals:
         signals = [float(_direction(output))]
-    context = {
+    enriched = {
         **context,
         "signals": signals,
         "btc_target_states": candidate.definition.signal_model.get("target_states"),
@@ -318,65 +499,216 @@ def _measured_result(
         ),
         "behaviour_hash": behaviour_hash_for_definition(candidate.definition),
     }
-    if isinstance(context.get("parity_receipt"), Mapping):
-        context["parity_receipt"] = economic_parity_receipt(
-            candidate.definition, context["parity_receipt"]
+    if isinstance(enriched.get("parity_receipt"), Mapping):
+        enriched["parity_receipt"] = economic_parity_receipt(
+            candidate.definition, enriched["parity_receipt"]
         )
     observations = len(signals)
-    changes = [abs(signals[index] - signals[index - 1]) for index in range(1, observations)]
-    turnover = sum(changes) / max(1, observations - 1)
     active = sum(1 for value in signals if abs(value) > 1e-12)
-    accounting = _product_accounting(context)
+    accounting = _product_accounting(enriched)
     return_report = (
         account_return_series(accounting)
         if accounting is not None
-        else _position_return_report(context, signals, returns)
+        else _position_return_report(enriched, signals, returns)
     )
-    aligned = return_report.effective_observations
-    gross = list(return_report.gross_returns)
-    net = list(return_report.net_returns)
-    analysis_returns = net or gross
-    bootstrap_values = analysis_returns
-    completed = completed_campaigns(accounting)
-    fees = return_report.fees
-    slippage = return_report.slippage
-    funding_pnl = return_report.funding_pnl
-    funding = return_report.funding_cost
-    turnover = return_report.turnover
-    net_return = return_report.net_pnl
-    window_returns = _window_returns(analysis_returns, _evaluation_window_count(context))
-    negative_controls = _negative_control_evidence(
-        observations=aligned,
-        candidate_return=net_return,
-        control_returns=_economic_control_returns(candidate, context, signals),
-        controls=_negative_control_names(candidate, context),
-        instrument_scope=tuple(str(item) for item in context.get("instrument_scope", ())),
-        seed_material={
-            "candidate_id": candidate.candidate_id,
-            "dataset_snapshot_ids": snapshots,
-        },
-    )
-    delay_stress = _temporal_stress(candidate, context, signals, net_return, delay=True)
-    cost_stress = _stress_report(context, signals, returns, fee=2, slippage=2)
-    adverse_fill_stress = _stress_report(context, signals, returns, slippage=2)
-    funding_stress = _stress_report(context, signals, returns, funding=2)
-    missing_data_stress = _temporal_stress(candidate, context, signals, net_return, delay=False)
-    parameter_stability = _parameter_stability(candidate, context, bootstrap_values)
-    _bind_parameter_control(negative_controls, parameter_stability, bootstrap_values)
-    cross_symbol_stability = _cross_symbol_stability(context, bootstrap_values)
-    portfolio_overlap = _portfolio_overlap(context, analysis_returns)
-    walk_forward = _purged_walk_forward(analysis_returns, context, candidate)
-    bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
-        bootstrap_values,
-        n_boot=int(context.get("bootstrap_iterations", 1_000)),
-        random_state=int(candidate.candidate_id[7:15], 16),
-    )
-    pbo, pbo_matrix = _pbo_measurements(context, parameter_stability, window_returns)
-    trial_sharpes, trial_count, trial_sharpe_std, dsr = _trial_statistics(
-        context, parameter_stability, bootstrap_values
-    )
+    analysis_returns = list(return_report.net_returns or return_report.gross_returns)
+    return {
+        "context": enriched,
+        "snapshots": snapshots,
+        "output_hash": output_hash,
+        "signals": signals,
+        "returns": returns,
+        "observations": observations,
+        "active": active,
+        "accounting": accounting,
+        "return_report": return_report,
+        "aligned": return_report.effective_observations,
+        "analysis_returns": analysis_returns,
+        "completed": completed_campaigns(accounting),
+        "fees": return_report.fees,
+        "slippage": return_report.slippage,
+        "funding_pnl": return_report.funding_pnl,
+        "funding": return_report.funding_cost,
+        "net_return": return_report.net_pnl,
+        "turnover": return_report.turnover,
+    }
+
+
+def _common_measured_evidence(candidate: Candidate, values: Mapping[str, Any]) -> dict[str, Any]:
+    context = values["context"]
+    snapshots = values["snapshots"]
+    accounting = values["accounting"]
     expected_definition_hash = candidate.definition.definition_hash
-    observed_definition_hash = str(context.get("strategy_definition_hash") or "")
+    expected_feature_manifest = str(
+        context.get("feature_manifest_id") or context.get("feature_set_hash") or ""
+    )
+    expected_cost_model = str(context.get("cost_model_id") or context.get("cost_model_hash") or "")
+    family = str(candidate.definition.family)
+    evidence_type = str(candidate.definition.validation_policy.get("evidence_type") or "")
+    feature_inputs = any(
+        context.get(name) is not None for name in ("feature_rows", "feature_vector", "market_frame")
+    )
+    evidence = {
+        "evidence_policy_hash": context.get("evidence_policy_hash"),
+        "compiled": True,
+        "features_valid": bool(context.get("features_valid", feature_inputs)),
+        "causality_valid": bool(
+            context.get(
+                "causality_valid",
+                not bool(context.get("lookahead_detected", False))
+                and not bool(context.get("future_input_detected", False)),
+            )
+        ),
+        "data_integrity": {
+            "passed": bool(context.get("data_integrity_valid", True))
+            and all(value.startswith("sha256:") and len(value) == 71 for value in snapshots),
+            "dataset_snapshot_ids": list(snapshots),
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "feature_manifest_id": expected_feature_manifest,
+                    "cost_model_id": expected_cost_model,
+                    "parameter_set_id": context.get("parameter_set_id"),
+                }
+            ),
+        },
+        "semantic_parity": {
+            "passed": bool(
+                context.get("semantic_parity_valid", context.get("parity_receipt") is not None)
+            ),
+            "behaviour_hash": str(
+                context.get("behaviour_hash") or behaviour_hash_for_definition(candidate.definition)
+            ),
+            "semantic_identity": expected_definition_hash,
+            "parity_receipt": context.get("parity_receipt"),
+        },
+        "realistic_costs": {
+            "passed": bool(context.get("cost_model_valid", True)),
+            "fee_bps": float(context.get("fee_bps", 0.0)),
+            "slippage_bps": float(context.get("slippage_bps", 0.0)),
+            "funding_rate": float(context.get("funding_rate", 0.0)),
+            "cost_model_id": expected_cost_model,
+        },
+        "family_evidence": {
+            "passed": bool(context.get("family_evidence_valid", True)),
+            "family": family,
+            "evidence_type": evidence_type,
+            "instrument_scope": list(context.get("instrument_scope", ())),
+        },
+        "signal_frequency": values["active"] / values["observations"],
+        "turnover": values["turnover"],
+        "return_ledger": {
+            "gross_pnl": values["return_report"].gross_pnl,
+            "net_pnl": values["return_report"].net_pnl,
+            "net_returns": list(values["return_report"].net_returns),
+            "maximum_drawdown": values["return_report"].maximum_drawdown,
+            "terminal_exposure": values["return_report"].terminal_exposure,
+            "terminal_liquidation_cost": values["return_report"].terminal_liquidation_cost,
+        },
+        "product_accounting": accounting,
+        "objective_unit": accounting.get("objective_unit") if accounting else None,
+        "objective_value": accounting.get("objective_value") if accounting else None,
+        "benchmark_value": accounting.get("benchmark_value") if accounting else None,
+        "objective_excess": accounting.get("objective_excess") if accounting else None,
+        "objective_excess_fraction": (
+            accounting.get("objective_excess_fraction") if accounting else None
+        ),
+        "cost_adjusted_return": values["net_return"],
+        "fees": values["fees"],
+        "slippage": values["slippage"],
+        "funding": values["funding"],
+        "funding_pnl": values["funding_pnl"],
+        "output_hash": values["output_hash"],
+        "observations": values["observations"],
+        "behaviour_hash": context.get("behaviour_hash"),
+        "parity_receipt": context.get("parity_receipt"),
+    }
+    product_id = str(context.get("product_id") or "")
+    if product_id in {"btc_accumulation", "active_income"}:
+        evidence.update(
+            {
+                "objective_status": "unavailable",
+                "objective_unit": "BTC" if product_id == "btc_accumulation" else "USDT",
+                "objective_value": None,
+                "benchmark_value": None,
+                "objective_excess": None,
+                "objective_excess_fraction": None,
+            }
+        )
+    if accounting is not None:
+        evidence.update(
+            {
+                "accounting": accounting,
+                "objective_status": "measured",
+                "objective_unit": accounting["objective_unit"],
+                "objective_value": accounting["objective_value"],
+                "benchmark_value": accounting["benchmark_value"],
+                "objective_excess": accounting["objective_excess"],
+                "objective_excess_fraction": accounting["objective_excess_fraction"],
+                "accounting_return": accounting["return_fraction"],
+            }
+        )
+    return evidence
+
+
+def _development_evidence(
+    candidate: Candidate, values: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    context = values["context"]
+    analysis_returns = values["analysis_returns"]
+    parameter_stability = _parameter_stability(candidate, context, analysis_returns)
+    cross_symbol_stability = _cross_symbol_stability(
+        context,
+        analysis_returns,
+        joint_portfolio=candidate.definition.source_type is StrategySourceType.CROSS_SECTIONAL,
+    )
+    return (
+        {
+            "chronological": not bool(context.get("lookahead_detected", False)),
+            "regime_breakdown": _regime_breakdown(context, analysis_returns),
+            "parameter_stability": parameter_stability,
+            "sample_evidence": _sample_evidence(
+                candidate,
+                values["snapshots"],
+                analysis_returns,
+                values["aligned"],
+                values["completed"],
+                context,
+            ),
+            "cross_symbol_stability": cross_symbol_stability,
+            "universe_evidence": _universe_evidence(candidate, context),
+            "portfolio_overlap": _portfolio_overlap(context, analysis_returns),
+        },
+        parameter_stability,
+    )
+
+
+def _protected_evidence(candidate: Candidate, values: Mapping[str, Any]) -> dict[str, Any]:
+    context = values["context"]
+    report = values["return_report"]
+    return {
+        "chronological": not bool(context.get("lookahead_detected", False)),
+        "sample_evidence": _sample_evidence(
+            candidate,
+            values["snapshots"],
+            values["analysis_returns"],
+            values["aligned"],
+            values["completed"],
+            context,
+        ),
+        "drawdown_stability": {
+            "passed": bool(report.net_returns)
+            and report.maximum_drawdown <= float(context.get("maximum_drawdown", 1.0)),
+            "maximum_drawdown": report.maximum_drawdown,
+            "tail_loss": _tail_loss(values["analysis_returns"]),
+            "tail_quantile": 0.05,
+        },
+    }
+
+
+def _forward_evidence(candidate: Candidate, values: Mapping[str, Any]) -> dict[str, Any]:
+    context = values["context"]
+    expected_definition_hash = candidate.definition.definition_hash
     expected_artefact_hash = str(context.get("artefact_hash") or "")
     observed_artefact_hash = str(context.get("runtime_artefact_hash") or "")
     expected_engine_hash = str(context.get("engine_hash") or "")
@@ -389,174 +721,143 @@ def _measured_result(
         context.get("feature_manifest_id") or context.get("feature_set_hash") or ""
     )
     observed_feature_manifest = str(context.get("runtime_feature_manifest_id") or "")
-    family = str(candidate.definition.family)
-    evidence_type = str(candidate.definition.validation_policy.get("evidence_type") or "")
-    data_integrity = {
-        "passed": bool(context.get("data_integrity_valid", True))
-        and all(value.startswith("sha256:") and len(value) == 71 for value in snapshots),
-        "dataset_snapshot_ids": list(snapshots),
-        "input_hash": canonical_hash(
-            {
-                "dataset_snapshot_ids": list(snapshots),
-                "feature_manifest_id": expected_feature_manifest,
-                "cost_model_id": expected_cost_model,
-                "parameter_set_id": context.get("parameter_set_id"),
-            }
-        ),
-    }
-    semantic_parity = {
-        "passed": bool(
-            context.get("semantic_parity_valid", context.get("parity_receipt") is not None)
-        ),
-        "behaviour_hash": str(
-            context.get("behaviour_hash") or behaviour_hash_for_definition(candidate.definition)
-        ),
-        "semantic_identity": candidate.definition.definition_hash,
-        "parity_receipt": context.get("parity_receipt"),
-    }
-    realistic_costs = {
-        "passed": bool(context.get("cost_model_valid", True)),
-        "fee_bps": float(context.get("fee_bps", 0.0)),
-        "slippage_bps": float(context.get("slippage_bps", 0.0)),
-        "funding_rate": float(context.get("funding_rate", 0.0)),
-        "cost_model_id": expected_cost_model,
-    }
-    family_evidence = {
-        "passed": bool(context.get("family_evidence_valid", True)),
-        "family": family,
-        "evidence_type": evidence_type,
-        "instrument_scope": list(context.get("instrument_scope", ())),
-    }
-    cycles = completed
-    monte_carlo = _monte_carlo_blocks(candidate, context, bootstrap_values)
-    declared_symbols = candidate.definition.universe.get("symbols")
-    declared_instrument_ids = candidate.definition.universe.get("instrument_ids")
-    declared_values = tuple(
-        str(item)
-        for values in (declared_symbols, declared_instrument_ids)
-        if isinstance(values, list | tuple)
-        for item in values
-    )
-    scope = tuple(str(item) for item in context.get("instrument_scope", ()))
-    predeclared = bool(declared_values)
-    if scope:
-        predeclared = predeclared and all(
-            observed in declared_values
-            or any(
-                observed.endswith(f":{declared_symbol}")
-                or observed.endswith(f":{declared_symbol}:USDT")
-                for declared_symbol in declared_values
-            )
-            for observed in scope
-        )
-    feature_inputs = any(
-        context.get(name) is not None for name in ("feature_rows", "feature_vector", "market_frame")
-    )
-    measured = {
-        "evidence_policy_hash": context.get("evidence_policy_hash"),
-        "compiled": True,
-        "features_valid": bool(context.get("features_valid", feature_inputs)),
-        "causality_valid": bool(
-            context.get(
-                "causality_valid",
-                not bool(context.get("lookahead_detected", False))
-                and not bool(context.get("future_input_detected", False)),
-            )
-        ),
-        "data_integrity": data_integrity,
-        "semantic_parity": semantic_parity,
-        "realistic_costs": realistic_costs,
-        "family_evidence": family_evidence,
-        "signal_frequency": active / observations,
-        "turnover": turnover,
-        "return_ledger": {
-            "gross_pnl": return_report.gross_pnl,
-            "net_pnl": return_report.net_pnl,
-            "net_returns": list(return_report.net_returns),
-            "maximum_drawdown": return_report.maximum_drawdown,
-            "terminal_exposure": return_report.terminal_exposure,
-            "terminal_liquidation_cost": return_report.terminal_liquidation_cost,
+    completed = values["completed"]
+    return {
+        "production_equivalent": {
+            "passed": bool(
+                production_mode
+                and runtime_mode
+                and runtime_mode == production_mode
+                and expected_engine_hash
+                and observed_engine_hash == expected_engine_hash
+                and expected_feature_manifest
+                and observed_feature_manifest == expected_feature_manifest
+                and expected_cost_model
+                and observed_cost_model == expected_cost_model
+            ),
+            "runtime_execution_mode": runtime_mode,
+            "production_execution_mode": production_mode,
+            "expected_engine_hash": expected_engine_hash,
+            "observed_engine_hash": observed_engine_hash,
+            "expected_feature_manifest": expected_feature_manifest,
+            "observed_feature_manifest": observed_feature_manifest,
+            "expected_cost_model": expected_cost_model,
+            "observed_cost_model": observed_cost_model,
         },
-        "product_accounting": accounting,
-        "objective_unit": accounting.get("objective_unit") if accounting else None,
-        "objective_value": accounting.get("objective_value") if accounting else None,
-        "benchmark_value": accounting.get("benchmark_value") if accounting else None,
-        "objective_excess": accounting.get("objective_excess") if accounting else None,
-        "objective_excess_fraction": (
-            accounting.get("objective_excess_fraction") if accounting else None
+        "exact_strategy_identity": {
+            "passed": str(context.get("strategy_definition_hash") or "")
+            == expected_definition_hash,
+            "expected": expected_definition_hash,
+            "observed": str(context.get("strategy_definition_hash") or ""),
+        },
+        "exact_artefact_hash": {
+            "passed": observed_artefact_hash == expected_artefact_hash,
+            "expected": expected_artefact_hash,
+            "observed": observed_artefact_hash,
+        },
+        "exact_engine_hash": {
+            "passed": observed_engine_hash == expected_engine_hash,
+            "expected": expected_engine_hash,
+            "observed": observed_engine_hash,
+        },
+        "exact_cost_model": {
+            "passed": bool(expected_cost_model) and observed_cost_model == expected_cost_model,
+            "expected": expected_cost_model,
+            "observed": observed_cost_model,
+        },
+        "drift_checks": _drift_checks(context),
+        "duration": float(max(1, values["aligned"])),
+        "evidence_units": float(max(1, values["aligned"])),
+        "sample_evidence": _sample_evidence(
+            candidate,
+            values["snapshots"],
+            values["analysis_returns"],
+            values["aligned"],
+            values["completed"],
+            context,
         ),
-        "chronological": not bool(context.get("lookahead_detected", False)),
-        "cost_adjusted_return": net_return,
-        "fees": fees,
-        "slippage": slippage,
-        "funding": funding,
-        "funding_pnl": funding_pnl,
-        "regime_breakdown": _regime_breakdown(context, analysis_returns),
-        "parameter_stability": parameter_stability,
-        "sample_evidence": {
-            "passed": aligned >= 3,
-            "status": "measured" if completed is not None else "unavailable",
-            "observations": aligned,
-            "closed_trades": completed,
-            "completed_episodes": completed,
-            "independence_estimated": False,
-            "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
+        "forward_duration": {
+            "passed": True,
             "calendar_days": float(context.get("calendar_days", 0.0)),
-            "run_id": canonical_hash(
-                {
-                    "kind": "sample_evidence/v1",
-                    "candidate_id": candidate.candidate_id,
-                    "dataset_snapshot_ids": list(snapshots),
-                    "returns": analysis_returns,
-                }
-            ),
-            "input_hash": canonical_hash(
-                {
-                    "dataset_snapshot_ids": list(snapshots),
-                    "returns": analysis_returns,
-                }
-            ),
+            "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
+            "cycles": completed,
         },
-        "cross_symbol_stability": cross_symbol_stability,
-        "universe_evidence": {
-            "passed": predeclared,
-            "predeclared": predeclared,
-            "declared_symbols": list(declared_symbols or ()),
-            "declared_instrument_ids": list(declared_instrument_ids or ()),
-            "observed_symbols": list(scope),
-        },
-        "portfolio_overlap": portfolio_overlap,
+    }
+
+
+def _robustness_evidence(
+    candidate: Candidate, values: Mapping[str, Any]
+) -> tuple[dict[str, Any], float]:
+    from src.metrics import bootstrap_sharpe_ci
+
+    context = values["context"]
+    snapshots = values["snapshots"]
+    signals = values["signals"]
+    returns = values["returns"]
+    analysis_returns = values["analysis_returns"]
+    aligned = values["aligned"]
+    net_return = values["net_return"]
+    window_returns = _window_returns(analysis_returns, _evaluation_window_count(context))
+    development, parameter_stability = _development_evidence(candidate, values)
+    controls = _negative_control_evidence(
+        observations=aligned,
+        candidate_return=net_return,
+        control_returns=_economic_control_returns(candidate, context, signals),
+        controls=_negative_control_names(candidate, context),
+        instrument_scope=tuple(str(item) for item in context.get("instrument_scope", ())),
+        seed_material={"candidate_id": candidate.candidate_id, "dataset_snapshot_ids": snapshots},
+    )
+    _bind_parameter_control(controls, parameter_stability, analysis_returns)
+    delay = _temporal_stress(candidate, context, signals, net_return, delay=True)
+    cost = _stress_report(context, signals, returns, fee=2, slippage=2)
+    adverse_fill = _stress_report(context, signals, returns, slippage=2)
+    funding = _stress_report(context, signals, returns, funding=2)
+    missing_data = _temporal_stress(candidate, context, signals, net_return, delay=False)
+    walk_forward = _purged_walk_forward(analysis_returns, context, candidate)
+    bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
+        analysis_returns,
+        n_boot=int(context.get("bootstrap_iterations", 1_000)),
+        random_state=int(candidate.candidate_id[7:15], 16),
+    )
+    pbo, pbo_matrix = _pbo_measurements(context, parameter_stability, window_returns)
+    trial_sharpes, trial_count, trial_sharpe_std, dsr = _trial_statistics(
+        context, parameter_stability, analysis_returns
+    )
+    evidence = {
+        **development,
+        **_protected_evidence(candidate, values),
+        **_forward_evidence(candidate, values),
         "walk_forward": walk_forward,
         "purged": int(walk_forward.get("purged_rows", 0)) > 0,
         "embargo": int(walk_forward.get("embargo_rows", 0)),
         "cost_stress": {
-            "passed": _stress_passes(cost_stress.net_pnl, net_return, context),
+            "passed": _stress_passes(cost.net_pnl, net_return, context),
             "multiplier": 2.0,
-            "cost_adjusted_return": cost_stress.net_pnl,
-            "degradation_fraction": _degradation(net_return, cost_stress.net_pnl),
+            "cost_adjusted_return": cost.net_pnl,
+            "degradation_fraction": _degradation(net_return, cost.net_pnl),
         },
-        "delay_stress": delay_stress,
+        "delay_stress": delay,
         "adverse_fill_stress": {
-            "passed": _stress_passes(adverse_fill_stress.net_pnl, net_return, context),
+            "passed": _stress_passes(adverse_fill.net_pnl, net_return, context),
             "multiplier": 2.0,
-            "cost_adjusted_return": adverse_fill_stress.net_pnl,
-            "degradation_fraction": _degradation(net_return, adverse_fill_stress.net_pnl),
+            "cost_adjusted_return": adverse_fill.net_pnl,
+            "degradation_fraction": _degradation(net_return, adverse_fill.net_pnl),
         },
-        "missing_data_stress": missing_data_stress,
+        "missing_data_stress": missing_data,
         "funding_stress": {
-            "passed": _stress_passes(funding_stress.net_pnl, net_return, context),
+            "passed": _stress_passes(funding.net_pnl, net_return, context),
             "multiplier": 2.0,
-            "cost_adjusted_return": funding_stress.net_pnl,
-            "degradation_fraction": _degradation(net_return, funding_stress.net_pnl),
+            "cost_adjusted_return": funding.net_pnl,
+            "degradation_fraction": _degradation(net_return, funding.net_pnl),
         },
-        "monte_carlo_return_blocks": monte_carlo,
+        "monte_carlo_return_blocks": _monte_carlo_blocks(candidate, context, analysis_returns),
         "bootstrap_confidence": {
-            "passed": len(bootstrap_values)
+            "passed": len(analysis_returns)
             >= int(context.get("minimum_bootstrap_observations", 30))
             and bootstrap_low >= 0.0,
             "lower_bound": bootstrap_low,
             "upper_bound": bootstrap_high,
-            "observations": len(bootstrap_values),
+            "observations": len(analysis_returns),
             "iterations": int(context.get("bootstrap_iterations", 1_000)),
             "method": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
             "run_id": canonical_hash(
@@ -564,15 +865,12 @@ def _measured_result(
                     "kind": "bootstrap_confidence/v1",
                     "candidate_id": candidate.candidate_id,
                     "dataset_snapshot_ids": list(snapshots),
-                    "returns": bootstrap_values,
+                    "returns": analysis_returns,
                     "iterations": int(context.get("bootstrap_iterations", 1_000)),
                 }
             ),
             "input_hash": canonical_hash(
-                {
-                    "dataset_snapshot_ids": list(snapshots),
-                    "returns": bootstrap_values,
-                }
+                {"dataset_snapshot_ids": list(snapshots), "returns": analysis_returns}
             ),
         },
         "probability_backtest_overfitting": pbo,
@@ -603,124 +901,76 @@ def _measured_result(
             ),
             "pbo": str(context.get("pbo_method") or "combinatorial_purged_pbo_v1"),
         },
-        "drawdown_stability": {
-            "passed": bool(return_report.net_returns)
-            and return_report.maximum_drawdown <= float(context.get("maximum_drawdown", 1.0)),
-            "maximum_drawdown": return_report.maximum_drawdown,
-            "tail_loss": _tail_loss(bootstrap_values),
-            "tail_quantile": 0.05,
-        },
-        "negative_control_results": negative_controls,
-        "production_equivalent": {
-            "passed": bool(
-                production_mode
-                and runtime_mode
-                and runtime_mode == production_mode
-                and expected_engine_hash
-                and observed_engine_hash == expected_engine_hash
-                and expected_feature_manifest
-                and observed_feature_manifest == expected_feature_manifest
-                and expected_cost_model
-                and observed_cost_model == expected_cost_model
-            ),
-            "runtime_execution_mode": runtime_mode,
-            "production_execution_mode": production_mode,
-            "expected_engine_hash": expected_engine_hash,
-            "observed_engine_hash": observed_engine_hash,
-            "expected_feature_manifest": expected_feature_manifest,
-            "observed_feature_manifest": observed_feature_manifest,
-            "expected_cost_model": expected_cost_model,
-            "observed_cost_model": observed_cost_model,
-        },
-        "exact_strategy_identity": {
-            "passed": observed_definition_hash == expected_definition_hash,
-            "expected": expected_definition_hash,
-            "observed": observed_definition_hash,
-        },
-        "exact_artefact_hash": {
-            "passed": observed_artefact_hash == expected_artefact_hash,
-            "expected": expected_artefact_hash,
-            "observed": observed_artefact_hash,
-        },
-        "exact_engine_hash": {
-            "passed": observed_engine_hash == expected_engine_hash,
-            "expected": expected_engine_hash,
-            "observed": observed_engine_hash,
-        },
-        "exact_cost_model": {
-            "passed": bool(expected_cost_model) and observed_cost_model == expected_cost_model,
-            "expected": expected_cost_model,
-            "observed": observed_cost_model,
-        },
-        "drift_checks": _drift_checks(context),
-        "duration": float(max(1, aligned)),
-        "evidence_units": float(max(1, aligned)),
-        "forward_duration": {
-            "passed": True,
-            "calendar_days": float(context.get("calendar_days", 0.0)),
-            "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
-            "cycles": cycles,
-        },
-        "output_hash": output_hash,
-        "observations": observations,
-        "behaviour_hash": context.get("behaviour_hash"),
-        "parity_receipt": context.get("parity_receipt"),
+        "negative_control_results": controls,
     }
-    product_id = str(context.get("product_id") or "")
-    if product_id in {"btc_accumulation", "active_income"}:
-        measured.update(
+    return evidence, dsr
+
+
+def _measured_result(
+    candidate: Candidate, context: Mapping[str, Any], output: Any
+) -> ExecutionResult:
+    stage = _measurement_stage(context)
+    values = _measured_components(candidate, context, output)
+    measured = _common_measured_evidence(candidate, values)
+    metrics = {
+        "observations": float(values["observations"]),
+        "cost_adjusted_return": values["net_return"],
+        "turnover": values["turnover"],
+        "funding_pnl": values["funding_pnl"],
+    }
+    stage_evidence, dsr = _stage_evidence(stage, candidate, values)
+    measured.update(stage_evidence)
+    if dsr is not None:
+        metrics["deflated_sharpe"] = dsr
+    accounting = values["accounting"]
+    if accounting is not None:
+        metrics.update(
             {
-                "objective_status": "unavailable",
-                "objective_unit": "BTC" if product_id == "btc_accumulation" else "USDT",
-                "objective_value": None,
-                "benchmark_value": None,
-                "objective_excess": None,
-                "objective_excess_fraction": None,
+                "accounting_return": float(accounting["return_fraction"]),
+                "objective_excess": float(accounting["objective_excess"]),
             }
         )
-    if accounting is not None:
-        measured["accounting"] = accounting
-        measured["objective_status"] = "measured"
-        measured["objective_unit"] = accounting["objective_unit"]
-        measured["objective_value"] = accounting["objective_value"]
-        measured["benchmark_value"] = accounting["benchmark_value"]
-        measured["objective_excess"] = accounting["objective_excess"]
-        measured["objective_excess_fraction"] = accounting["objective_excess_fraction"]
-        measured["accounting_return"] = accounting["return_fraction"]
+    if stage in _STAGE_EVIDENCE_FIELDS:
+        measured = {
+            name: value
+            for name, value in measured.items()
+            if name in _STAGE_EVIDENCE_FIELDS[str(stage)]
+        }
+    enriched = values["context"]
     return ExecutionResult(
         evidence=measured,
-        metrics={
-            "observations": float(observations),
-            "cost_adjusted_return": net_return,
-            "turnover": turnover,
-            "deflated_sharpe": dsr,
-            "funding_pnl": funding_pnl,
-            **(
-                {
-                    "accounting_return": float(accounting["return_fraction"]),
-                    "objective_excess": float(accounting["objective_excess"]),
-                }
-                if accounting is not None
-                else {}
-            ),
-        },
+        metrics=metrics,
         receipt=execution_receipt(
             candidate=candidate,
-            dataset_snapshot_ids=snapshots,
+            dataset_snapshot_ids=values["snapshots"],
             executor_version=ECONOMIC_ENGINE_VERSION,
-            evaluation_input=context.get("evaluation_input"),
+            evaluation_input=enriched.get("evaluation_input"),
             evidence_policy_hash=(
-                str(context["evidence_policy_hash"])
-                if context.get("evidence_policy_hash") is not None
+                str(enriched["evidence_policy_hash"])
+                if enriched.get("evidence_policy_hash") is not None
                 else None
             ),
             behaviour_hash=(
-                str(context["behaviour_hash"])
-                if context.get("behaviour_hash") is not None
+                str(enriched["behaviour_hash"])
+                if enriched.get("behaviour_hash") is not None
                 else None
             ),
         ),
     )
+
+
+def _stage_evidence(
+    stage: str | None, candidate: Candidate, values: Mapping[str, Any]
+) -> tuple[dict[str, Any], float | None]:
+    if stage == "development":
+        return _development_evidence(candidate, values)[0], None
+    if stage == "protected":
+        return _protected_evidence(candidate, values), None
+    if stage == "forward":
+        return _forward_evidence(candidate, values), None
+    if stage == "robustness" or stage is None:
+        return _robustness_evidence(candidate, values)
+    return {}, None
 
 
 def _product_accounting(
@@ -1727,13 +1977,22 @@ def _bind_parameter_control(controls, stability, returns) -> None:
 
 
 def _cross_symbol_stability(
-    context: Mapping[str, Any], base_returns: list[float]
+    context: Mapping[str, Any], base_returns: list[float], *, joint_portfolio: bool = False
 ) -> dict[str, Any]:
     scope = tuple(
         str(item)
         for item in context.get("instrument_scope", context.get("expected_symbols", ()))
         if item
     )
+    if joint_portfolio:
+        # The ranked portfolio is the economic unit; raw leg returns are not strategy evidence.
+        return {
+            "status": "not_applicable",
+            "passed": True,
+            "symbols": len(scope),
+            "per_symbol": {},
+            "reason": "joint_portfolio_is_the_economic_unit",
+        }
     if len(scope) <= 1:
         return {
             "status": "not_applicable",
@@ -2466,6 +2725,8 @@ def _build_semantic_context(
 
 
 def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    if not _diagnostic_execution(candidate, context):
+        _enforce_directional_scope(candidate, context)
     frame = context.get("market_frame")
     if frame is None:
         raise ExecutorError("registered Python execution requires a canonical market_frame")
@@ -2492,6 +2753,8 @@ def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) 
 
 
 def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    if not _diagnostic_execution(candidate, context):
+        _enforce_directional_scope(candidate, context)
     rows = context.get("feature_rows")
     rule = candidate.definition.signal_model.get("rule")
     if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
@@ -2561,6 +2824,8 @@ def _dsl_signals(rows: list[Any] | tuple[Any, ...], rule: Mapping[str, Any]) -> 
 
 
 def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    if not _diagnostic_execution(candidate, context):
+        _enforce_directional_scope(candidate, context)
     model_hash = context.get("model_artefact_hash")
     manifest_hash = context.get("feature_manifest_hash")
     if not model_hash or not manifest_hash:

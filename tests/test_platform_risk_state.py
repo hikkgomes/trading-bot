@@ -1,13 +1,279 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
+from sqlalchemy import insert, select
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
-from src.data.database import PlatformDatabase, account_snapshot, nav_snapshot, position
+from src.data.database import (
+    PlatformDatabase,
+    account_snapshot,
+    market_input_buffer,
+    nav_snapshot,
+    position,
+    risk_snapshot,
+)
 from src.domain._codec import canonical_hash
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.portfolio_engine import _validate_state_health
 from src.services.risk_state import PortfolioRiskCalculator
+
+
+def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'market-buffer.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    identities = []
+    payloads = []
+    for minute in range(21):
+        observed = start + dt.timedelta(minutes=minute)
+        payload = {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": "binance:futures:BTCUSDT:USDT",
+            "source_event_type": "best_bid_ask",
+            "source_event_time": observed.isoformat(),
+            "availability_time": observed.isoformat(),
+            "values": {"close": 100.0 + minute},
+        }
+        payloads.append(payload)
+        identities.append(
+            store.save_market_input(
+                payload,
+                created_at=observed.isoformat(),
+                retention_at=observed.isoformat(),
+            )
+        )
+
+    with database.engine.connect() as connection:
+        recent = set(connection.execute(select(market_input_buffer.c.id)).scalars())
+    assert recent == set(identities[-16:])
+
+    pinned = store.get(identities[-1])
+    assert pinned == payloads[-1]
+    later = start + dt.timedelta(minutes=36)
+    latest_payload = {
+        **payloads[-1],
+        "source_event_time": later.isoformat(),
+        "availability_time": later.isoformat(),
+        "values": {"close": 200.0},
+    }
+    latest_id = store.save_market_input(
+        latest_payload,
+        created_at=later.isoformat(),
+        retention_at=later.isoformat(),
+    )
+    with database.engine.connect() as connection:
+        recent = set(connection.execute(select(market_input_buffer.c.id)).scalars())
+        durable = set(connection.execute(select(risk_snapshot.c.id)).scalars())
+    assert recent == {latest_id}
+    assert identities[-1] in durable
+    assert store.get(identities[-1]) == payloads[-1]
+    with pytest.raises(KeyError, match="risk snapshot does not exist"):
+        store.get(identities[-2])
+    database.dispose()
+
+
+def test_portfolio_market_uses_buffer_and_rejects_its_expired_quote(tmp_path) -> None:
+    from src.services.portfolio_state import DatabasePortfolioSourceService
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'buffer-market-source.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    observed = dt.datetime(2026, 9, 2, tzinfo=dt.UTC)
+    payload = {
+        "kind": "market_data_input",
+        "product_id": "btc_accumulation",
+        "instrument_id": "binance:spot:BTCUSDT",
+        "source_event_type": "best_bid_ask",
+        "source_event_time": observed.isoformat(),
+        "availability_time": observed.isoformat(),
+        "values": {
+            "close": 100.0,
+            "spread_bps": 1.0,
+            "visible_depth_quote": 10_000.0,
+            "volatility": 0.01,
+        },
+    }
+    identity = store.save_market_input(
+        payload,
+        created_at=observed.isoformat(),
+        retention_at=observed.isoformat(),
+    )
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={"btc_accumulation": {"account_id": "spot", "dataset_timeframe": "1m"}},
+        accounts={"spot": {"market": "spot"}},
+    )
+
+    market, _ = source._market("btc_accumulation", observed.isoformat())
+    assert market["binance:spot:BTCUSDT"]["price"] == 100.0
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(risk_snapshot.c.id).where(risk_snapshot.c.id == identity)
+            ).scalar_one()
+            == identity
+        )
+        assert (
+            connection.execute(
+                select(market_input_buffer.c.id).where(market_input_buffer.c.id == identity)
+            ).scalar_one_or_none()
+            is None
+        )
+
+    later = observed + dt.timedelta(minutes=16)
+    assert source._market("btc_accumulation", later.isoformat())[0] == {}
+    database.dispose()
+
+
+def test_market_input_expiry_deletes_a_bounded_batch(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'bounded-market-cleanup.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    observed = dt.datetime(2026, 9, 3, tzinfo=dt.UTC)
+    rows = []
+    for index in range(1_001):
+        payload = {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": "binance:futures:BTCUSDT:USDT",
+            "source_event_type": "trade",
+            "source_event_id": str(index),
+            "source_event_time": observed.isoformat(),
+            "availability_time": observed.isoformat(),
+            "values": {"close": 100.0 + index},
+        }
+        rows.append(
+            {
+                "id": canonical_hash(payload),
+                "product_id": "active_income",
+                "instrument_id": "binance:futures:BTCUSDT:USDT",
+                "event_type": "trade",
+                "created_at": observed.isoformat(),
+                "payload": payload,
+            }
+        )
+    with database.engine.begin() as connection:
+        connection.execute(insert(market_input_buffer), rows)
+
+    expiry_time = (observed + dt.timedelta(minutes=16)).isoformat()
+    assert store.expire_market_inputs(at=expiry_time) == 1_000
+    with database.engine.connect() as connection:
+        remaining = connection.execute(select(market_input_buffer.c.id)).scalars().all()
+    assert len(remaining) == 1
+    assert store.expire_market_inputs(at=expiry_time) == 1
+    database.dispose()
+
+
+def test_live_entry_guard_pins_a_fresh_buffered_book(tmp_path) -> None:
+    from src.domain.orders import OrderIntent, OrderSide, OrderType
+    from src.services.live_execution import ApprovedLiveExecution
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'buffered-live-guard.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    observed_at = "2026-09-04T00:00:00+00:00"
+    instrument_id = "binance:futures:BTCUSDT:USDT"
+    payload = {
+        "kind": "market_data_input",
+        "product_id": "active_income",
+        "instrument_id": instrument_id,
+        "source_event_type": "best_bid_ask",
+        "source_event_time": observed_at,
+        "availability_time": observed_at,
+        "values": {
+            "close": 100.0,
+            "spread_bps": 1.0,
+            "bid_depth_quote": 2_000.0,
+            "ask_depth_quote": 2_000.0,
+        },
+    }
+    identity = store.save_market_input(
+        payload,
+        created_at=observed_at,
+        retention_at=observed_at,
+    )
+    guard = ApprovedLiveExecution.__new__(ApprovedLiveExecution)
+    guard.engine = database.engine
+    guard.products = {"active_income": {"account_id": "futures"}}
+    guard.risk_configuration = {
+        "global": {"maximum_market_data_staleness_seconds": 5},
+        "instrument": {"maximum_visible_depth_fraction": 0.1, "maximum_slippage_bps": 25},
+    }
+    intent = OrderIntent(
+        "entry",
+        "portfolio",
+        instrument_id,
+        OrderSide.BUY,
+        1,
+        OrderType.MARKET,
+        observed_at,
+        valid_until="2026-09-04T00:01:00+00:00",
+    )
+
+    guard._assert_market_admission({"product_id": "active_income"}, intent)
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(risk_snapshot.c.id).where(risk_snapshot.c.id == identity)
+            ).scalar_one()
+            == identity
+        )
+        assert (
+            connection.execute(
+                select(market_input_buffer.c.id).where(market_input_buffer.c.id == identity)
+            ).scalar_one_or_none()
+            is None
+        )
+    database.dispose()
+
+
+def test_forward_opening_mark_pins_one_fresh_buffered_input(tmp_path) -> None:
+    from src.services.forward_metrics import ForwardEvidenceCollector
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'buffered-forward-mark.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    observed_at = "2026-09-05T00:00:00+00:00"
+    instrument_id = "binance:futures:BTCUSDT:USDT"
+    identity = store.save_market_input(
+        {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": instrument_id,
+            "source_event_type": "mark_price",
+            "source_event_time": observed_at,
+            "availability_time": observed_at,
+            "values": {"close": 101.0},
+        },
+        created_at=observed_at,
+        retention_at=observed_at,
+    )
+
+    assert (
+        ForwardEvidenceCollector(database.engine)._opening_market_price(
+            "active_income", instrument_id, observed_at
+        )
+        == 101.0
+    )
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(risk_snapshot.c.id).where(risk_snapshot.c.id == identity)
+            ).scalar_one()
+            == identity
+        )
+        assert (
+            connection.execute(
+                select(market_input_buffer.c.id).where(market_input_buffer.c.id == identity)
+            ).scalar_one_or_none()
+            is None
+        )
+    database.dispose()
 
 
 def test_unavailable_factor_measurements_block_new_targets() -> None:
@@ -61,7 +327,7 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
                 "values": {
                     "close": price,
                     "spread_bps": 1.0,
-                    "visible_depth": 100_000.0,
+                    "visible_depth_quote": 100_000.0,
                     "volatility": 0.1,
                     "funding": 0.0,
                 },
@@ -101,7 +367,7 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
             "BTCUSDT": {
                 "price": 99.0,
                 "spread_bps": 1.0,
-                "visible_depth": 100_000.0,
+                "visible_depth_quote": 100_000.0,
                 "volatility": 0.1,
                 "funding": 0.0,
             }
@@ -137,7 +403,7 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
             "BTCUSDT": {
                 "price": 99.0,
                 "spread_bps": 1.0,
-                "visible_depth": 100_000.0,
+                "visible_depth_quote": 100_000.0,
                 "volatility": 0.1,
                 "funding": 0.0,
             }
@@ -271,7 +537,7 @@ def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path, bo
             "BTCUSDT": {
                 "price": 100.0,
                 "spread_bps": 1.0,
-                "visible_depth": 100_000.0,
+                "visible_depth_quote": 100_000.0,
                 "volatility": 0.1,
                 "funding": 0.0,
             }
@@ -481,7 +747,7 @@ def test_market_volatility_uses_closed_bars_and_does_not_refresh_old_estimate(tm
         "kind": "market_data_input",
         "product_id": "btc",
         "instrument_id": instrument_id,
-        "values": {"price": 100, "spread_bps": 1, "visible_depth": 1000, "volatility": 0.2},
+        "values": {"price": 100, "spread_bps": 1, "visible_depth_quote": 1000, "volatility": 0.2},
     }
     supplied_id = store.save(quote, created_at=start.isoformat())
     source = DatabasePortfolioSourceService(
@@ -495,7 +761,7 @@ def test_market_volatility_uses_closed_bars_and_does_not_refresh_old_estimate(tm
     assert market[instrument_id]["volatility_estimate"]["source_snapshot_ids"] == [supplied_id]
     later = start + dt.timedelta(minutes=3)
     store.save(
-        {**quote, "values": {"price": 120, "spread_bps": 1, "visible_depth": 1000}},
+        {**quote, "values": {"price": 120, "spread_bps": 1, "visible_depth_quote": 1000}},
         created_at=later.isoformat(),
     )
     assert source._market("btc", later.isoformat())[0] == {}
@@ -521,4 +787,54 @@ def test_market_volatility_uses_closed_bars_and_does_not_refresh_old_estimate(tm
     market, _ = source._market("btc", later.isoformat())
     assert market[instrument_id]["volatility"] == pytest.approx(0.1)
     assert set(market[instrument_id]["volatility_estimate"]["source_snapshot_ids"]) == bar_ids
+    database.dispose()
+
+
+def test_new_mark_cannot_refresh_stale_book_fields(tmp_path):
+    from src.services.portfolio_state import DatabasePortfolioSourceService
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'stale-book.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    base = {
+        "kind": "market_data_input",
+        "product_id": "btc",
+        "instrument_id": "binance:spot:BTCUSDT",
+    }
+    old = "2026-09-01T00:00:00+00:00"
+    now = "2026-09-01T00:01:00+00:00"
+    store.save(
+        {
+            **base,
+            "values": {
+                "price": 100,
+                "spread_bps": 1,
+                "visible_depth_quote": 1000,
+                "volatility": 0.01,
+            },
+        },
+        created_at=old,
+    )
+    store.save({**base, "values": {"price": 101}}, created_at=now)
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={"btc": {"account_id": "spot", "dataset_timeframe": "1h"}},
+        accounts={"spot": {"market": "spot"}},
+    )
+    assert source._market("btc", now)[0] == {}
+    store.save(
+        {
+            **base,
+            "source_event_time": old,
+            "values": {"price": 101, "spread_bps": 1, "visible_depth_quote": 1000},
+        },
+        created_at=now,
+    )
+    assert source._market("btc", now)[0] == {}
+    store.save(
+        {**base, "values": {"price": 101, "spread_bps": 1, "visible_depth_quote": 1000}},
+        created_at=now,
+    )
+    assert source._market("btc", now)[0][base["instrument_id"]]["price"] == 101
     database.dispose()

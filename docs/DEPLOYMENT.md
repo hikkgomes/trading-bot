@@ -2,7 +2,7 @@
 
 This is the only production deployment path. PostgreSQL owns lifecycle state,
 strategy artefacts, assignments, approvals, orders, fills, positions, risk,
-accounting, controls, and reports. Parquet is immutable market and research
+accounting, controls, and reports. Frozen Parquet is immutable research
 data. Legacy SQLite data is read only for one-time migration.
 
 ## 1. Install the host
@@ -71,6 +71,11 @@ backup credentials are configured. It creates a PostgreSQL backup, then
 quarantines legacy pending and dead research jobs. The repaired scheduler does
 not import that queue state.
 
+The upgrade first refuses enabled or active legacy user services, before
+stopping system services or modifying the database. Back up their files and
+state, then retire those exact user units before retrying. To run that check
+alone, use `sudo bash scripts/install_platform_services.sh --check-authorities`.
+
 ## 3. Configure isolated environments
 
 Create root-owned mode `0640` files under `/etc/trading-platform/`.
@@ -107,6 +112,11 @@ must not inherit `trading_runtime`; startup rejects mixed service roles. The
 evaluator uses `trading_evaluator` to read protected samples and publish sealed
 evidence. The adaptive research worker cannot read those samples or write sealed
 artefacts. The agent sandbox has no database credential.
+
+Frozen evaluation and execution use the same `.venv-runtime` interpreter and
+lock. Their OS users and database roles remain separate. Run inference calibration,
+policy approval and live-authority commands with that installed interpreter.
+Adaptive searches and code checks retain the separate research environment.
 
 Create missing service logins with `sudo -u postgres createuser --pwprompt NAME`,
 then apply the following as the PostgreSQL administrator. For an existing host,
@@ -178,6 +188,25 @@ sudo systemctl --failed --no-pager
 ```
 
 ## 5. Verify paper operation
+
+Queue consumers drain completed jobs promptly and poll idle live inputs at most
+once per second. Service heartbeats remain bounded to the configured interval;
+health changes publish immediately. Historical downloads run separately from
+live batch writes, with renewable leases and a hard research job deadline.
+
+The default feed captures closed candles, current funding marks and book quotes
+for the configured scope. It coalesces quotes to the latest exchange observation
+per flush. Full trade and depth replay collection is not enabled by default on
+this host. The capture policy is recorded on sampled quotes.
+
+Runtime processes share the Binance IP request budget in
+`runtime/exchange-limits`. Public data work leaves capacity for execution and
+recovery. HTTP 418/429 backoff applies across processes. Do not place this
+directory on an unrelated or non-shared filesystem for one trading host.
+
+Quote depth is USDT notional, with separate bid and ask values. Admission uses
+the execution side and exchange observation time. A newly received old quote
+cannot refresh market authority.
 
 Both products must stay in paper mode until the complete evidence chain has
 been reviewed.
@@ -253,15 +282,21 @@ account fingerprint, and execution-engine identity before any canary decision.
 
 ## 8. Backups and recovery
 
-Keep hourly backups for `hourly_retention_hours` (24 by default), then the newest
-backup of each type per UTC day for `retention_days` (30). The newest verified
+Keep hourly backups for `hourly_retention_hours` (6 in the supplied configuration), then the newest
+backup of each type per UTC day for `retention_days` (7). The newest verified
 backup of each type is always retained, even when stale. A replacement must
 verify before older recovery points are removed. This preserves the recovery
 window without retaining hundreds of full database copies on the server.
 
-Archive creation uses native tar; verification streams headers and contents
+Archive creation streams tar members; verification streams headers and contents
 without extracting a second temporary data store. A restore publishes its
 private destination only after every member and the gzip checksum validate.
+Backup maintenance is serialised. Retention runs before creation and preserves the newest verified recovery point of each type. Archives are built on the backup filesystem and moved into their published bundle without another full copy. Hidden incomplete builds are excluded from verification. Each committed file is streamed from one open inode; writer temporary files and locks are excluded.
+
+Weekly verification restores only the newest PostgreSQL dump into a temporary
+local cluster with TCP disabled and a private Unix socket. It checks the schema
+revision and core table counts, then writes a separate hash-bound restore
+receipt. The rehearsal does not connect to or change the production database.
 
 Create and verify both PostgreSQL and Parquet backups:
 
@@ -338,3 +373,23 @@ make platform-ci
 This runs formatting, Ruff including C90 complexity, platform type checking,
 database migration checks, PostgreSQL smoke, rehearsal tests, and the full
 test suite. Connected exchange tests remain a separate manual deployment gate.
+
+### Bounded market storage
+
+High-rate market observations use a 15-minute PostgreSQL buffer. Any observation
+used in a durable decision or required feature job is verified and copied to the
+immutable risk evidence store before its reference is published. Expiry removes
+only unpinned buffer rows, in bounded batches. Closed candles remain permanent.
+
+Live candle, feature and native funding Parquet stores publish a complete daily
+`current.parquet` through an atomic replacement under a partition writer lock.
+Readers use one published generation and hash the same opened file they read.
+Frozen datasets, backtests, models and artefacts remain immutable. Automatic
+whole-tree compaction is removed; it could block capture and exhaust memory.
+The original source files are retained during deployment for recovery.
+
+New public market batch jobs carry an explicit seven-day retention tag. A
+bounded database function removes completed tagged transport jobs and their
+attempts after seven days. It preserves financial, research, user-stream,
+quarantined and untagged historical jobs. Runtime has no direct job-delete
+permission. Operator queue totals describe the retained history.

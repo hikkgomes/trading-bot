@@ -1318,6 +1318,7 @@ def _candidate_applicability(candidate, context: Mapping[str, Any]) -> EvidenceA
         instrument_count=len(set(scope)) if isinstance(scope, list | tuple) and scope else None,
         tunable_parameter_count=len(_tunable_parameter_names(candidate, context)),
         active_strategy_count=len(active) if isinstance(active, Mapping) else None,
+        joint_portfolio=candidate.definition.source_type.value == "cross_sectional",
     )
 
 

@@ -118,7 +118,7 @@ sqlite-import:  ## Import legacy SQLite memory with immutable provenance
 	$(PY) -m src.research.sqlite_import --source "$(SOURCE)" \
 		--database-url "$(TRADING_PLATFORM_DATABASE_URL)" $(if $(ARCHIVE),--archive "$(ARCHIVE)",)
 
-.PHONY: platform-backup-postgresql platform-backup-parquet platform-backup-verify platform-compact-data platform-upgrade
+.PHONY: platform-backup-postgresql platform-backup-parquet platform-backup-verify platform-upgrade
 platform-backup-postgresql:  ## Create and verify a PostgreSQL backup
 	$(PY) -m src.services.backup_service --config $(PLATFORM_CONFIG) --mode postgresql
 
@@ -128,11 +128,8 @@ platform-backup-parquet:  ## Create and verify a Parquet backup
 platform-backup-verify:  ## Verify every platform backup
 	$(PY) -m src.services.backup_service --config $(PLATFORM_CONFIG) --mode verify
 
-platform-compact-data:  ## Compact active Parquet partitions and quarantine sources
-	$(PY) -m src.services.storage_compaction --root "$(PARQUET_ROOT)"
-
 platform-upgrade:  ## Stop services, back up PostgreSQL, retire old units, and migrate
-	REPO="$(CURDIR)" PYTHON="$(PY)" PLATFORM_CONFIG="$(PLATFORM_CONFIG)" \
+	REPO="$(CURDIR)" PYTHON="$(PY)" \
 		bash scripts/upgrade_platform.sh
 
 .PHONY: platform-backup-restore-postgresql platform-backup-restore-parquet

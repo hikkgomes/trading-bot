@@ -69,7 +69,7 @@ def test_unchanged_portfolio_sources_remain_idle_for_10000_cycles(tmp_path) -> N
                 "instrument": {
                     "price": 1.0,
                     "spread_bps": 1.0,
-                    "visible_depth": 100.0,
+                    "visible_depth_quote": 100.0,
                     "volatility": 0.1,
                     "funding": 0.0,
                 }
@@ -231,7 +231,7 @@ def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_pat
                 "values": {
                     "close": close,
                     "spread_bps": 1.0,
-                    "visible_depth": 100.0,
+                    "visible_depth_quote": 100.0,
                     "funding": 0.0,
                 },
             },

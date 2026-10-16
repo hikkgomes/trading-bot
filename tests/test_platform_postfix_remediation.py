@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,7 +61,7 @@ NOW = "2026-09-01T00:00:00+00:00"
 
 
 class _NoopLimiter:
-    def acquire(self) -> None:
+    def acquire(self, **_kwargs) -> None:
         return None
 
 
@@ -420,6 +420,71 @@ def test_market_spool_and_partition_replay_are_bounded_and_idempotent(tmp_path: 
         values[1:], venue="binance", market="futures", symbol="BTCUSDT", timeframe="1m"
     )
     assert len(list((tmp_path / "data/features").rglob("*.parquet"))) == 1
+
+
+def test_feature_window_is_graph_bounded_and_dedupes_retry_aliases(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    root = tmp_path / "data"
+    events = tuple(_candle(index) for index in range(240))
+    latest = events[-1]
+    alias = replace(
+        latest,
+        sequence=latest.sequence + 1,
+        receive_timestamp=(
+            dt.datetime.fromisoformat(latest.receive_timestamp) + dt.timedelta(seconds=2)
+        ).isoformat(),
+        availability_time=(
+            dt.datetime.fromisoformat(latest.availability_timestamp) + dt.timedelta(seconds=2)
+        ).isoformat(),
+    )
+    PartitionedBarStore(root).put_batch(
+        tuple((event, "binance", "futures", "BTCUSDT") for event in (*events, alias))
+    )
+    worker = DatabaseFeatureWorker(
+        queue=DatabaseJobQueue(database.engine),
+        worker_id="feature-worker",
+        store=SqlFeatureStore(database.engine),
+        job_names=("live_feature_calculation",),
+        parquet_root=root,
+        active_assignments=lambda _instrument: ({"id": "active"},),
+        feature_graph_for_assignment=lambda _assignment: {"required_nodes": ["macd"]},
+    )
+    assignment = {"id": "active"}
+    payload = {
+        "instrument_id": latest.instrument_id,
+        "feature_set_version": "core-bars-v1",
+        "source_event_time": dt.datetime.fromtimestamp(
+            latest.payload["data"]["k"]["t"] / 1_000, dt.UTC
+        ).isoformat(),
+        "source_close_time": latest.close_timestamp,
+        "availability_time": alias.availability_timestamp,
+        "timeframe": "1m",
+        "source_market_event_id": alias.event_id,
+        "input_references": {
+            "bar_window": {
+                "kind": "partitioned_bar_window",
+                "relative_pattern": ("bars/binance/futures/BTCUSDT/1m/**/*.parquet"),
+                "through_close_time": latest.close_timestamp,
+                "minimum_history": 1,
+                "source_event_ids": [alias.event_id],
+            }
+        },
+    }
+    payload["input_references"]["bar_window"]["content_hash"] = canonical_hash(
+        payload["input_references"]["bar_window"]
+    )
+    required_families, history_limit = worker._feature_input_requirements((assignment,), payload)
+    assert required_families == set()
+    assert history_limit == 226
+    inputs, _scalars = worker._input_values(
+        payload,
+        job_name="live_feature_calculation",
+        required_families=required_families,
+        history_limit=history_limit,
+    )
+    assert len(inputs["close_history"]) == 226
+    assert inputs["close_history"][-1] == pytest.approx(100 + 239)
+    database.dispose()
 
 
 def test_feature_spool_splits_cross_day_batches_before_partition_write(tmp_path: Path) -> None:

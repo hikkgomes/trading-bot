@@ -589,7 +589,7 @@ def test_portfolio_state_service_schedules_automatically_from_latest_sources(tmp
             "binance:futures:BTCUSDT:USDT": {
                 "price": 100.0,
                 "spread_bps": 1.0,
-                "visible_depth": 10000.0,
+                "visible_depth_quote": 10000.0,
                 "volatility": 0.2,
                 "funding": 0.0,
             }

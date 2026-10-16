@@ -1,4 +1,4 @@
-"""Content-addressed file storage for Parquet, models, and artefacts.
+"""Atomic market partitions and content-addressed models and artefacts.
 
 The interface does not impose a dataframe library. Callers write their Parquet
 file with the project tooling then register it atomically through this store.
@@ -21,6 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.data.feature_store import FeatureValue
+from src.data.locking import acquire_file_update_lock
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.market_events import MarketEvent
 
@@ -85,39 +86,13 @@ class ContentAddressedStore:
 
 
 class PartitionedMarketEventStore:
-    """Write immutable canonical events into the required Parquet partition layout."""
+    """Publish canonical event partitions atomically."""
 
     def __init__(self, root: Path):
         self.root = root.resolve()
 
     def put(self, event: MarketEvent, *, venue: str, market: str, symbol: str) -> Path:
-        parts = {
-            "venue": venue.lower(),
-            "market": market.lower(),
-            "event_type": event.event_type.value,
-            "symbol": symbol.upper(),
-        }
-        if any(not _PARTITION_TOKEN.fullmatch(value) for value in parts.values()):
-            raise ValueError("market-event partition contains an unsafe token")
-        date = datetime.fromisoformat(event.exchange_timestamp).date().isoformat()
-        directory = (
-            self.root
-            / "raw"
-            / parts["venue"]
-            / parts["market"]
-            / parts["event_type"]
-            / parts["symbol"]
-            / f"date={date}"
-        )
-        existing_paths = tuple(path for path in directory.glob("*.parquet") if path.is_file())
-        rows = _merge_event_rows(existing_paths, {event.event_id: _market_event_row(event)})
-        destination = directory / f"batch-{canonical_hash(rows).removeprefix('sha256:')}.parquet"
-        if destination.exists():
-            return destination
-        _write_rows(destination, rows, row_group_size=1_024)
-        if existing_paths:
-            _quarantine_parquet(existing_paths, root=self.root, label="raw")
-        return destination
+        return self.put_batch(((event, venue, market, symbol),))[0]
 
     def put_batch(
         self,
@@ -144,47 +119,15 @@ class PartitionedMarketEventStore:
         for (venue, market, event_type, symbol, date), partition_events in sorted(
             partitions.items()
         ):
-            unique_events = {event.event_id: event for event in partition_events}
-            ordered = tuple(
-                sorted(unique_events.values(), key=lambda item: (item.sequence, item.event_id))
-            )
-            rows = tuple(_market_event_row(item) for item in ordered)
-            digest = canonical_hash(rows).removeprefix("sha256:")
-            destination = (
-                self.root
-                / "raw"
-                / venue
-                / market
-                / event_type
-                / symbol
-                / f"date={date}"
-                / f"batch-{digest}.parquet"
-            )
-            if destination.exists():
-                existing_rows = tuple(
-                    dict(row) for row in pq.ParquetFile(destination).read().to_pylist()
+            directory = self.root / "raw" / venue / market / event_type / symbol / f"date={date}"
+            paths.append(
+                upsert_partition_rows(
+                    directory,
+                    tuple(_market_event_row(item) for item in partition_events),
+                    identity="event_id",
+                    row_group_size=row_group_size,
                 )
-                if canonical_hash(existing_rows).removeprefix("sha256:") != digest:
-                    raise RuntimeError(f"raw partition content hash collision: {destination}")
-                paths.append(destination)
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-            table = pa.table(
-                {
-                    key: [row[key] for row in rows]
-                    for key in rows[0]
-                }
             )
-            try:
-                pq.write_table(table, temporary, compression="zstd", row_group_size=row_group_size)
-                with temporary.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                os.replace(temporary, destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-            _fsync_directory(destination.parent)
-            paths.append(destination)
         return tuple(paths)
 
 
@@ -545,7 +488,7 @@ class PartitionedBarStore:
 
 
 class PartitionedFeatureStore:
-    """Write deterministic feature batches into immutable Parquet partitions."""
+    """Publish deterministic feature partitions atomically."""
 
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -629,22 +572,70 @@ def _market_event_row(event: MarketEvent) -> dict[str, object]:
     }
 
 
-def _merge_event_rows(
-    paths: Iterable[Path], incoming: Mapping[str, dict[str, object]]
-) -> tuple[dict[str, object], ...]:
-    rows = dict(incoming)
-    for path in paths:
-        for raw in pq.ParquetFile(path).read().to_pylist():
-            if isinstance(raw, Mapping):
-                identity = str(raw.get("event_id") or canonical_hash(dict(raw)))
-                rows.setdefault(identity, dict(raw))
+def partition_files(root: Path, pattern: str = "**/*.parquet") -> tuple[Path, ...]:
+    """Select one published generation; older immutable files remain readable during rollout."""
+    groups: dict[Path, list[Path]] = {}
+    for path in root.glob(pattern):
+        if path.is_file() and not path.is_symlink():
+            groups.setdefault(path.parent, []).append(path)
     return tuple(
-        row
-        for _identity, row in sorted(
-            rows.items(),
-            key=lambda item: (str(item[1].get("exchange_timestamp") or ""), item[0]),
+        path
+        for directory, paths in sorted(groups.items())
+        for path in (
+            [directory / "current.parquet"]
+            if (directory / "current.parquet").is_file()
+            else sorted(paths)
         )
     )
+
+
+def upsert_partition_rows(
+    directory: Path,
+    incoming: Iterable[Mapping[str, object]],
+    *,
+    identity: str,
+    row_group_size: int = 1024,
+) -> Path:
+    """Atomically replace a bounded daily partition without invalidating opened readers."""
+    destination = directory / "current.parquet"
+    with acquire_file_update_lock(destination, label="Parquet partition"):
+        rows: dict[str, dict[str, object]] = {}
+        for path in partition_files(directory, "*.parquet"):
+            for row in pq.ParquetFile(path).read().to_pylist():
+                rows[str(row[identity])] = row
+        for row in incoming:
+            key = str(row[identity])
+            existing = rows.get(key)
+            # A delivery retry must not move information availability into the future.
+            if existing is None:
+                rows[key] = dict(row)
+            elif _partition_content(existing) != _partition_content(row):
+                raise ValueError(f"conflicting partition observation: {identity}={key}")
+        ordered = tuple(rows[key] for key in sorted(rows))
+        _validate_bar_revisions(ordered)
+        _write_rows(destination, ordered, row_group_size=row_group_size)
+    return destination
+
+
+def _partition_content(row: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in row.items()
+        if key not in {"availability_time", "receive_timestamp", "received_at"}
+        and not (key == "close_timestamp" and "close_time_ms" in row)
+        and value is not None
+    }
+
+
+def _validate_bar_revisions(rows: Iterable[Mapping[str, object]]) -> None:
+    candles: dict[tuple[object, object, object], tuple[object, ...]] = {}
+    for row in rows:
+        if "open_time_ms" not in row:
+            continue
+        identity = (row["instrument_id"], row["open_time_ms"], row["close_time_ms"])
+        values = tuple(row[name] for name in ("open", "high", "low", "close", "volume"))
+        if candles.setdefault(identity, values) != values:
+            raise ValueError(f"conflicting closed candle: {identity}")
 
 
 def _bar_event_row(
@@ -670,7 +661,7 @@ def _bar_event_row(
         "instrument_id": event.instrument_id,
         "open_time_ms": int(candle["t"]),
         "close_time_ms": int(candle["T"]),
-        "close_timestamp": close_time.replace(microsecond=0).isoformat(),
+        "close_timestamp": close_time.isoformat(),
         "availability_time": event.availability_time,
         "open": float(candle["o"]),
         "high": float(candle["h"]),
@@ -704,42 +695,9 @@ def _write_bar_partition(
     row_group_size: int,
 ) -> Path:
     venue, market, symbol, timeframe, date = key
-    incoming = {event.event_id: row for event, row in items}
     directory = root / "bars" / venue / market / symbol / timeframe / f"date={date}"
-    existing_paths = (
-        tuple(path for path in sorted(directory.glob("*.parquet")) if path.is_file())
-        if directory.exists()
-        else ()
-    )
-    rows = _merge_bar_rows(existing_paths, incoming)
-    digest = canonical_hash(rows).removeprefix("sha256:")
-    destination = directory / f"batch-{digest}.parquet"
-    if destination.exists():
-        return destination
-    _write_rows(destination, rows, row_group_size=row_group_size)
-    if existing_paths:
-        _quarantine_parquet(existing_paths, root=root, label="bars")
-    return destination
-
-
-def _merge_bar_rows(
-    paths: Iterable[Path], incoming: Mapping[str, dict[str, object]]
-) -> tuple[dict[str, object], ...]:
-    rows = dict(incoming)
-    for path in paths:
-        for raw in pq.ParquetFile(path).read().to_pylist():
-            if isinstance(raw, Mapping):
-                identity = str(raw.get("event_id") or canonical_hash(dict(raw)))
-                rows.setdefault(identity, dict(raw))
-    return tuple(
-        row
-        for _identity, row in sorted(
-            rows.items(),
-            key=lambda item: (
-                str(item[1].get("close_timestamp") or item[1].get("close_time_ms") or ""),
-                item[0],
-            ),
-        )
+    return upsert_partition_rows(
+        directory, (row for _, row in items), identity="event_id", row_group_size=row_group_size
     )
 
 
@@ -751,8 +709,6 @@ def _write_feature_partition(
     *,
     row_group_size: int,
 ) -> Path:
-    payloads = [to_primitive(item) for item in values]
-    digest = canonical_hash(payloads).removeprefix("sha256:")
     directory = (
         root
         / "features"
@@ -763,47 +719,9 @@ def _write_feature_partition(
         / parts["timeframe"]
         / f"date={date}"
     )
-    destination = directory / f"batch-{digest}.parquet"
-    if destination.exists():
-        return destination
-    directory.mkdir(parents=True, exist_ok=True)
-    existing_paths = tuple(path for path in sorted(directory.glob("*.parquet")) if path.is_file())
-    if existing_paths:
-        values = _merge_feature_values(existing_paths, values)
-        digest = canonical_hash([to_primitive(item) for item in values]).removeprefix("sha256:")
-        destination = directory / f"batch-{digest}.parquet"
-        if destination.exists():
-            _quarantine_parquet(
-                (path for path in existing_paths if path != destination),
-                root=root,
-                label="features",
-            )
-            return destination
-    _write_feature_values(destination, values, row_group_size=row_group_size)
-    if existing_paths:
-        _quarantine_parquet(existing_paths, root=root, label="features")
-    return destination
-
-
-def _merge_feature_values(
-    paths: Iterable[Path], incoming: Iterable[FeatureValue]
-) -> tuple[FeatureValue, ...]:
-    values: dict[str, FeatureValue] = {item.feature_id: item for item in incoming}
-    for path in paths:
-        for raw in pq.ParquetFile(path).read().to_pylist():
-            if isinstance(raw, Mapping):
-                item = FeatureValue(
-                    feature_set_version=str(raw["feature_set_version"]),
-                    feature_name=str(raw["feature_name"]),
-                    instrument_id=str(raw["instrument_id"]),
-                    source_event_time=str(raw["source_event_time"]),
-                    source_close_time=str(raw["source_close_time"]),
-                    availability_time=str(raw["availability_time"]),
-                    value=float(raw["value"]),
-                )
-                values.setdefault(item.feature_id, item)
-    return tuple(
-        sorted(values.values(), key=lambda item: (item.source_close_time, item.feature_name))
+    rows = tuple({"feature_id": item.feature_id, **to_primitive(item)} for item in values)
+    return upsert_partition_rows(
+        directory, rows, identity="feature_id", row_group_size=row_group_size
     )
 
 
@@ -816,7 +734,10 @@ def _write_rows(
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     table = pa.table(
-        {key: [row.get(key) for row in rows] for key in {key for row in rows for key in row}}
+        {
+            key: [row.get(key) for row in rows]
+            for key in sorted({key for row in rows for key in row})
+        }
     )
     try:
         pq.write_table(table, temporary, compression="zstd", row_group_size=row_group_size)
@@ -826,46 +747,6 @@ def _write_rows(
     finally:
         temporary.unlink(missing_ok=True)
     _fsync_directory(destination.parent)
-
-
-def _write_feature_values(
-    destination: Path,
-    values: tuple[FeatureValue, ...],
-    *,
-    row_group_size: int,
-) -> None:
-    rows = tuple(
-        {
-            "feature_id": item.feature_id,
-            "feature_set_version": item.feature_set_version,
-            "feature_name": item.feature_name,
-            "instrument_id": item.instrument_id,
-            "source_event_time": item.source_event_time,
-            "source_close_time": item.source_close_time,
-            "availability_time": item.availability_time,
-            "value": item.value,
-        }
-        for item in values
-    )
-    _write_rows(destination, rows, row_group_size=row_group_size)
-
-
-def _quarantine_parquet(paths: Iterable[Path], *, root: Path, label: str) -> None:
-    """Move superseded active files aside after the replacement is durable."""
-
-    quarantine_root = root / "quarantine" / label
-    moved: list[Path] = []
-    for path in paths:
-        if not path.is_file() or path.is_symlink():
-            continue
-        target = quarantine_root / path.relative_to(root)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            target = target.with_name(f"{target.name}.{uuid.uuid4().hex}")
-        os.replace(path, target)
-        moved.append(target)
-    for directory in {path.parent for path in moved}:
-        _fsync_directory(directory)
 
 
 class PartitionedBacktestStore:

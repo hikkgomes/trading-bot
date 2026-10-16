@@ -3,7 +3,6 @@ set -euo pipefail
 
 REPO="${REPO:-/home/alfred/trading-bot}"
 PYTHON="${PYTHON:-$REPO/.venv-runtime/bin/python}"
-CONFIG="${PLATFORM_CONFIG:-$REPO/config/platform.json}"
 ENV_FILE="${PLATFORM_ENV_FILE:-/etc/trading-platform/migration.env}"
 
 if [[ "$REPO" != /* || "$REPO" =~ [[:space:]\|] ]]; then
@@ -65,9 +64,12 @@ stop_active_units() {
 }
 
 cd "$REPO"
+REPO="$REPO" NODE=linux-optiplex DRY_RUN=0 bash "$REPO/scripts/install_platform_services.sh" --check-authorities
 stop_active_units
-"$PYTHON" -m src.services.backup_service --config "$CONFIG" --mode postgresql
-"$PYTHON" -m src.services.backup_service --config "$CONFIG" --mode parquet
-"$PYTHON" -m src.services.backup_service --config "$CONFIG" --mode verify
+# Installed backup units supply the read-only backup login and filesystem owner.
+# The migration identity must never replace that service boundary.
+for mode in postgresql parquet verify; do
+  systemctl start "trading-platform-backup@$mode.service"
+done
 "$PYTHON" -m src.services.platform_upgrade
 REPO="$REPO" SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}" bash "$REPO/scripts/install_platform_services.sh"

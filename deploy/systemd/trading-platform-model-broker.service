@@ -1,0 +1,50 @@
+[Unit]
+Description=Bounded local OpenClaw model broker
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/trading-platform/model-broker/model-broker.env
+
+[Service]
+Type=simple
+User=alfred
+Group=trading-model-broker
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/model-broker/model-broker.env
+Environment=PYTHONUNBUFFERED=1
+Environment=TRADING_PLATFORM_OPENCLAW_STATE_DIR=/home/alfred/.openclaw
+Environment=TRADING_PLATFORM_OPENCLAW_PRIVATE_STATE=/var/lib/trading-platform-model-broker/openclaw-state
+UnsetEnvironment=TRADING_PLATFORM_DATABASE_URL TRADING_PLATFORM_AGENT_TRANSPORT_KEY BINANCE_SPOT_API_KEY BINANCE_SPOT_API_SECRET BINANCE_FUTURES_API_KEY BINANCE_FUTURES_API_SECRET
+RuntimeDirectory=trading-platform-model-broker
+RuntimeDirectoryMode=0750
+StateDirectory=trading-platform-model-broker
+StateDirectoryMode=0700
+UMask=0007
+ExecStartPre=/opt/trading-bot/.venv-agent/bin/python -m src.agents.model_broker --validate --socket /run/trading-platform-model-broker/model.sock --ledger /var/lib/trading-platform-model-broker/ledger.sqlite3 --prompt /opt/trading-bot/config/openclaw_daily_review_prompt.md --agent research --allowed-user trading-agent
+ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.agents.model_broker --socket /run/trading-platform-model-broker/model.sock --ledger /var/lib/trading-platform-model-broker/ledger.sqlite3 --prompt /opt/trading-bot/config/openclaw_daily_review_prompt.md --agent research --allowed-user trading-agent
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+TemporaryFileSystem=/home/alfred/.openclaw/npm:ro /home/alfred/.openclaw/subagents:ro
+BindPaths=/var/lib/trading-platform-model-broker/openclaw-state:/home/alfred/.openclaw/state
+ReadWritePaths=/home/alfred/.openclaw/workspace-trading-research /home/alfred/.openclaw/agents/trading-research /home/alfred/.openclaw/agents/research /home/alfred/.openclaw/agents/main/agent /home/alfred/.openclaw/locks
+ReadOnlyPaths=-/home/alfred/.openclaw/agents/main/agent/codex-home
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+InaccessiblePaths=-/etc/trading-platform/runtime.env -/etc/trading-platform/research.env -/etc/trading-platform/evaluator.env -/etc/trading-platform/agent.env -/etc/trading-platform/migration.env -/etc/trading-platform/backup.env -/run/docker.sock -/var/run/docker.sock -/run/user/%U/docker.sock
+Slice=trading-platform-agent.slice
+
+[Install]
+WantedBy=multi-user.target

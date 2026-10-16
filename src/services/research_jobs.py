@@ -21,9 +21,17 @@ from src.research.backtest.event_engine import (
     SimulatedOrderSide,
 )
 from src.research.canonical import SqlStrategyArtefactRepository, SqlValidationRepository
-from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
+from src.research.catalogue import (
+    registered_strategy_candidate_page,
+    registered_strategy_theses,
+)
 from src.research.cohorts import CohortPending, complete_cohort, prepare_cohort, selection_stream
-from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
+from src.research.coordinator import (
+    Candidate,
+    CandidateEvaluationView,
+    ResearchCoordinator,
+    TrialCapacityError,
+)
 from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import (
     CandidateDatasetPlan,
@@ -48,6 +56,7 @@ from src.research.executors import (
 )
 from src.research.generation import (
     CAMPAIGNS,
+    BtcAllocationLimits,
     GenerationFeedback,
     HypothesisGenerator,
     SqlGenerationFeedbackStore,
@@ -169,6 +178,51 @@ def _btc_accounting_context(product: Mapping[str, Any]) -> dict[str, Any]:
         "btc_minimum_fraction": product.get("btc_minimum_fraction"),
         "btc_max_tactical_fraction": product.get("btc_max_tactical_fraction"),
     }
+
+
+def _btc_generation_limits(
+    configuration: Mapping[str, Any] | None, product: Mapping[str, Any] | None
+) -> BtcAllocationLimits | None:
+    if not isinstance(configuration, Mapping) or not isinstance(product, Mapping):
+        return None
+    risk = configuration.get("risk")
+    if not isinstance(risk, Mapping):
+        return None
+    instrument_limits = risk.get("instrument")
+    strategy_limits = risk.get("strategy")
+    sleeve_limits = risk.get("sleeve")
+    if (
+        not isinstance(instrument_limits, Mapping)
+        or not isinstance(strategy_limits, Mapping)
+        or not isinstance(sleeve_limits, Mapping)
+    ):
+        return None
+    limit_values = (
+        product.get("btc_max_tactical_fraction"),
+        instrument_limits.get("maximum_fraction"),
+        strategy_limits.get("maximum_fraction"),
+        sleeve_limits.get("maximum_fraction"),
+        product.get("btc_minimum_fraction"),
+    )
+    if any(value is None for value in limit_values):
+        return None
+    return BtcAllocationLimits.from_mapping(
+        {
+            "product_max_tactical_fraction": product.get("btc_max_tactical_fraction"),
+            "instrument_maximum_fraction": instrument_limits.get("maximum_fraction"),
+            "strategy_maximum_fraction": strategy_limits.get("maximum_fraction"),
+            "sleeve_maximum_fraction": sleeve_limits.get("maximum_fraction"),
+            "minimum_btc_fraction": product.get("btc_minimum_fraction"),
+        }
+    )
+
+
+def _generation_instrument_cursor(payload: Mapping[str, Any]) -> int:
+    epoch = str(payload.get("epoch_id") or "")
+    epoch_offset = int(canonical_hash({"epoch": epoch})[7:15], 16) if epoch else 0
+    round_number = max(0, int(payload.get("round_number", 1)) - 1)
+    budget = max(1, int(payload.get("generation_budget", 1)))
+    return epoch_offset + round_number * budget
 
 
 def _active_income_accounting_context(
@@ -422,6 +476,18 @@ class DatabaseResearchJobHandlers:
         self.configuration = configuration
         self.dataset_bundle_service = dataset_bundle_service
         self.historical_bootstrap_service = historical_bootstrap_service
+        budgets = (
+            configuration.get("research", {}).get("search_budgets", {})
+            if isinstance(configuration, Mapping)
+            else {}
+        )
+        if isinstance(budgets, Mapping):
+            self.store.daily_trial_budget = int(
+                budgets.get("maximum_candidates_per_day", self.store.daily_trial_budget)
+            )
+            self.store.epoch_trial_budget = int(
+                budgets.get("maximum_candidates_per_epoch", self.store.epoch_trial_budget)
+            )
 
     def handlers(self) -> dict[str, Callable]:
         return {
@@ -520,12 +586,16 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
-        product_id = str(claimed.payload["product_id"])
-        catalogue_at = _runtime_data_timestamp(claimed.payload, "catalogue_submitted_at")
+        payload = dict(claimed.payload)
+        product_id = str(payload["product_id"])
+        had_bundle = bool(payload.get("dataset_bundle_id"))
+        selected_at = _optional_text(payload.get("research_as_of"))
+        catalogue_at = _runtime_data_timestamp(payload, "submitted_at", "catalogue_submitted_at")
         dataset, waiting = self._catalogue_dataset(
-            claimed.payload,
+            payload,
             product_id=product_id,
-            created_at=catalogue_at,
+            created_at=utc_now(),
+            history_as_of=selected_at,
         )
         if waiting is not None:
             if waiting.get("state") == "blocked_dataset":
@@ -537,12 +607,103 @@ class DatabaseResearchJobHandlers:
             }
         if dataset is None:
             raise JobSchemaError("catalogue dataset resolution returned no result")
-        return self._register_catalogue_candidates(
+        if selected_at and dataset.bundle is not None:
+            expected_snapshot = _optional_text(payload.get("universe_snapshot_id"))
+            if expected_snapshot and dataset.bundle.universe_snapshot_id != expected_snapshot:
+                raise JobSchemaError("catalogue bundle does not match the pinned research scope")
+        if not had_bundle and not payload.get("round_id"):
+            return self._catalogue_dataset_ready(product_id, dataset)
+        return self._run_catalogue_round(
             claimed,
+            payload=payload,
             dataset=dataset,
             product_id=product_id,
             catalogue_at=catalogue_at,
         )
+
+    @staticmethod
+    def _catalogue_dataset_ready(product_id: str, dataset: _CatalogueDataset) -> dict[str, Any]:
+        if dataset.bundle is None:
+            return {
+                "product_id": product_id,
+                "state": "waiting_for_dataset",
+                "reason_code": "canonical_dataset_bundle_unavailable",
+                "_defer": True,
+                "_defer_reason": "canonical_dataset_bundle_unavailable",
+            }
+        return {
+            "product_id": product_id,
+            "state": "dataset_ready",
+            "dataset_bundle_id": dataset.bundle.bundle_id,
+            "dataset_snapshot_hashes": list(dataset.snapshot_ids),
+            "universe_snapshot_id": dataset.bundle.universe_snapshot_id,
+        }
+
+    def _run_catalogue_round(
+        self,
+        claimed: ClaimedJob,
+        *,
+        payload: dict[str, Any],
+        dataset: _CatalogueDataset,
+        product_id: str,
+        catalogue_at: str,
+    ) -> dict[str, Any]:
+        from src.research.rounds import ResearchRoundCoordinator
+
+        request_payload = {
+            **payload,
+            "dataset_bundle_id": dataset.bundle_id,
+            "dataset_snapshot_hashes": list(dataset.snapshot_ids),
+            "universe_snapshot_id": (
+                dataset.plan.universe_snapshot_id
+                if dataset.plan is not None
+                else payload.get("universe_snapshot_id")
+            ),
+            "producer": "catalogue",
+        }
+        limits = (self.configuration or {}).get("research", {}).get("search_budgets", {})
+        if not request_payload.get("round_id"):
+            request = ResearchRoundCoordinator(self.store.engine).claim(
+                request_payload,
+                now=catalogue_at,
+                epoch_budget=int(
+                    limits.get("maximum_candidates_per_epoch", self.store.epoch_trial_budget)
+                ),
+                daily_budget=int(
+                    limits.get("maximum_candidates_per_day", self.store.daily_trial_budget)
+                ),
+            )
+            if request is None:
+                return {
+                    "product_id": product_id,
+                    "state": "waiting_for_budget",
+                    "next_catalogue_cursor": int(payload.get("catalogue_cursor", 0)),
+                    "catalogue_closed": bool(payload.get("catalogue_closed", False)),
+                }
+            request_payload = request
+        try:
+            return ResearchRoundCoordinator(self.store.engine).complete(
+                str(request_payload["round_id"]),
+                produce=lambda connection, request: self._register_catalogue_candidates(
+                    replace(claimed, payload=dict(request)),
+                    dataset=dataset,
+                    product_id=product_id,
+                    catalogue_at=str(request["submitted_at"]),
+                    cursor=int(request["catalogue_cursor"]),
+                    limit=int(request["generation_budget"]),
+                    connection=connection,
+                ),
+            )
+        except TrialCapacityError as exc:
+            return {
+                "product_id": product_id,
+                "state": "waiting_for_budget",
+                "reason_code": "research_trial_budget_exhausted",
+                "next_catalogue_cursor": int(request_payload.get("catalogue_cursor", 0)),
+                "catalogue_closed": False,
+                "_defer": True,
+                "_defer_reason": str(exc),
+            }
 
     def _register_catalogue_candidates(
         self,
@@ -551,6 +712,9 @@ class DatabaseResearchJobHandlers:
         dataset: _CatalogueDataset,
         product_id: str,
         catalogue_at: str,
+        cursor: int,
+        limit: int,
+        connection,
     ) -> dict[str, Any]:
         snapshot_ids = dataset.snapshot_ids
         bundle_id = dataset.bundle_id
@@ -566,7 +730,7 @@ class DatabaseResearchJobHandlers:
                 "_defer_reason": "point_in_time_universe_unavailable",
             }
         theses = registered_strategy_theses(product=product_id, instrument_universe=universe)
-        thesis_registry = SqlThesisRegistry(self.store.engine)
+        thesis_registry = SqlThesisRegistry(self.store.engine, connection=connection)
         for thesis in theses.values():
             thesis_registry.register(thesis)
         if product_id == "active_income" and len(universe) > 1:
@@ -575,7 +739,7 @@ class DatabaseResearchJobHandlers:
                     product=product_id, instrument_universe=(symbol,)
                 ).values():
                     thesis_registry.register(thesis)
-        candidates = registered_strategy_candidates(
+        candidates, next_cursor, catalogue_closed = registered_strategy_candidate_page(
             product=product_id,
             dataset_snapshot_hashes=snapshot_ids,
             dataset_bundle_id=(str(bundle_id) if bundle_id else None),
@@ -586,6 +750,8 @@ class DatabaseResearchJobHandlers:
             ),
             instrument_universe=universe,
             submitted_at=catalogue_at,
+            cursor=cursor,
+            limit=limit,
         )
         if plan is not None:
             if bundle is None:
@@ -599,11 +765,29 @@ class DatabaseResearchJobHandlers:
                 )
                 for candidate in candidates
             )
-        identities = ResearchCoordinator(self.store).register(candidates)
-        return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
+        store = SqlResearchStore(
+            self.store.engine,
+            connection=connection,
+            daily_trial_budget=self.store.daily_trial_budget,
+            epoch_trial_budget=self.store.epoch_trial_budget,
+        )
+        identities = ResearchCoordinator(store).register(candidates, producer="catalogue")
+        return {
+            "state": "catalogue_registered",
+            "registered_candidates": len(identities),
+            "candidate_count": len(identities),
+            "candidate_ids": list(identities),
+            "next_catalogue_cursor": next_cursor,
+            "catalogue_closed": catalogue_closed,
+        }
 
     def _catalogue_dataset(
-        self, payload: Mapping[str, Any], *, product_id: str, created_at: str | None = None
+        self,
+        payload: Mapping[str, Any],
+        *,
+        product_id: str,
+        created_at: str | None = None,
+        history_as_of: str | None = None,
     ) -> tuple[_CatalogueDataset | None, dict[str, Any] | None]:
         snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
         bundle_id = _optional_text(payload.get("dataset_bundle_id"))
@@ -614,11 +798,8 @@ class DatabaseResearchJobHandlers:
                 product_id=product_id,
                 universe_id=str(payload.get("universe_id") or ""),
                 market_type=str(payload.get("market_type") or "futures"),
-                created_at=str(
-                    created_at
-                    or payload.get("catalogue_submitted_at")
-                    or payload.get("available_at")
-                ),
+                created_at=created_at or utc_now(),
+                history_as_of=history_as_of or _optional_text(payload.get("research_as_of")),
                 timeframe=_optional_text(payload.get("dataset_timeframe")),
                 data_plan=ResearchDataPlan.from_payload(payload["data_plan"])
                 if payload.get("data_plan")
@@ -659,7 +840,15 @@ class DatabaseResearchJobHandlers:
     ) -> dict[str, Any]:
         renew()
         candidate = self._candidate(claimed.payload)
-        candidate_id = ResearchCoordinator(self.store).submit(candidate)
+        try:
+            candidate_id = ResearchCoordinator(self.store).submit(candidate)
+        except TrialCapacityError as exc:
+            return {
+                "state": "waiting_for_budget",
+                "reason_code": "research_trial_budget_exhausted",
+                "_defer": True,
+                "_defer_reason": str(exc),
+            }
         return {"candidate_id": candidate_id, "source_type": candidate.definition.source_type.value}
 
     def generate_hypotheses(
@@ -687,17 +876,30 @@ class DatabaseResearchJobHandlers:
             if request is None:
                 return {"state": "no_new_round", "candidate_ids": [], "candidate_count": 0}
             payload = request
-        return rounds.complete(
-            str(payload["round_id"]),
-            produce=lambda connection, request: self._generate_hypotheses(
-                replace(claimed, payload=dict(request)), renew, connection=connection
-            ),
-        )
+        try:
+            return rounds.complete(
+                str(payload["round_id"]),
+                produce=lambda connection, request: self._generate_hypotheses(
+                    replace(claimed, payload=dict(request)), renew, connection=connection
+                ),
+            )
+        except TrialCapacityError as exc:
+            return {
+                "state": "waiting_for_budget",
+                "reason_code": "research_trial_budget_exhausted",
+                "_defer": True,
+                "_defer_reason": str(exc),
+            }
 
     def _generate_hypotheses(self, claimed, renew, *, connection=None):
         payload = self._resolve_generation_dataset(claimed.payload)
         product_id, universe, snapshot_ids = self._generation_inputs(payload)
-        store = SqlResearchStore(self.store.engine, connection=connection)
+        store = SqlResearchStore(
+            self.store.engine,
+            connection=connection,
+            daily_trial_budget=self.store.daily_trial_budget,
+            epoch_trial_budget=self.store.epoch_trial_budget,
+        )
         feedback_store = SqlGenerationFeedbackStore(
             self.store.engine,
             connection=connection,
@@ -717,6 +919,12 @@ class DatabaseResearchJobHandlers:
             instrument_universe=universe,
             memory=SqlHypothesisMemory(self.store.engine, connection=connection),
             feedback_store=feedback_store,
+            btc_allocation_limits=_btc_generation_limits(
+                self.configuration,
+                _configured_product(self.configuration, product_id)
+                if isinstance(self.configuration, Mapping)
+                else None,
+            ),
         )
         parent_candidates = store.development_parents(
             as_of=payload.get("feedback_at"), stage_ids=payload.get("development_stage_ids")
@@ -736,6 +944,7 @@ class DatabaseResearchJobHandlers:
             ),
             parent_candidates=parent_candidates,
             dataset_plan=plan,
+            instrument_cursor=_generation_instrument_cursor(payload),
         )
         registered = self._register_hypotheses(
             hypotheses,
@@ -758,8 +967,16 @@ class DatabaseResearchJobHandlers:
         snapshot_ids = tuple(str(item) for item in payload.get("dataset_snapshot_hashes", ()))
         bundle_id = _optional_text(payload.get("dataset_bundle_id"))
         if snapshot_ids or self.dataset_bundle_service is None or bundle_id is not None:
+            if bundle_id and payload.get("universe_snapshot_id"):
+                supplied_bundle = SqlDatasetBundleRepository(self.store.engine).get(bundle_id)
+                if supplied_bundle.universe_snapshot_id != str(payload["universe_snapshot_id"]):
+                    raise JobSchemaError(
+                        "generation bundle does not match the pinned research scope"
+                    )
             return resolved
-        observed_at = _runtime_data_timestamp(payload, "submitted_at", "available_at")
+        observed_at = _runtime_data_timestamp(
+            payload, "research_as_of", "submitted_at", "available_at"
+        )
         from src.research.data_plan import ResearchDataPlan
 
         bundle = SqlDatasetBundleRepository(self.store.engine).latest_ready(
@@ -776,7 +993,7 @@ class DatabaseResearchJobHandlers:
             return resolved
         return {
             **resolved,
-            "submitted_at": observed_at,
+            "submitted_at": str(payload.get("submitted_at") or observed_at),
             "dataset_snapshot_hashes": list(bundle.stage_snapshot_ids.values()),
             "dataset_bundle_id": bundle.bundle_id,
             "universe_snapshot_id": bundle.universe_snapshot_id,
@@ -850,6 +1067,11 @@ class DatabaseResearchJobHandlers:
         bundle = SqlDatasetBundleRepository(self.store.engine).get(str(bundle_id))
         if bundle.lifecycle_state is not DatasetLifecycleState.READY:
             raise JobSchemaError("hypothesis generation requires a ready dataset bundle")
+        if bundle.product_id != str(payload.get("product_id")):
+            raise JobSchemaError("hypothesis generation bundle has the wrong product")
+        pinned_snapshot = _optional_text(payload.get("universe_snapshot_id"))
+        if pinned_snapshot and pinned_snapshot != bundle.universe_snapshot_id:
+            raise JobSchemaError("hypothesis generation bundle differs from the pinned universe")
         return bundle, CandidateDatasetPlan.from_bundle(bundle)
 
     def _register_hypotheses(
@@ -939,7 +1161,15 @@ class DatabaseResearchJobHandlers:
         if thesis.thesis_id != candidate.thesis_id:
             raise ValueError("ML candidate thesis identity does not match its definition")
         SqlThesisRegistry(self.store.engine).register(thesis)
-        candidate_id = ResearchCoordinator(self.store).submit(candidate)
+        try:
+            candidate_id = ResearchCoordinator(self.store).submit(candidate)
+        except TrialCapacityError as exc:
+            return {
+                "state": "waiting_for_budget",
+                "reason_code": "research_trial_budget_exhausted",
+                "_defer": True,
+                "_defer_reason": str(exc),
+            }
         return {"candidate_id": candidate_id, "source_type": candidate.definition.source_type.value}
 
     def evaluate_candidate(

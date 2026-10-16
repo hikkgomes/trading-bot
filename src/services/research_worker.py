@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from src.research.outcomes import OutcomeCategory
@@ -25,6 +28,7 @@ class ResearchWorker:
         lease_seconds: int = 120,
         heavy_compute: HeavyComputeLeaseStore | None = None,
         forbidden_secret_names: tuple[str, ...] = (),
+        maximum_runtime_seconds: int | None = None,
     ) -> None:
         if runtime.node.operating_system != "linux":
             raise ValueError("research workers must run on Linux")
@@ -45,6 +49,9 @@ class ResearchWorker:
         self.handlers = dict(handlers)
         self.lease_seconds = lease_seconds
         self.heavy_compute = heavy_compute
+        if maximum_runtime_seconds is not None and maximum_runtime_seconds <= 0:
+            raise ValueError("research deadline must be positive")
+        self.maximum_runtime_seconds = maximum_runtime_seconds
 
     def run_once(self, *, now: str | None = None) -> dict[str, Any]:
         now = now or utc_now()
@@ -97,26 +104,29 @@ class ResearchWorker:
     ) -> dict[str, Any]:
         current = claimed
         heavy_compute = self.heavy_compute
+        deadline = time.monotonic() + (self.maximum_runtime_seconds or self.lease_seconds)
 
         def renew() -> ClaimedJob:
             nonlocal current
+            lease_seconds = max(1, min(self.lease_seconds, int(deadline - time.monotonic())))
             current = self.queue.heartbeat(
                 current,
                 now=utc_now(),
-                lease_seconds=self.lease_seconds,
+                lease_seconds=lease_seconds,
             )
             if compute_lease is not None and heavy_compute is not None:
                 # Renewal is deliberately tied to the queue lease so a dead
                 # worker cannot keep the singleton slot indefinitely.
                 heavy_compute.renew(
                     compute_lease,
-                    now=current.lease_expires_at,
-                    lease_seconds=self.lease_seconds,
+                    now=utc_now(),
+                    lease_seconds=lease_seconds,
                 )
             return current
 
         try:
-            result = dict(handler(current, renew) or {})
+            with _job_deadline(self.maximum_runtime_seconds):
+                result = dict(handler(current, renew) or {})
         except Exception as exc:
             if compute_lease is not None and heavy_compute is not None:
                 heavy_compute.release(compute_lease)
@@ -154,6 +164,19 @@ class ResearchWorker:
         if compute_lease is not None and heavy_compute is not None:
             heavy_compute.release(compute_lease)
         return _completed_outcome(current.job_id, result)
+
+
+@contextmanager
+def _job_deadline(seconds):
+    timer = threading.Timer(seconds, lambda: os._exit(124)) if seconds is not None else None
+    if timer is not None:
+        timer.daemon = True
+        timer.start()
+    try:
+        yield
+    finally:
+        if timer is not None:
+            timer.cancel()
 
 
 def _add_seconds(value: str, seconds: int) -> str:

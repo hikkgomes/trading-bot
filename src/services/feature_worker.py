@@ -11,17 +11,38 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from src.data.feature_graph import AvailableValue, FeatureGraphRegistry, default_feature_engine
+from src.data.feature_graph import (
+    AvailableValue,
+    FeatureGraphRegistry,
+    FeatureNodeType,
+    default_feature_engine,
+)
 from src.data.feature_store import DeterministicFeatureCalculator, FeatureValue, SqlFeatureStore
 from src.data.parquet_store import (
     DurableFeatureBatchSpool,
     FeatureBatchSegment,
     PartitionedFeatureStore,
+    partition_files,
 )
 from src.domain._codec import canonical_hash, timeframe_seconds
+from src.domain.market_events import MarketEvent, MarketEventType
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.job_schemas import build_content_hash
 from src.services.scheduler import DatabaseJobQueue
+
+_EMA_WARMUP_BARS = 200
+_AUXILIARY_FAMILIES_BY_NODE_TYPE = {
+    FeatureNodeType.MULTI_TIMEFRAME: {"higher_timeframe"},
+    FeatureNodeType.CROSS_SECTIONAL_RANK: {"cross_sectional"},
+    FeatureNodeType.FUNDING_OPEN_INTEREST: {"funding_open_interest"},
+    FeatureNodeType.SPOT_PERPETUAL_BASIS: {"spot_perpetual"},
+    FeatureNodeType.CORRELATION_BETA: {"correlation_beta", "linked_instruments"},
+    FeatureNodeType.ORDER_BOOK: {"order_book"},
+    FeatureNodeType.TRADE_FLOW: {"trade_flow"},
+    FeatureNodeType.LIQUIDATION: {"liquidation"},
+    FeatureNodeType.SENTIMENT: {"sentiment"},
+    FeatureNodeType.FROZEN_ML_FEATURE_SET: {"ml_manifest"},
+}
 
 
 def core_bar_features(inputs: Mapping[str, float]) -> dict[str, float]:
@@ -90,10 +111,18 @@ class DatabaseFeatureWorker:
             return {"reason_code": "feature_queue_empty"}
         try:
             payload = claimed.payload
-            raw_inputs, scalar_inputs = self._input_values(payload, job_name=claimed.name)
-            values = self._calculate_core_values(payload, scalar_inputs)
             assignments = tuple(self.active_assignments(str(payload["instrument_id"])))
             assignments = self._matching_timeframes(assignments, payload)
+            required_families, history_limit = self._feature_input_requirements(
+                assignments, payload
+            )
+            raw_inputs, scalar_inputs = self._input_values(
+                payload,
+                job_name=claimed.name,
+                required_families=required_families,
+                history_limit=history_limit,
+            )
+            values = self._calculate_core_values(payload, scalar_inputs)
             required_by_assignment, graph_values, graph_output_features = self._graph_features(
                 payload=payload,
                 raw_inputs=raw_inputs,
@@ -152,7 +181,12 @@ class DatabaseFeatureWorker:
         }
 
     def _input_values(
-        self, payload: Mapping[str, Any], *, job_name: str
+        self,
+        payload: Mapping[str, Any],
+        *,
+        job_name: str,
+        required_families: set[str] | None = None,
+        history_limit: int = 1,
     ) -> tuple[Mapping[str, Any], dict[str, float]]:
         if job_name == "live_feature_calculation" and not isinstance(
             payload.get("input_references"), Mapping
@@ -160,7 +194,11 @@ class DatabaseFeatureWorker:
             raise ValueError("live feature jobs require immutable input references")
         raw_inputs = payload.get("inputs")
         if payload.get("input_references") is not None:
-            raw_inputs = self._resolve_input_references(payload)
+            raw_inputs = self._resolve_input_references(
+                payload,
+                required_families=required_families,
+                history_limit=history_limit,
+            )
         if not isinstance(raw_inputs, Mapping):
             raise ValueError("feature job requires immutable input references or an input object")
         scalar_inputs = {
@@ -169,6 +207,30 @@ class DatabaseFeatureWorker:
             if isinstance(value, int | float) and not isinstance(value, bool)
         }
         return raw_inputs, scalar_inputs
+
+    def _feature_input_requirements(
+        self, assignments: tuple[Mapping[str, Any], ...], payload: Mapping[str, Any]
+    ) -> tuple[set[str] | None, int]:
+        if self.feature_graph_for_assignment is None:
+            return None, 1
+        requirements = self._assignment_feature_requirements(assignments)
+        required_nodes = tuple(
+            dict.fromkeys(name for names in requirements.values() for name in names)
+        )
+        if not required_nodes:
+            return set(), 1
+        graph = self.graph_registry.graph(
+            required_nodes, version=str(payload["feature_set_version"])
+        )
+        families: set[str] = set()
+        bar_history = 1
+        for node in graph.nodes:
+            families.update(_AUXILIARY_FAMILIES_BY_NODE_TYPE.get(node.node_type, ()))
+            if node.node_type is FeatureNodeType.BAR_INDICATOR:
+                bar_history = max(bar_history, node.minimum_history)
+                if node.name in {"ema", "macd"}:
+                    bar_history = max(bar_history, node.minimum_history + _EMA_WARMUP_BARS)
+        return families, bar_history
 
     @staticmethod
     def _calculate_core_values(
@@ -502,18 +564,25 @@ class DatabaseFeatureWorker:
             created_at=str(payload["availability_time"]),
         )
 
-    def _resolve_input_references(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def _resolve_input_references(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        required_families: set[str] | None = None,
+        history_limit: int = 1,
+    ) -> dict[str, Any]:
         references = self._validated_references(payload)
         bar = references.get("bar_window")
         if not isinstance(bar, Mapping):
             raise ValueError("feature job requires a bar_window input reference")
-        resolved, available_at = self._resolve_bar_window(payload, bar)
+        resolved, available_at = self._resolve_bar_window(payload, bar, history_limit=history_limit)
         self._merge_reference_inputs(
             resolved,
             references=references,
             bar=bar,
             payload=payload,
             available_at=available_at,
+            required_families=required_families,
         )
         return resolved
 
@@ -528,7 +597,11 @@ class DatabaseFeatureWorker:
         return references
 
     def _resolve_bar_window(
-        self, payload: Mapping[str, Any], bar: Mapping[str, Any]
+        self,
+        payload: Mapping[str, Any],
+        bar: Mapping[str, Any],
+        *,
+        history_limit: int = 1,
     ) -> tuple[dict[str, Any], dt.datetime]:
         pattern = str(bar.get("relative_pattern") or "")
         if not pattern.startswith("bars/") or ".." in Path(pattern).parts:
@@ -540,21 +613,22 @@ class DatabaseFeatureWorker:
         source_ids = bar.get("source_event_ids", ())
         if not isinstance(source_ids, list | tuple):
             raise ValueError("feature bar reference source_event_ids must be a list")
-        rows = self._bar_rows(pattern, payload, through=through, available_at=available_at)
-        ordered = sorted(
-            rows.values(), key=lambda row: (int(row["close_time_ms"]), str(row["event_id"]))
+        minimum_history = max(int(bar.get("minimum_history", 1)), history_limit)
+        rows = self._bar_rows(
+            pattern,
+            payload,
+            through=through,
+            available_at=available_at,
+            source_ids={str(item) for item in source_ids},
+            history_limit=minimum_history,
         )
-        if len(ordered) < int(bar.get("minimum_history", 1)):
+        ordered = self._dedupe_bar_rows(rows.values(), limit=minimum_history)
+        if len(ordered) < minimum_history:
             raise ValueError("feature input reference does not contain the required bar history")
-        target_rows = (
-            [
-                row
-                for row in ordered
-                if str(row.get("event_id")) in {str(item) for item in source_ids}
-            ]
-            if source_ids
-            else ordered
-        )
+        if source_ids and not {str(item) for item in source_ids}.issubset(rows):
+            raise ValueError("feature input reference does not contain all target event IDs")
+        target_rows = [rows[str(item)] for item in source_ids] if source_ids else ordered
+        target_rows.sort(key=lambda row: (int(row["close_time_ms"]), str(row["event_id"])))
         latest = self._latest_bar(payload, target_rows, through=through)
         return self._bar_values(latest, ordered), available_at
 
@@ -565,20 +639,61 @@ class DatabaseFeatureWorker:
         *,
         through: dt.datetime,
         available_at: dt.datetime,
+        source_ids: set[str],
+        history_limit: int,
     ) -> dict[str, dict[str, Any]]:
         assert self.parquet_store is not None
         rows: dict[str, dict[str, Any]] = {}
-        for path in self.parquet_store.root.glob(pattern):
-            if path.is_symlink() or not path.is_file():
-                continue
-            for row in pq.ParquetFile(path).read().to_pylist():
-                if str(row.get("instrument_id")) != str(payload["instrument_id"]):
+        paths_by_partition: dict[Path, list[Path]] = {}
+        for path in partition_files(self.parquet_store.root, pattern):
+            paths_by_partition.setdefault(path.parent, []).append(path)
+        for directory in sorted(paths_by_partition, reverse=True):
+            for path in paths_by_partition[directory]:
+                if path.is_symlink() or not path.is_file():
                     continue
-                close_time = dt.datetime.fromtimestamp(float(row["close_time_ms"]) / 1_000, dt.UTC)
-                availability = dt.datetime.fromisoformat(str(row["availability_time"]))
-                if close_time <= through and availability <= available_at:
-                    rows[str(row["event_id"])] = row
+                for row in pq.ParquetFile(path).read().to_pylist():
+                    if str(row.get("instrument_id")) != str(payload["instrument_id"]):
+                        continue
+                    close_time = dt.datetime.fromtimestamp(
+                        float(row["close_time_ms"]) / 1_000, dt.UTC
+                    )
+                    availability = dt.datetime.fromisoformat(str(row["availability_time"]))
+                    if close_time <= through and availability <= available_at:
+                        identity = str(row["event_id"])
+                        current = rows.get(identity)
+                        if current is None or availability < dt.datetime.fromisoformat(
+                            str(current["availability_time"])
+                        ):
+                            rows[identity] = row
+            ordered = self._dedupe_bar_rows(rows.values(), limit=history_limit)
+            if len(ordered) >= history_limit and source_ids.issubset(rows):
+                break
         return rows
+
+    @staticmethod
+    def _dedupe_bar_rows(rows: Iterable[Mapping[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+        logical: dict[tuple[str, int, int], dict[str, Any]] = {}
+        for raw_row in rows:
+            row = dict(raw_row)
+            key = (
+                str(row.get("instrument_id") or ""),
+                int(row["open_time_ms"]),
+                int(row["close_time_ms"]),
+            )
+            current = logical.get(key)
+            availability = dt.datetime.fromisoformat(str(row["availability_time"]))
+            if (
+                current is None
+                or availability < dt.datetime.fromisoformat(str(current["availability_time"]))
+                or availability == dt.datetime.fromisoformat(str(current["availability_time"]))
+                and str(row["event_id"]) < str(current["event_id"])
+            ):
+                logical[key] = row
+        ordered = sorted(
+            logical.values(),
+            key=lambda row: (int(row["close_time_ms"]), str(row["event_id"])),
+        )
+        return ordered[-limit:]
 
     @staticmethod
     def _latest_bar(
@@ -616,7 +731,7 @@ class DatabaseFeatureWorker:
             {name: float(row[name]) for name in ("open", "high", "low", "close", "volume")}
             for row in ordered
         ]
-        for name in ("spread_bps", "visible_depth", "volatility", "funding"):
+        for name in ("spread_bps", "visible_depth_quote", "volatility", "funding"):
             if latest.get(name) is not None:
                 result[name] = float(latest[name])
         if latest.get("funding") is not None:
@@ -631,9 +746,12 @@ class DatabaseFeatureWorker:
         bar: Mapping[str, Any],
         payload: Mapping[str, Any],
         available_at: dt.datetime,
+        required_families: set[str] | None,
     ) -> None:
         for name, reference in references.items():
             if name == "bar_window":
+                continue
+            if required_families is not None and name not in required_families:
                 continue
             reference_available = dt.datetime.fromisoformat(
                 str(reference.get("availability_time", payload["availability_time"]))
@@ -684,13 +802,26 @@ class DatabaseFeatureWorker:
         through: dt.datetime,
         same_instrument: bool,
     ) -> list[dict[str, Any]]:
+        snapshot_source = reference.get("snapshot_source")
+        if snapshot_source == "disabled":
+            return []
+        if snapshot_source == "market_input":
+            return self._resolve_market_input_rows(
+                reference,
+                instrument_id=instrument_id,
+                available_at=available_at,
+                through=through,
+                same_instrument=same_instrument,
+            )
+        if snapshot_source is not None:
+            raise ValueError("feature auxiliary snapshot source is unsupported")
         pattern = str(reference.get("relative_pattern") or "")
         if not pattern.startswith("raw/") or ".." in Path(pattern).parts:
             raise ValueError("feature auxiliary reference has an unsafe partition")
         event_types, source_ids = _auxiliary_filters(reference)
         rows: list[dict[str, Any]] = []
         assert self.parquet_store is not None
-        for path in self.parquet_store.root.glob(pattern):
+        for path in partition_files(self.parquet_store.root, pattern):
             if path.is_symlink() or not path.is_file():
                 continue
             for row in pq.ParquetFile(path).read().to_pylist():
@@ -705,14 +836,110 @@ class DatabaseFeatureWorker:
                 )
                 if decoded is not None:
                     rows.append(decoded)
+        rows = _dedupe_auxiliary_candles(rows)
         return sorted(
             rows,
+            key=lambda row: (
+                row["source_time"],
+                row["availability_time"],
+                row["event_id"],
+            ),
+        )
+
+    def _resolve_market_input_rows(
+        self,
+        reference: Mapping[str, Any],
+        *,
+        instrument_id: str,
+        available_at: dt.datetime,
+        through: dt.datetime,
+        same_instrument: bool,
+    ) -> list[dict[str, Any]]:
+        if self.snapshot_store is None:
+            raise ValueError("market input snapshot references require a snapshot store")
+        event_types, _source_ids = _auxiliary_filters(reference)
+        raw_ids = reference.get("source_snapshot_ids")
+        if not isinstance(raw_ids, list | tuple):
+            raise ValueError("feature market input snapshot IDs must be a list")
+        rows: dict[str, dict[str, Any]] = {}
+        for snapshot_id in raw_ids:
+            if not isinstance(snapshot_id, str):
+                raise ValueError("feature market input snapshot ID must be a string")
+            event = self._decode_market_input_snapshot(snapshot_id)
+            if event_types and event.event_type.value not in event_types:
+                raise ValueError("feature market input event type is outside its reference")
+            if same_instrument and event.instrument_id != instrument_id:
+                raise ValueError("feature market input instrument is outside its reference")
+            event_available_at = dt.datetime.fromisoformat(event.availability_timestamp)
+            event_exchange_at = dt.datetime.fromisoformat(event.exchange_timestamp)
+            if event_available_at > available_at or event_exchange_at > through:
+                continue
+            row = {
+                "event_id": event.event_id,
+                "instrument_id": event.instrument_id,
+                "event_type": event.event_type.value,
+                "sequence": event.sequence,
+                "exchange_timestamp": event_exchange_at,
+                "receive_timestamp": dt.datetime.fromisoformat(event.receive_timestamp),
+                "close_timestamp": dt.datetime.fromisoformat(
+                    str(event.close_timestamp or event.exchange_timestamp)
+                ),
+                "availability_time": event_available_at,
+                "payload": dict(event.payload),
+            }
+            existing = rows.get(event.event_id)
+            if existing is not None and existing != row:
+                raise ValueError("duplicate market input IDs disagree on their event")
+            rows[event.event_id] = row
+        return sorted(
+            rows.values(),
             key=lambda row: (
                 row["exchange_timestamp"],
                 row["availability_time"],
                 row["event_id"],
             ),
         )
+
+    def _decode_market_input_snapshot(self, snapshot_id: str) -> MarketEvent:
+        assert self.snapshot_store is not None
+        payload = self.snapshot_store.get(snapshot_id)
+        if payload.get("kind") != "market_data_input":
+            raise ValueError("feature market input snapshot has the wrong kind")
+        sequence = payload.get("source_sequence")
+        source_payload = payload.get("source_payload")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or not isinstance(source_payload, Mapping)
+        ):
+            raise ValueError("feature market input snapshot lacks a canonical event")
+        fields = (
+            "instrument_id",
+            "source_event_type",
+            "source_event_time",
+            "source_receive_time",
+            "source_close_time",
+            "availability_time",
+            "source_event_id",
+        )
+        if any(not isinstance(payload.get(field), str) for field in fields):
+            raise ValueError("feature market input snapshot has invalid event fields")
+        try:
+            event = MarketEvent(
+                instrument_id=str(payload["instrument_id"]),
+                event_type=MarketEventType(str(payload["source_event_type"])),
+                exchange_timestamp=str(payload["source_event_time"]),
+                receive_timestamp=str(payload["source_receive_time"]),
+                sequence=sequence,
+                payload=source_payload,
+                close_timestamp=str(payload["source_close_time"]),
+                availability_time=str(payload["availability_time"]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("feature market input snapshot has an invalid event") from exc
+        if event.event_id != payload["source_event_id"]:
+            raise ValueError("feature market input source event identity is invalid")
+        return event
 
     @staticmethod
     def _auxiliary_row(
@@ -736,7 +963,7 @@ class DatabaseFeatureWorker:
             row_exchange = dt.datetime.fromisoformat(str(row["exchange_timestamp"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("feature auxiliary row has invalid timestamps") from exc
-        if row_availability > available_at or row_exchange > through:
+        if row_availability > available_at:
             return None
         payload_json = row.get("payload_json")
         if not isinstance(payload_json, str):
@@ -745,15 +972,37 @@ class DatabaseFeatureWorker:
             decoded = json.loads(payload_json)
         except json.JSONDecodeError as exc:
             raise ValueError("feature auxiliary row payload is not valid JSON") from exc
+        event_type = str(row.get("event_type"))
+        source_time = _auxiliary_source_time(event_type, decoded, row_exchange)
+        if source_time is None or source_time > through:
+            return None
         return {
             "event_id": str(row.get("event_id")),
             "instrument_id": str(row.get("instrument_id")),
-            "event_type": str(row.get("event_type")),
+            "event_type": event_type,
             "sequence": row.get("sequence"),
             "exchange_timestamp": row_exchange,
+            "source_time": source_time,
             "availability_time": row_availability,
             "payload": decoded,
         }
+
+
+def _auxiliary_source_time(
+    event_type: str, payload: Any, exchange_time: dt.datetime
+) -> dt.datetime | None:
+    if event_type != "candle":
+        return exchange_time
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    candle = data.get("k") if isinstance(data, Mapping) else None
+    if not isinstance(candle, Mapping):
+        raise ValueError("feature candle auxiliary row has no candle payload")
+    close_ms = candle.get("T")
+    if not isinstance(close_ms, int) or isinstance(close_ms, bool):
+        raise ValueError("feature candle auxiliary row has an invalid close time")
+    if candle.get("x") is not True:
+        return None
+    return dt.datetime.fromtimestamp(close_ms / 1_000, dt.UTC)
 
 
 def _auxiliary_filters(reference: Mapping[str, Any]) -> tuple[set[str], set[str]]:
@@ -764,6 +1013,29 @@ def _auxiliary_filters(reference: Mapping[str, Any]) -> tuple[set[str], set[str]
     if not isinstance(raw_ids, list | tuple):
         raise ValueError("feature auxiliary reference source_event_ids must be a list")
     return {str(item) for item in raw_event_types}, {str(item) for item in raw_ids}
+
+
+def _dedupe_auxiliary_candles(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str, int], dict[str, Any]] = {}
+    other: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload")
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        candle = data.get("k") if isinstance(data, Mapping) else None
+        if row.get("event_type") != "candle" or not isinstance(candle, Mapping):
+            other.append(row)
+            continue
+        try:
+            key = (str(row["instrument_id"]), str(candle["i"]), int(candle["t"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("feature candle auxiliary row has no logical identity") from exc
+        current = selected.get(key)
+        if current is None or (row["availability_time"], row["event_id"]) < (
+            current["availability_time"],
+            current["event_id"],
+        ):
+            selected[key] = row
+    return [*other, *selected.values()]
 
 
 def _retry_at(value: str, seconds: int) -> str:

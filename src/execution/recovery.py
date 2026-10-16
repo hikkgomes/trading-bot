@@ -31,6 +31,7 @@ class RecoveryAction:
     action_type: RecoveryActionType
     target: str
     quantity: float | None = None
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class JsonlRecoveryStore:
                         action_type=RecoveryActionType(item["action_type"]),
                         target=item["target"],
                         quantity=item.get("quantity"),
+                        operation_id=item.get("operation_id"),
                     )
                     for item in payload["actions"]
                 )
@@ -126,6 +128,7 @@ class SqlRecoveryStore:
                         action_type=RecoveryActionType(item["action_type"]),
                         target=item["target"],
                         quantity=item.get("quantity"),
+                        operation_id=item.get("operation_id"),
                     )
                     for item in values["actions"]
                 )

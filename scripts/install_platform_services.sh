@@ -96,6 +96,7 @@ stop_current_authorities() {
     trading-platform-research.service
     trading-platform-evaluator.service
     trading-platform-agent.service
+    trading-platform-model-broker.service
     trading-platform-control.service
     trading-platform-migration.service
   )
@@ -106,7 +107,9 @@ stop_current_authorities() {
         exit 1
       }
     fi
-    systemctl disable "$unit" >/dev/null 2>&1 || true
+    if [[ "$unit" != "trading-platform-model-broker.service" ]]; then
+      systemctl disable "$unit" >/dev/null 2>&1 || true
+    fi
     if systemctl is-active --quiet "$unit"; then
       echo "Refusing platform upgrade while current unit remains active: $unit" >&2
       exit 1
@@ -181,7 +184,7 @@ retire_legacy_units() {
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   [[ "$NODE" == "linux-optiplex" ]] || { echo "NODE must be linux-optiplex." >&2; exit 1; }
   [[ -f "$REPO/config/platform.json" ]] || { echo "platform config is missing" >&2; exit 1; }
-  bash -n "$REPO/scripts/run_platform_service.sh"
+  bash -n "$REPO/scripts/upgrade_platform.sh"
   echo "dry-run: validated Linux platform installation for $REPO"
   exit 0
 fi
@@ -192,8 +195,11 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     exit 1
   fi
   refuse_user_authorities
+  if [[ "${1:-}" == "--check-authorities" ]]; then
+    exit 0
+  fi
   stop_current_authorities
-  for group in trading-runtime trading-research trading-evaluator trading-agent trading-platform-owner trading-platform; do
+  for group in trading-runtime trading-research trading-evaluator trading-agent trading-model-broker trading-platform-owner trading-platform; do
     if ! getent group "$group" >/dev/null; then
       groupadd --system "$group"
     fi
@@ -207,6 +213,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   for user in trading-runtime trading-research trading-evaluator trading-agent trading-platform-owner; do
     usermod --append --groups trading-platform "$user"
   done
+  usermod --append --groups trading-model-broker trading-agent
   command -v setfacl >/dev/null 2>&1 || {
     echo "Linux platform installation requires setfacl for service-specific write access." >&2
     exit 1
@@ -228,11 +235,19 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   setfacl -R -m g:trading-platform:r-X "$REPO/src" "$REPO/config" "$REPO/alembic"
   setfacl -m g:trading-platform:r "$REPO/alembic.ini"
   setfacl -R -m u:trading-research:r-X,u:trading-evaluator:r-X,u:trading-agent:--- "$REPO/.git"
-  setfacl -R -m u:trading-runtime:r-X,u:trading-platform-owner:r-X \
+  setfacl -R -m u:trading-runtime:r-X,u:trading-evaluator:r-X,u:trading-platform-owner:r-X \
     "$REPO/.venv-runtime"
   setfacl -R -m u:trading-research:r-X,u:trading-evaluator:r-X "$REPO/.venv-research"
   setfacl -R -m u:trading-agent:r-X "$REPO/.venv-agent"
   install -d -m 0750 -o root -g trading-platform /etc/trading-platform
+  setfacl -m g:trading-model-broker:--x /etc/trading-platform
+  install -d -m 0750 -o root -g trading-model-broker /etc/trading-platform/model-broker
+  install -d -m 0700 -o alfred -g trading-model-broker \
+    /var/lib/trading-platform-model-broker \
+    /var/lib/trading-platform-model-broker/openclaw-state
+  for directory in workspace-trading-research agents/trading-research agents/research locks; do
+    install -d -m 0700 -o alfred -g trading-model-broker "/home/alfred/.openclaw/$directory"
+  done
   for environment in \
     runtime:trading-runtime \
     research:trading-research \
@@ -317,6 +332,8 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     /etc/systemd/system/trading-platform-evaluator.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-agent.service" \
     /etc/systemd/system/trading-platform-agent.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-model-broker.service" \
+    /etc/systemd/system/trading-platform-model-broker.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-control.service" \
     /etc/systemd/system/trading-platform-control.service
   for slice in critical background agent; do

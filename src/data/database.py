@@ -21,6 +21,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    select,
+    union_all,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import TypeDecorator
@@ -557,6 +559,80 @@ portfolio_strategy = _id_payload_table("portfolio_strategy")
 alpha_forecast = _id_payload_table("alpha_forecast")
 target_position = _id_payload_table("target_position")
 risk_snapshot = _id_payload_table("risk_snapshot")
+Index("ix_risk_snapshot_created", risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
+Index(
+    "ix_risk_snapshot_market_scope",
+    risk_snapshot.c.payload["kind"].as_string(),
+    risk_snapshot.c.payload["product_id"].as_string(),
+    risk_snapshot.c.payload["instrument_id"].as_string(),
+    risk_snapshot.c.created_at.desc(),
+)
+Index(
+    "ix_risk_snapshot_product_time",
+    risk_snapshot.c.payload["kind"].as_string(),
+    risk_snapshot.c.payload["product_id"].as_string(),
+    risk_snapshot.c.created_at.desc(),
+)
+Index(
+    "ix_risk_snapshot_candle_scope",
+    risk_snapshot.c.payload["kind"].as_string(),
+    risk_snapshot.c.payload["product_id"].as_string(),
+    risk_snapshot.c.payload["source_event_type"].as_string(),
+    risk_snapshot.c.payload["source_timeframe"].as_string(),
+    risk_snapshot.c.payload["instrument_id"].as_string(),
+    risk_snapshot.c.created_at,
+)
+market_input_buffer = Table(
+    "market_input_buffer",
+    metadata,
+    Column("id", String(160), primary_key=True),
+    Column("product_id", String(80), nullable=False),
+    Column("instrument_id", String(160), nullable=False),
+    Column("event_type", String(80), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+    CheckConstraint(
+        "event_type IN ('best_bid_ask', 'depth_update', 'mark_price', 'funding_rate', "
+        "'trade', 'aggregate_trade', 'candle')",
+        name="ck_market_input_buffer_event_type",
+    ),
+    CheckConstraint(
+        "json_extract(payload, '$.kind') IS 'market_data_input'",
+        name="ck_market_input_buffer_kind",
+    ),
+    CheckConstraint(
+        "json_extract(payload, '$.source_event_type') IS event_type",
+        name="ck_market_input_buffer_source_type",
+    ),
+    CheckConstraint(
+        "event_type <> 'candle' OR "
+        "COALESCE(json_extract(payload, '$.source_candle_closed'), 0) = 0",
+        name="ck_market_input_buffer_unclosed_candle",
+    ),
+    CheckConstraint(
+        "json_extract(payload, '$.product_id') IS product_id AND "
+        "json_extract(payload, '$.instrument_id') IS instrument_id",
+        name="ck_market_input_buffer_scope",
+    ),
+)
+Index(
+    "ix_market_input_buffer_scope_time",
+    market_input_buffer.c.product_id,
+    market_input_buffer.c.instrument_id,
+    market_input_buffer.c.created_at.desc(),
+    market_input_buffer.c.id.desc(),
+)
+Index("ix_market_input_buffer_time", market_input_buffer.c.created_at)
+market_input_sources = union_all(
+    select(risk_snapshot.c.id, risk_snapshot.c.created_at, risk_snapshot.c.payload).where(
+        risk_snapshot.c.payload["kind"].as_string() == "market_data_input"
+    ),
+    select(
+        market_input_buffer.c.id,
+        market_input_buffer.c.created_at,
+        market_input_buffer.c.payload,
+    ).where(market_input_buffer.c.payload["kind"].as_string() == "market_data_input"),
+).subquery("market_input_sources")
 risk_policy = _id_payload_table("risk_policy")
 risk_decision = Table(
     "risk_decision",
@@ -700,6 +776,7 @@ job = Table(
     Column("content_hash", String(80), nullable=False),
     Column("payload", JSON, nullable=False),
 )
+Index("ix_job_state_name_available", job.c.state, job.c.name, job.c.available_at)
 job_quarantine = Table(
     "job_quarantine",
     metadata,

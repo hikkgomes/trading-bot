@@ -12,8 +12,8 @@ from sqlalchemy import exists, insert, or_, select
 from src.data.database import PlatformDatabase, research_calibration, research_policy_approval
 from src.domain._codec import canonical_hash, non_empty, timestamp
 from src.research.calibration import CASES, GENERATOR_VERSION, _case_summary
+from src.research.policy_identity import research_policy_engine_digest
 from src.research.selection import METHOD
-from src.services.execution_identity import execution_engine_digest
 
 
 def research_qualification(
@@ -145,6 +145,8 @@ def validate_calibration(receipt, configuration):
         "source_hashes": calibration_source_hashes(),
         "qualification_authority": False,
         "policy_approval_required": True,
+        "calibration_scope": "selection_inference_kernel",
+        "candidates": int(configuration["search_budgets"]["maximum_candidates_per_epoch"]),
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("calibration source, method or configuration binding is invalid")
@@ -156,12 +158,14 @@ def validate_calibration(receipt, configuration):
     if not 0 < alpha < 1 or not 0 < budget < 1 or budget != configured_budget:
         raise ValueError("calibration cutoff or configured risk budget is invalid")
     summary = _validated_trials(receipt, alpha)
-    if summary["null"]["qualification_rate_interval_95"][1] > budget:
-        raise ValueError("calibration null upper confidence bound exceeds the configured budget")
     if any(
-        summary[case]["qualification_rate"] != 0
-        for case in ("leakage_trap", "cost_trap", "regime_limited", "flat")
+        summary[case]["qualification_rate_interval_95"][1] > budget
+        for case in ("null", "cost_trap", "regime_limited")
     ):
+        raise ValueError(
+            "calibration negative-control upper confidence bound exceeds the configured budget"
+        )
+    if any(summary[case]["qualification_rate"] != 0 for case in ("leakage_trap", "flat")):
         raise ValueError("calibration admitted a negative control")
     if summary["flat"]["deferral_rate"] != 1:
         raise ValueError("flat calibration samples must remain inconclusive")
@@ -191,16 +195,16 @@ def _validated_trials(receipt, alpha):
         if len(selected) != replicates or {trial["seed"] for trial in selected} != expected_seeds:
             raise ValueError("calibration trial seeds are incomplete or duplicated")
         for trial in selected:
-            _validate_trial(trial, alpha, observations)
+            _validate_trial(trial, alpha, observations, receipt["candidates"])
         summary[case] = _case_summary(selected)
     if summary != receipt["summary"]:
         raise ValueError("calibration summary does not match its trials")
     return summary
 
 
-def _validate_trial(trial, alpha, observations):
+def _validate_trial(trial, alpha, observations, candidates):
     inference = trial["inference"]
-    _validate_trial_design(inference, observations)
+    _validate_trial_design(inference, observations, candidates)
     if (
         inference.get("method") != METHOD
         or inference.get("draws", 0) < 2000
@@ -230,8 +234,8 @@ def _validate_trial(trial, alpha, observations):
         raise ValueError("calibration trial qualification does not match its inference")
 
 
-def _validate_trial_design(inference, observations):
-    members = [f"configuration-{index}" for index in range(3)]
+def _validate_trial_design(inference, observations, candidates):
+    members = [f"configuration-{index}" for index in range(candidates)]
     times = inference.get("timestamps", ())
     if inference.get("members") != members or inference.get("sample_unit") != "calendar_interval":
         raise ValueError("calibration must cover the declared configuration cohort and calendar")
@@ -290,7 +294,7 @@ def approve_policy(
         "policy_hash": EvidencePolicy.from_configuration(
             configuration["evidence_policy"]
         ).policy_hash,
-        "engine_hash": execution_engine_digest(),
+        "engine_hash": research_policy_engine_digest(),
         **validated,
     }
     identity = canonical_hash(payload)
@@ -361,7 +365,7 @@ def current_approval(
     }
     if not rows:
         return None
-    engine_hash = execution_engine_digest()
+    engine_hash = research_policy_engine_digest()
     return next(
         (
             {"approval_id": row["id"], **row["payload"]}

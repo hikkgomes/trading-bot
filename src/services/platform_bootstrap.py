@@ -35,7 +35,7 @@ from src.research.datasets import (
 )
 from src.risk.engine import SqlRiskPolicyStore
 from src.risk.policies import install_product_risk_policies
-from src.services.scheduler import DatabaseJobQueue
+from src.services.scheduler import DatabaseJobQueue, immutable_work_id
 
 
 def _record(connection, table, values: Mapping[str, Any]) -> bool:
@@ -405,19 +405,20 @@ class PlatformBootstrap:
             engine_version="platform-bootstrap/v1",
         )
         snapshot_id = dataset_bundle.stage_snapshot_ids["screening"]
+        universe_payload: dict[str, Any] = {
+            "schedule_name": "universe_refresh",
+            "product_id": product_id,
+            "universe_id": universe_id,
+            "available_at": observed_at,
+            "producer_identity": "platform-scheduler",
+            "market_type": "spot" if instrument.market_type is MarketType.SPOT else "futures",
+            "policy": {},
+            "maximum_symbols": int(product.get("research_max_symbols", 100)),
+        }
         DatabaseJobQueue(self.engine).enqueue_if_absent(
-            job_id=f"initial-universe-refresh:{product_id}",
+            job_id=immutable_work_id("initial-universe-refresh", universe_payload),
             name="universe_refresh",
-            payload={
-                "schedule_name": "universe_refresh",
-                "product_id": product_id,
-                "universe_id": universe_id,
-                "available_at": observed_at,
-                "producer_identity": "platform-scheduler",
-                "market_type": "spot" if instrument.market_type is MarketType.SPOT else "futures",
-                "policy": {},
-                "maximum_symbols": int(product.get("research_max_symbols", 100)),
-            },
+            payload=universe_payload,
             available_at=observed_at,
             priority=300,
             producer_identity="platform-bootstrap",

@@ -142,7 +142,7 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     repeated = scheduler.run_once(now=NOW)
 
     assert scheduled["schedules"] == 14
-    assert scheduled["jobs_enqueued"] == 9
+    assert scheduled["jobs_enqueued"] == 3
     assert repeated["jobs_enqueued"] == 0
     assert scheduled["maintenance"]["reason_code"] == "platform_maintenance_completed"
     with database.engine.connect() as connection:
@@ -150,7 +150,10 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
             connection.execute(select(func.count()).select_from(platform_schedule)).scalar_one()
             == 14
         )
-        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 15
+        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 9
+        assert not {"historical_bootstrap", "register_strategy_catalogue"}.intersection(
+            connection.execute(select(job.c.name)).scalars()
+        )
         assert "diagnostic_paper_open" in set(connection.execute(select(job.c.name)).scalars())
         assert "dataset_snapshot_validate" in set(connection.execute(select(job.c.name)).scalars())
         assert "universe_refresh" in set(connection.execute(select(job.c.name)).scalars())
@@ -170,7 +173,20 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
         )
     restarted = scheduler.run_once(now="2026-08-27T10:00:01+00:00")
     assert restarted["jobs_enqueued"] == 0
+    universes = SqlUniverseStore(database.engine)
+    for product in configuration["products"]["products"]:
+        memberships = universes.members_at(universe_id=product["universe_id"], observed_at=NOW)
+        universes.record_snapshot(
+            universe_id=product["universe_id"],
+            observed_at="2026-08-27T10:59:00+00:00",
+            observations=tuple(
+                InstrumentObservation(instrument=member.instrument, **member.metrics)
+                for member in memberships
+            ),
+            policy=UniverseEligibilityPolicy(),
+        )
     scheduler.run_once(now="2026-08-27T11:00:00+00:00")
+    scheduler.run_once(now="2026-08-27T12:00:00+00:00")
     with database.engine.connect() as connection:
         cutoffs = set(
             connection.execute(
@@ -181,7 +197,9 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
                 )
             ).scalars()
         )
-    assert {NOW, "2026-08-27T11:00:00+00:00"} <= cutoffs
+    # Synthetic bootstrap observations never pin a campaign. Native refreshes do,
+    # and the campaign keeps that original history boundary on subsequent ticks.
+    assert cutoffs == {"2026-08-27T11:00:00+00:00"}
 
     testnet_configuration = copy.deepcopy(configuration)
     next(
@@ -231,6 +249,65 @@ def test_bootstrap_is_idempotent_after_initial_job_completion(tmp_path: Path) ->
             ).scalar_one()
             == 1
         )
+
+
+def test_bootstrap_preserves_old_universe_work_and_enqueues_the_current_contract(tmp_path):
+    database = _database(tmp_path)
+    configuration = load_split_configuration(ROOT / "config")
+    product = next(
+        p for p in configuration["products"]["products"] if p["product_id"] == "active_income"
+    )
+    queue = DatabaseJobQueue(database.engine)
+    old_payload = {
+        "schedule_name": "universe_refresh",
+        "product_id": "active_income",
+        "universe_id": product["universe_id"],
+        "available_at": NOW,
+        "producer_identity": "platform-scheduler",
+        "market_type": "futures",
+        "policy": {},
+        "maximum_symbols": 1,
+    }
+    old_id = "initial-universe-refresh:active_income"
+    queue.enqueue_if_absent(
+        job_id=old_id,
+        name="universe_refresh",
+        payload=old_payload,
+        available_at=NOW,
+        priority=300,
+        producer_identity="platform-bootstrap",
+    )
+    queue.register_worker(
+        worker_id="universe",
+        node_id="test",
+        role="universe-worker",
+        capabilities=("universe_refresh",),
+        observed_at=NOW,
+    )
+    claimed = queue.claim(
+        worker_id="universe", now=NOW, lease_seconds=60, names=("universe_refresh",)
+    )
+    queue.complete(claimed, completed_at=NOW)
+    bootstrap = PlatformBootstrap(engine=database.engine, configuration=configuration)
+    bootstrap.ensure(now=NOW)
+    bootstrap.ensure(now="2026-08-27T11:00:00+00:00")
+    with database.engine.connect() as connection:
+        rows = (
+            connection.execute(
+                select(job).where(
+                    job.c.name == "universe_refresh",
+                    job.c.payload["product_id"].as_string() == "active_income",
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 2
+    original = next(row for row in rows if row["id"] == old_id)
+    assert original["state"] == "completed" and original["payload"] == old_payload
+    current = next(row for row in rows if row["id"] != old_id)
+    assert current["state"] == "pending"
+    assert current["payload"]["maximum_symbols"] == product["research_max_symbols"]
 
 
 def test_bootstrap_ignores_completed_diagnostic_from_an_older_payload(tmp_path: Path) -> None:
@@ -569,7 +646,7 @@ def test_binance_universe_rest_requests_use_the_shared_limiter() -> None:
         def __init__(self) -> None:
             self.acquires = 0
 
-        def acquire(self) -> None:
+        def acquire(self, **_kwargs) -> None:
             self.acquires += 1
 
     session = Session()
@@ -598,7 +675,7 @@ def test_spot_market_source_defaults_funding_but_futures_rejects_missing_or_stal
                 "values": {
                     "close": 100.0,
                     "spread_bps": 1.0,
-                    "visible_depth": 1_000_000.0,
+                    "visible_depth_quote": 1_000_000.0,
                     "volatility": 0.2,
                 },
             },
@@ -656,7 +733,7 @@ def test_closed_kline_does_not_carry_derived_market_fields() -> None:
                 "c": "100.0",
                 "x": True,
                 "spread_bps": 1.0,
-                "visible_depth": 1_000_000.0,
+                "visible_depth_quote": 1_000_000.0,
                 "volatility": 0.2,
                 "funding": 0.0001,
             },
@@ -771,7 +848,7 @@ def test_realistic_market_events_build_complete_spot_and_futures_state(
                     ),
                 )
             )
-        observed_at = (start + dt.timedelta(minutes=3)).isoformat()
+        observed_at = NOW
         event_ms = int(dt.datetime.fromisoformat(observed_at).timestamp() * 1_000)
         events.append(
             (
@@ -792,7 +869,7 @@ def test_realistic_market_events_build_complete_spot_and_futures_state(
                 ),
             )
         )
-    funding_at = (start + dt.timedelta(minutes=3, seconds=1)).isoformat()
+    funding_at = NOW
     funding_ms = int(dt.datetime.fromisoformat(funding_at).timestamp() * 1_000)
     events.append(
         (

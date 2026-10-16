@@ -296,7 +296,7 @@ def _product_fixture(
                 receive_timestamp=now,
                 payload={
                     "e": "trade",
-                    "E": close_ms + 2,
+                    "E": close_ms + 1,
                     "s": "BTCUSDT",
                     "p": "102000",
                     "q": "25",
@@ -314,11 +314,11 @@ def _product_fixture(
                     receive_timestamp=now,
                     payload={
                         "e": "markPriceUpdate",
-                        "E": close_ms + 3,
+                        "E": close_ms + 1,
                         "s": "BTCUSDT",
                         "p": "102000",
                         "r": "0.0001",
-                        "T": close_ms + 3,
+                        "T": close_ms + 1,
                     },
                 ),
                 run_id,

@@ -195,6 +195,33 @@ class SqlStopStore:
             return tuple(events)
 
 
+def live_protected_instruments(engine, portfolio_id: str, *, connection=None) -> set[str]:
+    latest = (
+        select(
+            protective_stop_table.c.stop_id,
+            func.max(protective_stop_table.c.sequence).label("sequence"),
+        )
+        .group_by(protective_stop_table.c.stop_id)
+        .subquery()
+    )
+    with connection_scope(engine, connection, write=False) as opened:
+        return set(
+            opened.execute(
+                select(protective_stop_table.c.payload["instrument_id"].as_string())
+                .join(
+                    latest,
+                    (latest.c.stop_id == protective_stop_table.c.stop_id)
+                    & (latest.c.sequence == protective_stop_table.c.sequence),
+                )
+                .where(
+                    protective_stop_table.c.payload["portfolio_id"].as_string() == portfolio_id,
+                    protective_stop_table.c.payload["execution_mode"].as_string() == "live",
+                    protective_stop_table.c.status.not_in(["cancelled", "reconciled"]),
+                )
+            ).scalars()
+        )
+
+
 class StopManager:
     def __init__(self, store: StopStore):
         self.store = store

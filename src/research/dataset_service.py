@@ -1,4 +1,4 @@
-"""Build canonical research bundles from immutable Parquet bars."""
+"""Build frozen research bundles from canonical Parquet bars."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from src.data.bar_window import RecentBarWindow
 from src.data.database import (
@@ -22,6 +22,7 @@ from src.data.database import (
     universe_member,
     universe_snapshot,
 )
+from src.data.parquet_store import partition_files
 from src.data.universe import SqlUniverseStore
 from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
 from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
@@ -115,19 +116,27 @@ class DatabaseDatasetBundleService:
         universe_id: str,
         market_type: str,
         created_at: str,
+        history_as_of: str | None = None,
         timeframe: str | None = None,
         intervals: Mapping[str, Mapping[str, str]] | None = None,
         data_plan: ResearchDataPlan | None = None,
     ) -> DatasetBundleBuildResult:
         created = timestamp(created_at, field="created_at")
-        resolved_universe = self._universe(
-            universe_id, created, product_id=product_id, include_history=True
+        history_cutoff = timestamp(history_as_of or created, field="history_as_of")
+        inputs = self._resolve_research_inputs(
+            universe_id=universe_id,
+            product_id=product_id,
+            history_as_of=history_cutoff,
+            timeframe=timeframe or self.timeframe,
+            data_plan=data_plan,
         )
-        if resolved_universe is None:
-            return self._waiting(product_id, "point_in_time_universe_unavailable")
+        if isinstance(inputs, DatasetBundleBuildResult):
+            return inputs
+        resolved_universe, plan = inputs
         universe_snapshot_id = resolved_universe.latest_snapshot_id
         instruments = resolved_universe.instruments
-        plan = self._validated_plan(data_plan, product_id, instruments, timeframe or self.timeframe)
+        history_end_ms = plan.acquisition_interval(history_cutoff)[1]
+        history_end = dt.datetime.fromtimestamp(history_end_ms / 1_000, dt.UTC).isoformat()
         feature_id = self._latest_manifest(
             feature_manifest,
             created=created,
@@ -146,6 +155,8 @@ class DatabaseDatasetBundleService:
             market_type=market_type,
             timeframe=timeframe or self.timeframe,
             created=created,
+            history_as_of=history_cutoff,
+            history_end=history_end,
             product_id=product_id,
             data_plan=plan,
         )
@@ -177,10 +188,11 @@ class DatabaseDatasetBundleService:
                 detail=str(exc),
             )
         try:
-            intervals = (
-                _stage_intervals(bars, warmup_bars=plan.warmup_bars)
-                if intervals is None
-                else intervals
+            intervals = _bounded_stage_intervals(
+                bars,
+                warmup_bars=plan.warmup_bars,
+                intervals=intervals,
+                history_end=history_end,
             )
             payload_by_role = self._role_payloads(
                 bars,
@@ -347,6 +359,8 @@ class DatabaseDatasetBundleService:
         market_type: str,
         timeframe: str,
         created: str,
+        history_as_of: str,
+        history_end: str,
         product_id: str,
         data_plan: ResearchDataPlan | None = None,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]] | DatasetBundleBuildResult:
@@ -378,10 +392,11 @@ class DatabaseDatasetBundleService:
                 maximum_rows=data_plan.required_rows if data_plan and minimum_days else limit,
                 batch_rows=data_plan.batch_rows if data_plan else 4096,
                 range_start=(
-                    data_plan.acquisition_interval(created)[0]
+                    data_plan.acquisition_interval(history_as_of)[0]
                     if data_plan and minimum_days
                     else None
                 ),
+                range_end=int(dt.datetime.fromisoformat(history_end).timestamp() * 1_000),
             )
         except DatasetBundleBuildError as exc:
             if str(exc).startswith("historical bars are missing"):
@@ -405,6 +420,8 @@ class DatabaseDatasetBundleService:
         *,
         product_id: str,
         include_history: bool,
+        instrument_scope: tuple[str, ...] | None = None,
+        history_start: str | None = None,
     ) -> _ResolvedUniverse | None:
         memberships = SqlUniverseStore(self.engine).members_at(
             universe_id=universe_id,
@@ -412,18 +429,6 @@ class DatabaseDatasetBundleService:
             eligible_only=True,
         )
         if not memberships:
-            return None
-        current_instruments = {
-            item.instrument.instrument_id: (
-                item.instrument.instrument_id,
-                item.instrument.exchange_symbol,
-                item.instrument.venue,
-            )
-            for item in memberships
-            if product_id != "btc_accumulation"
-            or item.instrument.instrument_id == BTC_SPOT_INSTRUMENT_ID
-        }
-        if not current_instruments:
             return None
         with self.engine.connect() as connection:
             selection = connection.execute(
@@ -434,6 +439,16 @@ class DatabaseDatasetBundleService:
         if selection.get("historical_liquidity_eligibility") == "not_asserted":
             if selection.get("product_id") != product_id:
                 raise DatasetBundleBuildError("fixed research scope belongs to another product")
+            current_instruments = {
+                item.instrument.instrument_id: (
+                    item.instrument.instrument_id,
+                    item.instrument.exchange_symbol,
+                    item.instrument.venue,
+                )
+                for item in memberships
+                if product_id != "btc_accumulation"
+                or item.instrument.instrument_id == BTC_SPOT_INSTRUMENT_ID
+            }
             return _ResolvedUniverse(
                 latest_snapshot_id=memberships[0].snapshot_id,
                 instruments=tuple(sorted(current_instruments.values())),
@@ -441,6 +456,21 @@ class DatabaseDatasetBundleService:
                 snapshot_ids=(memberships[0].snapshot_id,),
                 selection_mode="fixed_research_scope",
             )
+        current_instruments = {
+            item.instrument.instrument_id: (
+                item.instrument.instrument_id,
+                item.instrument.exchange_symbol,
+                item.instrument.venue,
+            )
+            for item in memberships
+            if (
+                product_id != "btc_accumulation"
+                or item.instrument.instrument_id == BTC_SPOT_INSTRUMENT_ID
+            )
+            and (instrument_scope is None or item.instrument.exchange_symbol in instrument_scope)
+        }
+        if not current_instruments:
+            return None
         if not include_history:
             return _ResolvedUniverse(
                 latest_snapshot_id=memberships[0].snapshot_id,
@@ -456,7 +486,10 @@ class DatabaseDatasetBundleService:
         history, historical_instruments, snapshot_ids = self._universe_history(
             universe_id=universe_id,
             observed_at=observed_at,
-            product_id=product_id,
+            instrument_scope=(
+                frozenset(current_instruments) if instrument_scope is not None else None
+            ),
+            history_start=history_start,
         )
         current_instruments.update(historical_instruments)
         return _ResolvedUniverse(
@@ -467,12 +500,45 @@ class DatabaseDatasetBundleService:
         )
 
     def _universe_history(
-        self, *, universe_id: str, observed_at: str, product_id: str
+        self,
+        *,
+        universe_id: str,
+        observed_at: str,
+        instrument_scope: frozenset[str] | None,
+        history_start: str | None,
     ) -> tuple[
         tuple[tuple[str, frozenset[str]], ...],
         dict[str, tuple[str, str, str]],
         tuple[str, ...],
     ]:
+        member_join_conditions = [
+            universe_snapshot.c.id == universe_member.c.snapshot_id,
+            universe_member.c.eligible.is_(True),
+        ]
+        if instrument_scope is not None:
+            member_join_conditions.append(universe_member.c.instrument_id.in_(instrument_scope))
+        member_join = and_(*member_join_conditions)
+        snapshot_filters = [
+            universe_snapshot.c.universe_id == universe_id,
+            universe_snapshot.c.observed_at <= observed_at,
+        ]
+        if history_start is not None:
+            anchor_snapshot = (
+                select(universe_snapshot.c.id)
+                .where(
+                    universe_snapshot.c.universe_id == universe_id,
+                    universe_snapshot.c.observed_at < history_start,
+                )
+                .order_by(universe_snapshot.c.observed_at.desc(), universe_snapshot.c.id.desc())
+                .limit(1)
+                .scalar_subquery()
+            )
+            snapshot_filters.append(
+                or_(
+                    universe_snapshot.c.observed_at >= history_start,
+                    universe_snapshot.c.id == anchor_snapshot,
+                )
+            )
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(
@@ -482,16 +548,8 @@ class DatabaseDatasetBundleService:
                     universe_member.c.eligible,
                     universe_member.c.payload,
                 )
-                .select_from(
-                    universe_snapshot.join(
-                        universe_member,
-                        universe_snapshot.c.id == universe_member.c.snapshot_id,
-                    )
-                )
-                .where(
-                    universe_snapshot.c.universe_id == universe_id,
-                    universe_snapshot.c.observed_at <= observed_at,
-                )
+                .select_from(universe_snapshot.outerjoin(universe_member, member_join))
+                .where(*snapshot_filters)
                 .order_by(
                     universe_snapshot.c.observed_at,
                     universe_snapshot.c.id,
@@ -502,12 +560,12 @@ class DatabaseDatasetBundleService:
         observed_at_by_snapshot: dict[str, str] = {}
         instruments: dict[str, tuple[str, str, str]] = {}
         for row in rows:
-            instrument_id = str(row["instrument_id"])
-            if product_id == "btc_accumulation" and instrument_id != BTC_SPOT_INSTRUMENT_ID:
-                continue
             snapshot_id = str(row["id"])
             observed = timestamp(str(row["observed_at"]), field="universe observed_at")
             observed_at_by_snapshot[snapshot_id] = observed
+            if row["instrument_id"] is None:
+                continue
+            instrument_id = str(row["instrument_id"])
             raw_payload = row["payload"]
             instrument_payload = (
                 raw_payload.get("instrument") if isinstance(raw_payload, Mapping) else None
@@ -517,8 +575,7 @@ class DatabaseDatasetBundleService:
                 venue = str(instrument_payload.get("venue") or "")
                 if symbol and venue:
                     instruments[instrument_id] = (instrument_id, symbol, venue)
-            if row["eligible"] is True:
-                memberships.setdefault(snapshot_id, set()).add(instrument_id)
+            memberships.setdefault(snapshot_id, set()).add(instrument_id)
         history = tuple(
             (
                 observed_at_by_snapshot[snapshot_id],
@@ -633,17 +690,27 @@ class DatabaseDatasetBundleService:
         maximum_rows: int | None = None,
         batch_rows: int = 4096,
         range_start: int | None = None,
+        range_end: int | None = None,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
         limit = maximum_rows if maximum_rows is not None else self.maximum_rows
         start = _bar_time(range_start, field="range_start") if range_start is not None else None
+        end = _bar_time(range_end, field="range_end") if range_end is not None else None
         windows = {
             key: RecentBarWindow(max(1, limit // len(instruments))) for key, _, _ in instruments
         }
+
+        def in_range(row: Mapping[str, Any]) -> bool:
+            value = row.get("close_time_ms", row.get("close_timestamp"))
+            if value is None:
+                return True
+            close = _bar_time(value, field="close")
+            return (start is None or close >= start) and (end is None or close < end)
+
         source_hashes: set[str] = set()
         for instrument_id, symbol, venue in instruments:
             root = self.parquet_root / "bars" / venue.lower() / market_type.lower() / symbol.upper()
             root = root / _text(timeframe, field="timeframe")
-            for path in sorted(root.rglob("*.parquet")) if root.is_dir() else ():
+            for path in partition_files(root):
                 if path.is_symlink() or not path.is_file():
                     continue
                 if start and any(
@@ -651,23 +718,23 @@ class DatabaseDatasetBundleService:
                 ):
                     continue
                 try:
-                    file_rows = (
-                        row
-                        for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_rows)
-                        for row in batch.to_pylist()
-                        if start is None
-                        or _bar_time(
-                            row.get("close_time_ms", row.get("close_timestamp")), field="close"
+                    with path.open("rb") as source:
+                        file_rows = (
+                            row
+                            for batch in pq.ParquetFile(source).iter_batches(batch_size=batch_rows)
+                            for row in batch.to_pylist()
+                            if in_range(row)
                         )
-                        >= start
-                    )
-                    added = _ingest_bar_rows(
-                        file_rows, windows[instrument_id], instrument_id, created
-                    )
+                        added = _ingest_bar_rows(
+                            file_rows, windows[instrument_id], instrument_id, created
+                        )
+                        if added:
+                            source.seek(0)
+                            source_hashes.add(
+                                "sha256:" + hashlib.file_digest(source, "sha256").hexdigest()
+                            )
                 except Exception as exc:
                     raise DatasetBundleBuildError(f"cannot read bar partition {path}") from exc
-                if added:
-                    source_hashes.add(_file_identity(path))
         rows_by_instrument = {
             key: window.rows() for key, window in windows.items() if window.rows()
         }
@@ -722,6 +789,33 @@ class DatabaseDatasetBundleService:
             )
         return plan
 
+    def _resolve_research_inputs(
+        self, *, universe_id, product_id, history_as_of, timeframe, data_plan
+    ):
+        resolved_universe = self._universe(
+            universe_id,
+            history_as_of,
+            product_id=product_id,
+            include_history=True,
+            instrument_scope=(data_plan.instrument_scope if data_plan is not None else None),
+            history_start=(
+                dt.datetime.fromtimestamp(
+                    data_plan.acquisition_interval(history_as_of)[0] / 1_000, dt.UTC
+                ).isoformat()
+                if data_plan is not None
+                else None
+            ),
+        )
+        if resolved_universe is None:
+            return self._waiting(product_id, "point_in_time_universe_unavailable")
+        try:
+            plan = self._validated_plan(
+                data_plan, product_id, resolved_universe.instruments, timeframe
+            )
+        except DatasetBundleBuildError as exc:
+            return self._waiting(product_id, "research_data_plan_scope_mismatch", detail=str(exc))
+        return resolved_universe, plan
+
     def _funding_coverage(self, product_id, bars, instruments, created):
         from src.research.funding import _interval_start
 
@@ -748,7 +842,16 @@ class DatabaseDatasetBundleService:
             end = max(row["close_timestamp"] for row in selected)
             cursor, proof = start, []
             for row in records:
-                if row["symbol"] != instrument_id.split(":")[2] or row["payload"].get("gaps"):
+                payload = row["payload"]
+                if row["symbol"] != instrument_id.split(":")[2] or payload.get("gaps"):
+                    continue
+                range_start = dt.datetime.fromisoformat(row["range_start"])
+                range_end = dt.datetime.fromisoformat(row["range_end"])
+                if not _native_funding_coverage(
+                    payload,
+                    start_ms=int(range_start.timestamp() * 1_000),
+                    end_ms=int(range_end.timestamp() * 1_000),
+                ):
                     continue
                 if (
                     row["range_start"] <= cursor < row["range_end"]
@@ -760,10 +863,15 @@ class DatabaseDatasetBundleService:
                             key: row[key]
                             for key in ("id", "content_hash", "range_start", "range_end")
                         }
+                        | {
+                            "rows": payload["rows"],
+                            "coverage_classification": payload["coverage_classification"],
+                            "page_hashes": [page["response_hash"] for page in payload["pages"]],
+                        }
                     )
                 if cursor >= end:
                     break
-            if cursor < end:
+            if cursor < end or not any(item["rows"] for item in proof):
                 raise FundingCoverageUnavailable(
                     f"futures funding coverage is incomplete for: {instrument_id}"
                 )
@@ -811,7 +919,9 @@ def _ingest_bar_rows(rows, window: RecentBarWindow, instrument_id: str, created:
 def _normalise_bar(
     raw: Mapping[str, Any], instrument_id: str, created: str
 ) -> dict[str, Any] | None:
-    close_value = raw.get("close_timestamp", raw.get("close_time_ms", raw.get("timestamp")))
+    if raw.get("instrument_id") is not None and raw["instrument_id"] != instrument_id:
+        raise DatasetBundleBuildError("bar instrument identity differs from its partition")
+    close_value = raw.get("close_time_ms", raw.get("close_timestamp", raw.get("timestamp")))
     if close_value is None:
         return None
     available_value = raw.get("availability_time", raw.get("available_at", close_value))
@@ -940,6 +1050,42 @@ def _validate_market_bars(
             raise DatasetBundleBuildError(f"bar[{index}] has no signed funding rate")
 
 
+def _native_funding_coverage(payload: Mapping[str, Any], *, start_ms: int, end_ms: int) -> bool:
+    pages = payload.get("pages")
+    rows = payload.get("rows")
+    page_limit = payload.get("page_limit")
+    return (
+        payload.get("coverage_classification") == "native_query_exhausted"
+        and payload.get("request_bounds") == {"start_ms": start_ms, "end_ms": end_ms}
+        and isinstance(rows, int)
+        and not isinstance(rows, bool)
+        and rows >= 0
+        and isinstance(page_limit, int)
+        and not isinstance(page_limit, bool)
+        and page_limit > 0
+        and isinstance(pages, list)
+        and bool(pages)
+        and all(_native_funding_page(page, start_ms, end_ms) for page in pages)
+    )
+
+
+def _native_funding_page(page: Any, start_ms: int, end_ms: int) -> bool:
+    if not isinstance(page, Mapping):
+        return False
+    digest = page.get("response_hash")
+    return (
+        isinstance(page.get("request_start_ms"), int)
+        and isinstance(page.get("request_end_ms"), int)
+        and start_ms <= page["request_start_ms"] < end_ms
+        and page["request_end_ms"] == end_ms - 1
+        and isinstance(page.get("returned_rows"), int)
+        and page["returned_rows"] >= 0
+        and isinstance(digest, str)
+        and len(digest) == 71
+        and digest.startswith("sha256:")
+    )
+
+
 def _validate_bar_timing(
     row: Mapping[str, Any], timeframe: str | None, interval: int | None
 ) -> None:
@@ -1006,7 +1152,7 @@ def _bar_time(value: Any, *, field: str) -> str:
 
 
 def _stage_intervals(
-    rows: tuple[dict[str, Any], ...], *, warmup_bars: int = 0
+    rows: tuple[dict[str, Any], ...], *, warmup_bars: int = 0, end_at: str | None = None
 ) -> dict[str, dict[str, str]]:
     times = sorted({str(row["close_timestamp"]) for row in rows})[warmup_bars:]
     if len(times) < len(CORE_RESEARCH_BUNDLE_ROLES):
@@ -1018,11 +1164,36 @@ def _stage_intervals(
         .replace(microsecond=0)
         .isoformat()
     )
+    if end_at is not None:
+        final_end = min(final_end, end_at)
     ends = [*starts[1:], final_end]
     return {
         role: {"start": start, "end": end}
         for role, start, end in zip(CORE_RESEARCH_BUNDLE_ROLES, starts, ends, strict=True)
     }
+
+
+def _bounded_stage_intervals(
+    rows: tuple[dict[str, Any], ...],
+    *,
+    warmup_bars: int,
+    intervals: Mapping[str, Mapping[str, str]] | None,
+    history_end: str,
+) -> Mapping[str, Mapping[str, str]]:
+    result = (
+        _stage_intervals(rows, warmup_bars=warmup_bars, end_at=history_end)
+        if intervals is None
+        else intervals
+    )
+    if any(
+        timestamp(str(interval["end"]), field="stage interval end", preserve_subseconds=True)
+        > history_end
+        for interval in result.values()
+    ):
+        raise DatasetResolutionError(
+            "dataset data_pending: stage interval exceeds pinned history cutoff"
+        )
+    return result
 
 
 def _single_interval(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:

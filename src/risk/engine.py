@@ -9,9 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import insert, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
+from src.data.database import market_input_buffer as market_input_buffer_table
+from src.data.database import market_input_sources
 from src.data.database import risk_decision as risk_decision_table
 from src.data.database import risk_policy as risk_policy_table
 from src.data.database import risk_snapshot as risk_snapshot_table
@@ -19,6 +22,16 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, 
 from src.domain.risk import RiskDecision
 
 REQUIRED_RISK_SCOPES = ("strategy", "instrument", "sleeve", "product", "account", "global")
+_MARKET_INPUT_RETENTION = dt.timedelta(minutes=15)
+_MARKET_INPUT_CLEANUP_LIMIT = 1_000
+_BUFFERED_MARKET_EVENT_TYPES = {
+    "best_bid_ask",
+    "depth_update",
+    "mark_price",
+    "funding_rate",
+    "trade",
+    "aggregate_trade",
+}
 
 
 class SqlRiskPolicyStore:
@@ -227,36 +240,211 @@ class SqlRiskSnapshotStore:
             )
         return snapshot_id
 
+    def save_market_input(
+        self,
+        payload: dict[str, object],
+        *,
+        created_at: str,
+        retention_at: str | None = None,
+    ) -> str:
+        clean, event_type, product_id, instrument_id = self._prepare_market_input(payload)
+        snapshot_id = canonical_hash(clean)
+        created_at = timestamp(created_at, field="created_at")
+        retained_at = timestamp(
+            retention_at or dt.datetime.now(dt.UTC).isoformat(), field="retention_at"
+        )
+        cutoff = (dt.datetime.fromisoformat(retained_at) - _MARKET_INPUT_RETENTION).isoformat()
+        with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
+            ).scalar_one_or_none()
+            if existing is not None:
+                if dict(existing) != clean:
+                    raise ValueError("risk snapshot content-hash collision")
+                connection.execute(
+                    delete(market_input_buffer_table).where(
+                        market_input_buffer_table.c.id == snapshot_id
+                    )
+                )
+                self._expire_unpinned_market_inputs(connection, cutoff)
+                return snapshot_id
+            buffered = connection.execute(
+                select(market_input_buffer_table.c.payload)
+                .where(market_input_buffer_table.c.id == snapshot_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if buffered is not None:
+                if dict(buffered) != clean:
+                    raise ValueError("market input content-hash collision")
+            else:
+                existing = connection.execute(
+                    select(risk_snapshot_table.c.payload).where(
+                        risk_snapshot_table.c.id == snapshot_id
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if dict(existing) != clean:
+                        raise ValueError("risk snapshot content-hash collision")
+                    connection.execute(
+                        delete(market_input_buffer_table).where(
+                            market_input_buffer_table.c.id == snapshot_id
+                        )
+                    )
+                    self._expire_unpinned_market_inputs(connection, cutoff)
+                    return snapshot_id
+                connection.execute(
+                    insert(market_input_buffer_table).values(
+                        id=snapshot_id,
+                        product_id=product_id,
+                        instrument_id=instrument_id,
+                        event_type=event_type,
+                        created_at=created_at,
+                        payload=clean,
+                    )
+                )
+            self._expire_unpinned_market_inputs(connection, cutoff)
+        return snapshot_id
+
+    def expire_market_inputs(self, *, at: str) -> int:
+        current = timestamp(at, field="at")
+        cutoff = (dt.datetime.fromisoformat(current) - _MARKET_INPUT_RETENTION).isoformat()
+        with self.engine.begin() as connection:
+            return self._expire_unpinned_market_inputs(connection, cutoff)
+
+    def _prepare_market_input(
+        self, payload: dict[str, object]
+    ) -> tuple[dict[str, object], str, str, str]:
+        if self.book_id is not None:
+            payload = {**payload, "book_id": self.book_id}
+        clean = json_value(payload, field="market input")
+        if not isinstance(clean, dict) or clean.get("kind") != "market_data_input":
+            raise ValueError("market input buffer accepts only market_data_input snapshots")
+        raw_event_type = clean.get("source_event_type")
+        product_id = clean.get("product_id")
+        instrument_id = clean.get("instrument_id")
+        if not isinstance(raw_event_type, str) or not isinstance(product_id, str):
+            raise ValueError("market input event and product identities must be strings")
+        if not isinstance(instrument_id, str):
+            raise ValueError("market input instrument identity must be a string")
+        event_type = non_empty(raw_event_type, field="source_event_type")
+        if event_type == "candle" and clean.get("source_candle_closed") is True:
+            raise ValueError("closed candles must remain immutable risk snapshots")
+        if event_type not in _BUFFERED_MARKET_EVENT_TYPES and event_type != "candle":
+            raise ValueError("market input event type is not eligible for the recent buffer")
+        return (
+            clean,
+            event_type,
+            non_empty(product_id, field="product_id"),
+            non_empty(instrument_id, field="instrument_id"),
+        )
+
+    @staticmethod
+    def _expire_unpinned_market_inputs(connection, cutoff: str) -> int:
+        pinned = select(risk_snapshot_table.c.id).where(
+            risk_snapshot_table.c.id == market_input_buffer_table.c.id
+        )
+        expired = (
+            select(market_input_buffer_table.c.id)
+            .where(
+                market_input_buffer_table.c.created_at < cutoff,
+                ~pinned.exists(),
+            )
+            .order_by(market_input_buffer_table.c.created_at, market_input_buffer_table.c.id)
+            .limit(_MARKET_INPUT_CLEANUP_LIMIT)
+        )
+        result = connection.execute(
+            delete(market_input_buffer_table).where(market_input_buffer_table.c.id.in_(expired))
+        )
+        return max(0, result.rowcount or 0)
+
     def get(self, snapshot_id: str) -> dict[str, object]:
-        with self.engine.connect() as connection:
+        with self.engine.begin() as connection:
             payload = connection.execute(
                 select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
             ).scalar_one_or_none()
+            if payload is not None:
+                clean = self._verified_payload(payload, snapshot_id)
+                connection.execute(
+                    delete(market_input_buffer_table).where(
+                        market_input_buffer_table.c.id == snapshot_id
+                    )
+                )
+                return clean
+            buffered = connection.execute(
+                select(market_input_buffer_table.c.created_at, market_input_buffer_table.c.payload)
+                .where(market_input_buffer_table.c.id == snapshot_id)
+                .with_for_update()
+            ).one_or_none()
+            if buffered is None:
+                payload = connection.execute(
+                    select(risk_snapshot_table.c.payload).where(
+                        risk_snapshot_table.c.id == snapshot_id
+                    )
+                ).scalar_one_or_none()
+                if payload is None:
+                    raise KeyError(f"risk snapshot does not exist: {snapshot_id}")
+                return self._verified_payload(payload, snapshot_id)
+            created_at, payload = buffered
+            clean = self._verified_payload(payload, snapshot_id)
+            self._pin_market_input(connection, snapshot_id, created_at, clean)
+            connection.execute(
+                delete(market_input_buffer_table).where(
+                    market_input_buffer_table.c.id == snapshot_id
+                )
+            )
+            return clean
+
+    @staticmethod
+    def _verified_payload(payload: object, snapshot_id: str) -> dict[str, object]:
         if not isinstance(payload, dict):
             raise KeyError(f"risk snapshot does not exist: {snapshot_id}")
         if canonical_hash(payload) != snapshot_id:
             raise ValueError("risk snapshot content hash does not match its identity")
         return dict(payload)
 
+    @staticmethod
+    def _pin_market_input(connection, snapshot_id: str, created_at: str, payload: dict) -> None:
+        try:
+            with connection.begin_nested():
+                connection.execute(
+                    insert(risk_snapshot_table).values(
+                        id=snapshot_id,
+                        created_at=created_at,
+                        payload=payload,
+                    )
+                )
+        except IntegrityError:
+            pass
+        existing = connection.execute(
+            select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
+        ).scalar_one_or_none()
+        if not isinstance(existing, dict) or dict(existing) != payload:
+            raise ValueError("pinned market input does not match its content hash")
+
     def latest(
         self, *, kind: str, product_id: str, at: str, require_source_envelope: bool = False
     ) -> tuple[str, dict[str, object]]:
         at = timestamp(at, field="at")
+        source = market_input_sources if kind == "market_data_input" else risk_snapshot_table
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(
-                    risk_snapshot_table.c.id,
-                    risk_snapshot_table.c.created_at,
-                    risk_snapshot_table.c.payload,
+            rows = (
+                connection.execute(
+                    select(
+                        source.c.id,
+                        source.c.created_at,
+                        source.c.payload,
+                    )
+                    .where(
+                        source.c.created_at <= at,
+                        source.c.payload["kind"].as_string() == kind,
+                        source.c.payload["product_id"].as_string() == product_id,
+                        source.c.payload["book_id"].as_string() == self.book_id,
+                    )
+                    .order_by(source.c.created_at.desc(), source.c.id.desc())
                 )
-                .where(
-                    risk_snapshot_table.c.created_at <= at,
-                    risk_snapshot_table.c.payload["kind"].as_string() == kind,
-                    risk_snapshot_table.c.payload["product_id"].as_string() == product_id,
-                    risk_snapshot_table.c.payload["book_id"].as_string() == self.book_id,
-                )
-                .order_by(risk_snapshot_table.c.created_at.desc(), risk_snapshot_table.c.id.desc())
-            ).mappings()
+                .mappings()
+                .all()
+            )
             for row in rows:
                 payload = row["payload"]
                 if (
@@ -271,7 +459,10 @@ class SqlRiskSnapshotStore:
                 ):
                     if canonical_hash(payload) != str(row["id"]):
                         raise ValueError("risk snapshot content hash does not match its identity")
-                    return str(row["id"]), dict(payload)
+                    identity = str(row["id"])
+                    return identity, self.get(identity) if kind == "market_data_input" else dict(
+                        payload
+                    )
         raise KeyError(f"no {kind} snapshot exists for product {product_id} at {at}")
 
 

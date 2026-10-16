@@ -11,7 +11,11 @@ import requests
 
 from src.data.binance_market import normalise_public_event
 from src.domain.market_events import MarketEvent, MarketEventType
-from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
+from src.execution.rate_limit import (
+    ExchangeRateLimiter,
+    observe_http_response,
+    shared_exchange_rate_limiter,
+)
 
 _REST_ENDPOINTS = {
     "spot": "https://api.binance.com",
@@ -82,12 +86,13 @@ class BinanceMarketGapRepair:
         return handler(request, market=market, symbol=symbol)
 
     def _get(self, *, market: str, path: str, params: Mapping[str, Any]) -> Any:
-        self.rate_limiter.acquire()
+        self.rate_limiter.acquire(cost=50 if path.endswith("depth") else 5)
         response = self.session.get(
             f"{self.base_urls[market]}{path}",
             params=dict(params),
             timeout=self.timeout_seconds,
         )
+        observe_http_response(self.rate_limiter, response)
         response.raise_for_status()
         return response.json()
 

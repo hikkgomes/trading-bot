@@ -32,15 +32,19 @@ def test_default_event_capture_config_is_bounded_and_uses_approved_streams():
 
     assert config.max_total_bytes == 5 * 1024**3
     assert config.retention_seconds == 7 * 86400
-    public = next(source for source in config.sources if "depth20@100ms" in source.streams)
+    public = next(
+        source
+        for source in config.sources
+        if source.market == "futures" and "bookTicker" in source.streams
+    )
     assert public.url == "wss://fstream.binance.com/public/stream"
     public_names = stream_names(public, ("ETHUSDT",))
-    assert "btcusdt@depth20@100ms" in public_names
-    market = next(source for source in config.sources if "aggTrade" in source.streams)
+    assert "btcusdt@bookTicker" in public_names
+    market = next(source for source in config.sources if "markPrice@1s" in source.streams)
     assert market.url == "wss://fstream.binance.com/market/stream"
     market_names = stream_names(market, ("ETHUSDT",))
-    assert "ethusdt@aggTrade" in market_names
-    assert "!forceOrder@arr" in market_names
+    assert "ethusdt@markPrice@1s" in market_names
+    assert "!forceOrder@arr" not in market_names
     candle_source = next(source for source in config.sources if "kline_15m" in source.streams)
     assert candle_source.url == "wss://fstream.binance.com/market/stream"
     assert candle_source.max_dynamic_symbols == 12

@@ -9,14 +9,130 @@ import threading
 import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any, cast
 
 import requests
 
-from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
+from src.data.universe import (
+    InstrumentObservation,
+    SqlUniverseStore,
+    UniverseEligibilityPolicy,
+    UniverseMembership,
+)
+from src.domain._codec import canonical_hash, timestamp
 from src.domain.instruments import Instrument, MarketType
-from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
+from src.execution.rate_limit import (
+    ExchangeRateLimiter,
+    observe_http_response,
+    shared_exchange_rate_limiter,
+)
 from src.services.scheduler import DatabaseJobQueue
+
+
+@dataclass(frozen=True)
+class ResearchScopeResolution:
+    snapshot_id: str | None
+    universe_id: str
+    symbols: tuple[str, ...]
+    skipped_reasons: tuple[tuple[str, str], ...]
+
+
+def _research_selection(
+    product_id: str,
+    memberships: tuple[UniverseMembership, ...],
+    maximum_symbols: int,
+    minimum_history_days: int,
+    selected_at: str,
+) -> tuple[tuple[UniverseMembership, ...], dict[str, str]]:
+    assessed = tuple(
+        (member, _research_membership_reason(member, selected_at)) for member in memberships
+    )
+    eligible = tuple(member for member, reason in assessed if reason is None)
+    skipped = {
+        member.instrument.exchange_symbol: reason
+        for member, reason in assessed
+        if reason is not None
+    }
+    if product_id == "btc_accumulation":
+        selected = tuple(
+            member
+            for member in eligible
+            if member.instrument.instrument_id == "binance:spot:BTCUSDT"
+        )
+        if not selected:
+            skipped.setdefault("BTCUSDT", "btc_not_currently_eligible")
+        return selected, skipped
+    if product_id != "active_income":
+        raise ValueError(f"unsupported research product: {product_id}")
+    return _income_research_selection(eligible, maximum_symbols, minimum_history_days, skipped)
+
+
+def _research_membership_reason(member: UniverseMembership, selected_at: str) -> str | None:
+    if "diagnostic" in member.strategy_eligibility:
+        return "diagnostic_universe"
+    if not member.eligible:
+        return member.reason_code
+    age = (
+        dt.datetime.fromisoformat(selected_at) - dt.datetime.fromisoformat(member.observed_at)
+    ).total_seconds()
+    # A newly selected scope needs a current screen, allowing two refresh periods.
+    if not 0 <= age <= 600:
+        return "universe_observation_stale"
+    return None
+
+
+def _income_research_selection(
+    eligible: tuple[UniverseMembership, ...],
+    maximum_symbols: int,
+    minimum_history_days: int,
+    skipped: dict[str, str],
+) -> tuple[tuple[UniverseMembership, ...], dict[str, str]]:
+    candidates = []
+    for member in eligible:
+        candidate, reason = _income_research_candidate(member, minimum_history_days)
+        if candidate is None:
+            skipped[member.instrument.exchange_symbol] = str(reason)
+        else:
+            candidates.append(candidate)
+    ranked = sorted(
+        candidates,
+        key=lambda item: (-item[1], item[0].instrument.exchange_symbol),
+    )
+    selected = tuple(member for member, _volume in ranked[:maximum_symbols])
+    skipped.update(
+        {
+            member.instrument.exchange_symbol: "research_scope_limit"
+            for member, _volume in ranked[maximum_symbols:]
+        }
+    )
+    return selected, skipped
+
+
+def _income_research_candidate(member, minimum_history_days):
+    try:
+        listing_age = float(member.metrics["listing_age_days"])
+    except (KeyError, TypeError, ValueError):
+        return None, "listing_age_unavailable"
+    if not math.isfinite(listing_age) or listing_age < minimum_history_days:
+        return None, "insufficient_listing_history"
+    try:
+        quote_volume = float(member.metrics["quote_volume"])
+    except (KeyError, TypeError, ValueError):
+        return None, "quote_volume_unavailable"
+    if not math.isfinite(quote_volume) or quote_volume < 0:
+        return None, "quote_volume_unavailable"
+    return (member, quote_volume), None
+
+
+def _validate_research_specification_hash(value: str) -> str:
+    if not isinstance(value, str) or len(value) != 71 or not value.startswith("sha256:"):
+        raise ValueError("research scope requires a specification hash")
+    try:
+        int(value[7:], 16)
+    except ValueError as exc:
+        raise ValueError("research scope requires a specification hash") from exc
+    return value
 
 
 class DatabaseUniverseService:
@@ -47,6 +163,71 @@ class DatabaseUniverseService:
     def eligible_symbols_for_capture(self, *, at: str | None = None) -> tuple[str, ...]:
         observed_at = at or dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
         return self.store.eligible_exchange_symbols(observed_at=observed_at)
+
+    def resolve_research_scope(
+        self,
+        *,
+        product_id: str,
+        source_universe_id: str,
+        selected_at: str,
+        maximum_symbols: int,
+        minimum_history_days: int,
+        specification_hash: str,
+    ) -> ResearchScopeResolution:
+        """Pin a bounded current eligible cohort as an explicitly fixed research scope."""
+        if (
+            not isinstance(maximum_symbols, int)
+            or isinstance(maximum_symbols, bool)
+            or maximum_symbols < 1
+        ):
+            raise ValueError("research scope maximum_symbols must be positive")
+        if (
+            not isinstance(minimum_history_days, int)
+            or isinstance(minimum_history_days, bool)
+            or minimum_history_days < 0
+        ):
+            raise ValueError("research scope minimum_history_days must be non-negative")
+        specification_hash = _validate_research_specification_hash(specification_hash)
+        selected_at = timestamp(selected_at, field="selected_at")
+        memberships = self.store.members_at(
+            universe_id=source_universe_id,
+            observed_at=selected_at,
+            eligible_only=False,
+        )
+        selected, skipped = _research_selection(
+            product_id, memberships, maximum_symbols, minimum_history_days, selected_at
+        )
+        instruments = tuple(member.instrument for member in selected)
+        symbols = tuple(sorted(item.exchange_symbol for item in instruments))
+        scope_hash = canonical_hash(
+            {
+                "product_id": product_id,
+                "specification_hash": specification_hash,
+                "instrument_ids": sorted(item.instrument_id for item in instruments),
+            }
+        )
+        research_universe_id = f"research:{product_id}:{scope_hash.removeprefix('sha256:')[:16]}"
+        if not instruments:
+            return ResearchScopeResolution(
+                snapshot_id=None,
+                universe_id=research_universe_id,
+                symbols=(),
+                skipped_reasons=tuple(sorted(skipped.items())),
+            )
+        snapshot_id = self.store.record_fixed_research_scope(
+            universe_id=research_universe_id,
+            product_id=product_id,
+            instruments=instruments,
+            selected_at=selected_at,
+            specification_hash=specification_hash,
+            skipped_reasons=skipped,
+        )
+        return ResearchScopeResolution(
+            snapshot_id=snapshot_id,
+            universe_id=research_universe_id,
+            symbols=symbols,
+            skipped_reasons=tuple(sorted(skipped.items())),
+        )
 
     def record_snapshot(
         self,
@@ -164,11 +345,12 @@ class BinanceUniverseClient:
             self._weight_used += weight
         for attempt in range(self.maximum_retries):
             try:
-                self.rate_limiter.acquire()
+                self.rate_limiter.acquire(cost=weight, funding=path.endswith("fundingInfo"))
                 base_url = self.base_url
                 if path.startswith("/api/") and base_url == "https://fapi.binance.com":
                     base_url = "https://api.binance.com"
                 response = self.session.get(f"{base_url}{path}", params=params, timeout=20)
+                observe_http_response(self.rate_limiter, response)
                 response.raise_for_status()
                 return response.json()
             except requests.RequestException:

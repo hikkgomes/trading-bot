@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -168,6 +169,71 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
                 text=True,
             )
             assert result.returncode == 0, f"{user} cannot write {path}: {result.stderr}"
+    typed_probes = (
+        (
+            "trading-runtime",
+            INSTALLED_ROOT / ".venv-runtime/bin/python",
+            INSTALLED_ROOT / "data/bars",
+            "parquet",
+            "import pathlib, sys; import pyarrow as pa; import pyarrow.parquet as pq; p = pathlib.Path(sys.argv[1]); pq.write_table(pa.table({'probe': [1]}), p); assert pq.read_table(p).num_rows == 1; p.unlink()",
+        ),
+        (
+            "trading-research",
+            INSTALLED_ROOT / ".venv-research/bin/python",
+            INSTALLED_ROOT / "data/research",
+            "parquet",
+            "import pathlib, sys; import pyarrow as pa; import pyarrow.parquet as pq; p = pathlib.Path(sys.argv[1]); pq.write_table(pa.table({'probe': [1]}), p); assert pq.read_table(p).num_rows == 1; p.unlink()",
+        ),
+        (
+            "trading-runtime",
+            INSTALLED_ROOT / ".venv-runtime/bin/python",
+            INSTALLED_ROOT / "runtime",
+            "json",
+            "import json, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text('{}'); assert json.loads(p.read_text()) == {}; p.unlink()",
+        ),
+        (
+            "trading-research",
+            INSTALLED_ROOT / ".venv-research/bin/python",
+            INSTALLED_ROOT / "runtime/research",
+            "json",
+            "import json, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text('{}'); assert json.loads(p.read_text()) == {}; p.unlink()",
+        ),
+        (
+            "trading-evaluator",
+            INSTALLED_ROOT / ".venv-runtime/bin/python",
+            INSTALLED_ROOT / "data/artefacts",
+            "json",
+            "import json, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text('{}'); assert json.loads(p.read_text()) == {}; p.unlink()",
+        ),
+        (
+            "trading-agent",
+            INSTALLED_ROOT / ".venv-agent/bin/python",
+            INSTALLED_ROOT / "runtime/agent-worktrees",
+            "json",
+            "import json, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text('{}'); assert json.loads(p.read_text()) == {}; p.unlink()",
+        ),
+    )
+    for index, (user, python, directory, kind, code) in enumerate(typed_probes):
+        probe = directory / f".platform-{kind}-probe-{os.getpid()}-{index}.{kind}"
+        result = subprocess.run(
+            [
+                "runuser",
+                "-u",
+                user,
+                "--",
+                "env",
+                "-i",
+                f"PATH={os.defpath}",
+                str(python),
+                "-c",
+                code,
+                str(probe),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"{user} cannot write {kind} in {directory}: {result.stderr}"
     private_paths = {
         "trading-agent": (
             INSTALLED_ROOT / ".git/config",
@@ -202,6 +268,7 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
 @pytest.mark.skipif(
     os.geteuid() != 0
     or not INSTALLED_ROOT.is_dir()
+    or not Path("/etc/trading-platform/runtime.env").is_file()
     or not all(
         os.environ.get(f"TRADING_PLATFORM_INSTALLED_{domain}_DATABASE_URL", "").startswith(
             "postgresql"
@@ -220,17 +287,44 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
 def test_installed_database_service_users_can_run_one_real_service_cycle() -> None:
     from sqlalchemy.engine import make_url
 
+    domains = ("RUNTIME", "RESEARCH", "EVALUATOR")
+    database_urls = {
+        domain: make_url(os.environ[f"TRADING_PLATFORM_INSTALLED_{domain}_DATABASE_URL"])
+        for domain in domains
+    }
+    production_value = None
+    with Path("/etc/trading-platform/runtime.env").open(encoding="utf-8") as handle:
+        for line in handle:
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "TRADING_PLATFORM_DATABASE_URL":
+                parsed = shlex.split(value.strip(), comments=False)
+                production_value = parsed[0] if parsed else None
+    assert production_value
+    production_url = make_url(production_value)
+    production_database = (production_url.database or "").casefold()
+    target_identities = set()
+    logins = set()
+    for domain, url in database_urls.items():
+        assert url.drivername.startswith("postgresql")
+        assert url.database
+        assert url.database.casefold() not in {"trading_platform", production_database}, domain
+        assert url.username
+        host = (url.host or "").casefold()
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            host = "loopback"
+        target_identities.add((host, url.port or 5432, url.database.casefold()))
+        logins.add(url.username)
+    assert len(target_identities) == 1
+    assert len(logins) == 3
+
     services = (
         ("trading-runtime", ".venv-runtime", "product-supervisor", "RUNTIME"),
         ("trading-research", ".venv-research", "research-worker", "RESEARCH"),
         ("trading-research", ".venv-research", "agent-coordinator", "RESEARCH"),
-        ("trading-evaluator", ".venv-research", "evaluation-worker", "EVALUATOR"),
+        ("trading-evaluator", ".venv-runtime", "evaluation-worker", "EVALUATOR"),
     )
     for user, environment_name, service, domain in services:
         database_url = os.environ[f"TRADING_PLATFORM_INSTALLED_{domain}_DATABASE_URL"]
-        assert make_url(database_url).database != "trading_platform", (
-            "use an isolated test database"
-        )
         environment = {
             "PATH": os.environ.get("PATH", os.defpath),
             "TRADING_PLATFORM_DATABASE_URL": database_url,

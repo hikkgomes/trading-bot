@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import requests
 from sqlalchemy import insert, select, update
 
@@ -23,10 +21,14 @@ from src.data.database import (
     instrument,
     instrument_status,
 )
-from src.data.parquet_store import _fsync_directory
+from src.data.parquet_store import _fsync_directory, upsert_partition_rows
 from src.domain._codec import canonical_hash, json_value, timestamp
 from src.domain.instruments import Instrument, MarketType
-from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
+from src.execution.rate_limit import (
+    ExchangeRateLimiter,
+    observe_http_response,
+    shared_exchange_rate_limiter,
+)
 
 INTERVAL_MS = {
     "1m": 60_000,
@@ -186,6 +188,8 @@ class HistoricalBootstrapService:
                         "funding_rows": funding.rows if funding is not None else 0,
                         "funding_partitions": funding.partitions if funding is not None else (),
                         "metadata_fetched": symbol in metadata,
+                        "completed": report.completed and (funding is None or funding.completed),
+                        "gaps": report.gaps + (funding.gaps if funding is not None else ()),
                     }
                 )
             )
@@ -194,12 +198,13 @@ class HistoricalBootstrapService:
     def _fetch_metadata(self, *, market: str, symbols: tuple[str, ...]) -> set[str]:
         base, _ = ENDPOINTS[market]
         metadata_path = "/api/v3/exchangeInfo" if market == "spot" else "/fapi/v1/exchangeInfo"
-        self.rate_limiter.acquire()
+        self.rate_limiter.acquire(cost=20 if market == "spot" else 1)
         response = self.session.get(
             f"{base}{metadata_path}",
             params={"symbol": symbols[0]} if market == "spot" and len(symbols) == 1 else None,
             timeout=self.timeout_seconds,
         )
+        observe_http_response(self.rate_limiter, response)
         response.raise_for_status()
         payload = response.json()
         raw_symbols = payload.get("symbols") if isinstance(payload, Mapping) else None
@@ -238,7 +243,12 @@ class HistoricalBootstrapService:
             )
         cursor = start
         for row in rows:
-            if _progress_gaps(row) or row["next_start"] < row["range_end"]:
+            if timeframe == "funding":
+                if not _funding_progress_exhausted(row):
+                    continue
+            elif _progress_gaps(row):
+                continue
+            if row["next_start"] < row["range_end"]:
                 continue
             left = int(dt.datetime.fromisoformat(row["range_start"]).timestamp() * 1000)
             right = int(dt.datetime.fromisoformat(row["range_end"]).timestamp() * 1000)
@@ -451,33 +461,31 @@ class HistoricalBootstrapService:
         maximum_pages: int = 10_000,
         heartbeat: Callable[[], Any] | None = None,
     ) -> HistoricalBootstrapReport:
-        """Download signed Binance funding events at their native timestamps."""
+        """Exhaust the native funding-rate query over an exact half-open range."""
 
         symbol = str(symbol).upper().strip()
         if not symbol.isalnum() or range_start_ms >= range_end_ms or maximum_pages <= 0:
             raise ValueError("funding bootstrap range is invalid")
         range_start = _millis_timestamp(range_start_ms)
         range_end = _millis_timestamp(range_end_ms)
-        progress_id = canonical_hash(
-            {
-                "product_id": product_id,
-                "market": "futures",
-                "symbol": symbol,
-                "timeframe": "funding",
-                "range_start": range_start,
-                "range_end": range_end,
-            }
+        covered_cursor = self._covered_cursor(
+            product_id,
+            "futures",
+            symbol,
+            "funding",
+            range_start_ms,
+            range_end_ms,
         )
+        segment_start = covered_cursor
+        progress_id = _funding_progress_id(product_id, symbol, segment_start, range_end_ms)
         progress = self._progress(progress_id)
-        cursor = range_start_ms if progress is None else _resume_cursor(progress, range_start_ms)
-        cursor = max(
-            cursor,
-            self._covered_cursor(
-                product_id, "futures", symbol, "funding", range_start_ms, range_end_ms
-            ),
-        )
-        resumed = progress is not None or cursor > range_start_ms
-        if cursor >= range_end_ms:
+        if progress is not None and not _funding_progress_resumable(
+            progress, segment_start, range_end_ms
+        ):
+            progress = None
+        if segment_start >= range_end_ms:
+            completed = self._has_funding_events(product_id, symbol, range_start, range_end)
+            empty_gaps = () if completed else (_native_funding_empty_gap(range_start, range_end),)
             return HistoricalBootstrapReport(
                 product_id=product_id,
                 market="futures",
@@ -487,40 +495,89 @@ class HistoricalBootstrapService:
                 range_end=range_end,
                 rows=0,
                 partitions=(),
-                gaps=(),
+                gaps=empty_gaps,
                 resumed=True,
-                completed=True,
+                completed=completed,
             )
+        cursor = segment_start if progress is None else _resume_cursor(progress, segment_start)
+        resumed = progress is not None or segment_start > range_start_ms
+        prior_payload = (
+            dict(progress["payload"])
+            if progress is not None and isinstance(progress.get("payload"), Mapping)
+            else {
+                "schema": "platform.historical_bootstrap_progress/v1",
+                "request_bounds": {"start_ms": segment_start, "end_ms": range_end_ms},
+                "page_limit": FUNDING_PAGE_SIZE,
+                "rows": 0,
+                "pages": [],
+                "partitions": [],
+                "gaps": [],
+                "coverage_classification": "native_query_in_progress",
+            }
+        )
         self._save_progress(
             progress_id=progress_id,
             product_id=product_id,
             market="futures",
             symbol=symbol,
             timeframe="funding",
-            range_start=range_start,
+            range_start=_millis_timestamp(segment_start),
             range_end=range_end,
             next_start=_millis_timestamp(cursor),
             status="running",
-            payload={"schema": "platform.historical_bootstrap_progress/v1", "gaps": []},
+            payload=prior_payload,
         )
         rows, partitions, gaps, cursor = self._download_funding_range(
             progress_id=progress_id,
             product_id=product_id,
             symbol=symbol,
-            range_start=range_start,
+            range_start=_millis_timestamp(segment_start),
             range_end=range_end,
             cursor=cursor,
             range_end_ms=range_end_ms,
             maximum_pages=maximum_pages,
+            prior_payload=prior_payload,
             heartbeat=heartbeat,
         )
-        completed = cursor >= range_end_ms and not gaps
+        has_events = self._has_funding_events(product_id, symbol, range_start, range_end)
+        completed = cursor >= range_end_ms and not gaps and has_events
+        if cursor >= range_end_ms and not gaps and not has_events:
+            gaps.append(_native_funding_empty_gap(range_start, range_end))
         if not completed:
+            failed_payload = self._progress(progress_id)
             self._save_failed(
                 progress_id,
-                "funding_gap_detected" if gaps else "funding_range_incomplete",
-                payload={"gaps": gaps},
+                "native_funding_history_empty" if gaps and not rows else "funding_range_incomplete",
+                payload={
+                    **(
+                        dict(failed_payload["payload"])
+                        if failed_payload is not None
+                        and isinstance(failed_payload.get("payload"), Mapping)
+                        else {}
+                    ),
+                    "gaps": gaps,
+                    "coverage_classification": "native_query_empty"
+                    if gaps and not rows
+                    else "native_query_incomplete",
+                },
             )
+        else:
+            completed_payload = self._progress(progress_id)
+            if completed_payload is not None:
+                payload = dict(completed_payload["payload"])
+                payload["coverage_classification"] = "native_query_exhausted"
+                self._save_progress(
+                    progress_id=progress_id,
+                    product_id=product_id,
+                    market="futures",
+                    symbol=symbol,
+                    timeframe="funding",
+                    range_start=_millis_timestamp(segment_start),
+                    range_end=range_end,
+                    next_start=_millis_timestamp(range_end_ms),
+                    status="completed",
+                    payload=payload,
+                )
         return HistoricalBootstrapReport(
             product_id=product_id,
             market="futures",
@@ -652,40 +709,79 @@ class HistoricalBootstrapService:
         cursor: int,
         range_end_ms: int,
         maximum_pages: int,
+        prior_payload: Mapping[str, Any],
         heartbeat: Callable[[], Any] | None = None,
     ) -> tuple[int, set[str], list[dict[str, Any]], int]:
-        rows_downloaded = 0
-        partitions: set[str] = set()
-        gaps: list[dict[str, Any]] = []
-        pages = 0
+        rows_downloaded = int(prior_payload.get("rows", 0))
+        partitions = set(prior_payload.get("partitions", ()))
+        gaps = list(prior_payload.get("gaps", ()))
+        page_records = list(prior_payload.get("pages", ()))
+        page_count = len(page_records)
         while cursor < range_end_ms:
             if heartbeat is not None:
                 heartbeat()
-            pages += 1
-            if pages > maximum_pages:
-                self._save_failed(progress_id, "funding_maximum_pages_exceeded")
+            page_count += 1
+            if page_count > maximum_pages:
+                self._save_failed(
+                    progress_id,
+                    "funding_maximum_pages_exceeded",
+                    payload={
+                        **dict(prior_payload),
+                        "rows": rows_downloaded,
+                        "pages": page_records,
+                        "partitions": sorted(partitions),
+                        "coverage_classification": "native_query_incomplete",
+                    },
+                )
                 raise HistoricalBootstrapError("funding bootstrap page budget exhausted")
-            raw = self._fetch_funding_page(symbol=symbol, start_ms=cursor, end_ms=range_end_ms)
+            request_start = cursor
+            raw = self._fetch_funding_page(
+                symbol=symbol, start_ms=request_start, end_ms=range_end_ms
+            )
             page = self._normalise_funding_page(raw, product_id=product_id, symbol=symbol)
-            page = [row for row in page if cursor <= int(row["funding_time_ms"]) < range_end_ms]
-            if not page:
-                gaps.append(self._gap(cursor, range_end_ms, "8h", "exchange_returned_empty_range"))
-                break
-            page.sort(key=lambda row: int(row["funding_time_ms"]))
-            gaps.extend(_funding_gaps(page, cursor))
+            times = tuple(int(row["funding_time_ms"]) for row in page)
+            if len(page) != len(raw) or times != tuple(sorted(set(times))):
+                raise HistoricalBootstrapError("Binance funding page is duplicate or out of order")
+            if any(not request_start <= value < range_end_ms for value in times):
+                raise HistoricalBootstrapError("Binance funding page exceeded its request bounds")
+            next_cursor = (
+                range_end_ms
+                if len(raw) < FUNDING_PAGE_SIZE
+                else int(page[-1]["funding_time_ms"]) + 1
+            )
+            if len(raw) >= FUNDING_PAGE_SIZE and next_cursor <= request_start:
+                self._save_failed(progress_id, "funding_download_did_not_advance")
+                raise HistoricalBootstrapError("funding bootstrap download did not advance")
             for day, day_rows in _group_by_funding_day(page):
                 partitions.add(
                     str(self._publish_funding_partition(day_rows, symbol=symbol, day=day))
                 )
                 self._record_funding_entries(day_rows)
             rows_downloaded += len(page)
-            next_cursor = int(page[-1]["funding_time_ms"]) + 1
-            if next_cursor <= cursor:
-                self._save_failed(progress_id, "funding_download_did_not_advance")
-                raise HistoricalBootstrapError("funding bootstrap download did not advance")
-            cursor = min(next_cursor, range_end_ms)
-            if range_end_ms - cursor < 8 * 3_600_000:
-                cursor = range_end_ms
+            page_records.append(
+                {
+                    "request_start_ms": request_start,
+                    "request_end_ms": range_end_ms - 1,
+                    "returned_rows": len(raw),
+                    "response_hash": canonical_hash(raw),
+                    "first_funding_time_ms": times[0] if times else None,
+                    "last_funding_time_ms": times[-1] if times else None,
+                    "next_start_ms": next_cursor,
+                }
+            )
+            cursor = next_cursor
+            progress_payload = {
+                **dict(prior_payload),
+                "rows": rows_downloaded,
+                "gaps": gaps,
+                "partitions": sorted(partitions),
+                "pages": page_records,
+                "coverage_classification": (
+                    "native_query_exhausted"
+                    if cursor >= range_end_ms
+                    else "native_query_in_progress"
+                ),
+            }
             self._save_progress(
                 progress_id=progress_id,
                 product_id=product_id,
@@ -696,17 +792,9 @@ class HistoricalBootstrapService:
                 range_end=range_end,
                 next_start=_millis_timestamp(cursor),
                 status="running" if cursor < range_end_ms else "completed",
-                payload={
-                    "schema": "platform.historical_bootstrap_progress/v1",
-                    "rows": rows_downloaded,
-                    "gaps": gaps,
-                    "partitions": sorted(partitions),
-                },
+                payload=progress_payload,
             )
-            if len(raw) < FUNDING_PAGE_SIZE:
-                if cursor < range_end_ms and range_end_ms - cursor >= 8 * 3_600_000:
-                    gaps.append(self._gap(cursor, range_end_ms, "8h", "short_exchange_page"))
-                break
+            prior_payload = progress_payload
         return rows_downloaded, partitions, gaps, cursor
 
     def _gap(self, start_ms: int, end_ms: int, timeframe: str, reason_code: str) -> dict[str, Any]:
@@ -720,7 +808,7 @@ class HistoricalBootstrapService:
         self, *, market: str, symbol: str, timeframe: str, start_ms: int, end_ms: int
     ) -> list[Any]:
         base, path = ENDPOINTS[market]
-        self.rate_limiter.acquire()
+        self.rate_limiter.acquire(cost=10)
         response = self.session.get(
             f"{base}{path}",
             params={
@@ -732,6 +820,7 @@ class HistoricalBootstrapService:
             },
             timeout=self.timeout_seconds,
         )
+        observe_http_response(self.rate_limiter, response)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, list):
@@ -739,7 +828,7 @@ class HistoricalBootstrapService:
         return payload
 
     def _fetch_funding_page(self, *, symbol: str, start_ms: int, end_ms: int) -> list[Any]:
-        self.rate_limiter.acquire()
+        self.rate_limiter.acquire(funding=True)
         response = self.session.get(
             "https://fapi.binance.com/fapi/v1/fundingRate",
             params={
@@ -750,6 +839,7 @@ class HistoricalBootstrapService:
             },
             timeout=self.timeout_seconds,
         )
+        observe_http_response(self.rate_limiter, response)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, list):
@@ -867,85 +957,14 @@ class HistoricalBootstrapService:
         timeframe: str,
         day: str,
     ) -> Path:
-        materialised = {int(row["open_time_ms"]): dict(row) for row in rows}
         directory = self.root / "bars" / "binance" / market / symbol / timeframe / f"date={day}"
-        directory.mkdir(parents=True, exist_ok=True)
-        existing_paths = tuple(sorted(directory.glob("*.parquet")))
-        for path in existing_paths:
-            try:
-                existing = pq.ParquetFile(path).read().to_pylist()
-            except Exception as exc:
-                raise HistoricalBootstrapError(
-                    f"cannot read existing bar partition {path}"
-                ) from exc
-            for row in existing:
-                if isinstance(row, Mapping) and row.get("open_time_ms") is not None:
-                    materialised.setdefault(int(row["open_time_ms"]), dict(row))
-        ordered = tuple(materialised[key] for key in sorted(materialised))
-        content_hash = canonical_hash(ordered).removeprefix("sha256:")
-        destination = directory / f"part-{content_hash}.parquet"
-        if not destination.exists():
-            temporary = destination.with_name(f".{destination.name}.tmp")
-            table = pa.table({key: [row.get(key) for row in ordered] for key in ordered[0]})
-            try:
-                pq.write_table(table, temporary, compression="zstd", row_group_size=1_024)
-                with temporary.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                os.replace(temporary, destination)
-                _fsync_directory(destination.parent)
-            finally:
-                temporary.unlink(missing_ok=True)
-        for path in existing_paths:
-            if path == destination:
-                continue
-            self.quarantine_root.mkdir(parents=True, exist_ok=True)
-            target = self.quarantine_root / f"{path.name}.{canonical_hash(str(path))[-16:]}"
-            if target.exists():
-                target = target.with_name(f"{target.name}.{os.urandom(6).hex()}")
-            os.replace(path, target)
-        _fsync_directory(directory)
-        return destination
+        return upsert_partition_rows(directory, rows, identity="event_id")
 
     def _publish_funding_partition(
         self, rows: Iterable[Mapping[str, Any]], *, symbol: str, day: str
     ) -> Path:
-        materialised = {int(row["funding_time_ms"]): dict(row) for row in rows}
         directory = self.root / "funding" / "binance" / "futures" / symbol / f"date={day}"
-        directory.mkdir(parents=True, exist_ok=True)
-        existing_paths = tuple(sorted(directory.glob("*.parquet")))
-        for path in existing_paths:
-            for raw in pq.ParquetFile(path).read().to_pylist():
-                if isinstance(raw, Mapping) and raw.get("funding_time_ms") is not None:
-                    materialised.setdefault(int(raw["funding_time_ms"]), dict(raw))
-        ordered = tuple(materialised[key] for key in sorted(materialised))
-        destination = directory / f"part-{canonical_hash(ordered).removeprefix('sha256:')}.parquet"
-        if not destination.exists():
-            temporary = destination.with_name(f".{destination.name}.tmp")
-            try:
-                pq.write_table(
-                    pa.table({key: [row.get(key) for row in ordered] for key in ordered[0]}),
-                    temporary,
-                    compression="zstd",
-                    row_group_size=1_024,
-                )
-                with temporary.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                os.replace(temporary, destination)
-                _fsync_directory(destination.parent)
-            finally:
-                temporary.unlink(missing_ok=True)
-        for path in existing_paths:
-            if path == destination:
-                continue
-            target = (
-                self.quarantine_root / "funding" / f"{path.name}.{canonical_hash(str(path))[-16:]}"
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                target = target.with_name(f"{target.name}.{os.urandom(6).hex()}")
-            os.replace(path, target)
-        _fsync_directory(directory)
-        return destination
+        return upsert_partition_rows(directory, rows, identity="funding_time_ms")
 
     def _record_funding_entries(self, rows: Iterable[Mapping[str, Any]]) -> None:
         from src.data.database import strategy_book
@@ -997,6 +1016,27 @@ class HistoricalBootstrapService:
                     priority=100,
                     connection=connection,
                 )
+
+    def _has_funding_events(
+        self, product_id: str, symbol: str, range_start: str, range_end: str
+    ) -> bool:
+        funding_time = funding_entry.c.payload["funding_time"].as_string()
+        with self.engine.connect() as connection:
+            return (
+                connection.execute(
+                    select(funding_entry.c.id)
+                    .where(
+                        funding_entry.c.payload["kind"].as_string() == "historical_funding",
+                        funding_entry.c.payload["product_id"].as_string() == product_id,
+                        funding_entry.c.payload["symbol"].as_string() == symbol,
+                        funding_time >= range_start,
+                        funding_time < range_end,
+                        funding_entry.c.created_at <= dt.datetime.now(dt.UTC).isoformat(),
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
 
     def _progress(self, progress_id: str) -> Mapping[str, Any] | None:
         with self.engine.connect() as connection:
@@ -1075,9 +1115,6 @@ class HistoricalBootstrapService:
             raise ValueError(f"unsupported Binance timeframe: {timeframe}") from exc
 
 
-HistoricalBootstrap = HistoricalBootstrapService
-
-
 def _progress_gaps(progress: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     payload = progress.get("payload")
     if payload is None:
@@ -1101,6 +1138,173 @@ def _resume_cursor(progress: Mapping[str, Any], range_start_ms: int) -> int:
     if gap_starts:
         cursor = min(cursor, min(gap_starts))
     return max(range_start_ms, cursor)
+
+
+def _funding_progress_id(product_id: str, symbol: str, start_ms: int, end_ms: int) -> str:
+    return canonical_hash(
+        {
+            "product_id": product_id,
+            "market": "futures",
+            "symbol": symbol,
+            "timeframe": "funding",
+            "range_start": _millis_timestamp(start_ms),
+            "range_end": _millis_timestamp(end_ms),
+        }
+    )
+
+
+def _funding_page_next(
+    page: Any,
+    *,
+    cursor: int,
+    end_ms: int,
+    final_page: bool,
+    page_limit: int,
+    allow_incomplete_tail: bool,
+) -> int | None:
+    if not _funding_page_metadata_valid(page, cursor, end_ms, page_limit):
+        return None
+    count = page["returned_rows"]
+    next_cursor = page["next_start_ms"]
+    if count == 0:
+        if (
+            final_page
+            and next_cursor == end_ms
+            and page.get("first_funding_time_ms") is None
+            and page.get("last_funding_time_ms") is None
+        ):
+            return end_ms
+        return None
+    first, last = page.get("first_funding_time_ms"), page.get("last_funding_time_ms")
+    if (
+        not isinstance(first, int)
+        or not isinstance(last, int)
+        or first < cursor
+        or last < first
+        or last >= end_ms
+    ):
+        return None
+    expected_next = last + 1
+    if expected_next >= end_ms:
+        return end_ms if final_page and next_cursor == end_ms else None
+    if count < page_limit:
+        return end_ms if final_page and next_cursor == end_ms else None
+    if next_cursor != expected_next:
+        return None
+    if final_page and not allow_incomplete_tail:
+        return None
+    return expected_next
+
+
+def _funding_page_metadata_valid(page: Any, cursor: int, end_ms: int, page_limit: int) -> bool:
+    if not isinstance(page, Mapping):
+        return False
+    digest = page.get("response_hash")
+    count, next_cursor = page.get("returned_rows"), page.get("next_start_ms")
+    return (
+        page.get("request_start_ms") == cursor
+        and page.get("request_end_ms") == end_ms - 1
+        and isinstance(digest, str)
+        and len(digest) == 71
+        and digest.startswith("sha256:")
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and 0 <= count <= page_limit
+        and isinstance(next_cursor, int)
+        and not isinstance(next_cursor, bool)
+    )
+
+
+def _funding_progress_chain(
+    payload: Mapping[str, Any],
+    *,
+    start_ms: int,
+    end_ms: int,
+    allow_incomplete_tail: bool,
+) -> tuple[bool, int, int]:
+    page_limit = payload.get("page_limit")
+    pages = payload.get("pages")
+    rows_expected = payload.get("rows")
+    if (
+        not isinstance(page_limit, int)
+        or isinstance(page_limit, bool)
+        or page_limit < 1
+        or not isinstance(pages, list)
+        or not pages
+        or not isinstance(rows_expected, int)
+        or isinstance(rows_expected, bool)
+        or rows_expected < 0
+    ):
+        return False, start_ms, 0
+    cursor, rows = start_ms, 0
+    for index, page in enumerate(pages):
+        next_cursor = _funding_page_next(
+            page,
+            cursor=cursor,
+            end_ms=end_ms,
+            final_page=index == len(pages) - 1,
+            page_limit=page_limit,
+            allow_incomplete_tail=allow_incomplete_tail,
+        )
+        if next_cursor is None:
+            return False, cursor, rows
+        rows += int(page["returned_rows"])
+        cursor = next_cursor
+    return rows == rows_expected, cursor, rows
+
+
+def _funding_progress_resumable(progress: Mapping[str, Any], start_ms: int, end_ms: int) -> bool:
+    payload = progress.get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("request_bounds")
+        != {
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        }
+        or payload.get("page_limit") != FUNDING_PAGE_SIZE
+    ):
+        return False
+    if payload.get("coverage_classification") not in {
+        "native_query_in_progress",
+        "native_query_incomplete",
+        "native_query_exhausted",
+    }:
+        return False
+    valid, cursor, _rows = _funding_progress_chain(
+        payload,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        allow_incomplete_tail=True,
+    )
+    return valid and cursor == _timestamp_millis(progress["next_start"])
+
+
+def _funding_progress_exhausted(progress: Mapping[str, Any]) -> bool:
+    payload = progress.get("payload")
+    if not isinstance(payload, Mapping) or payload.get("coverage_classification") != (
+        "native_query_exhausted"
+    ):
+        return False
+    start_ms = _timestamp_millis(progress["range_start"])
+    end_ms = _timestamp_millis(progress["range_end"])
+    if payload.get("request_bounds") != {"start_ms": start_ms, "end_ms": end_ms}:
+        return False
+    valid, cursor, _rows = _funding_progress_chain(
+        payload,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        allow_incomplete_tail=False,
+    )
+    return valid and cursor == end_ms and not _progress_gaps(progress)
+
+
+def _native_funding_empty_gap(start: str, end: str) -> dict[str, str]:
+    return {
+        "start": start,
+        "end": end,
+        "reason_code": "native_funding_history_empty",
+    }
 
 
 def _group_by_day(
@@ -1146,32 +1350,6 @@ def _page_gaps(
                     "start": _millis_timestamp(expected),
                     "end": _millis_timestamp(current_open - interval),
                     "reason_code": "missing_exchange_range",
-                }
-            )
-    return gaps
-
-
-def _funding_gaps(page: Sequence[Mapping[str, Any]], cursor: int) -> list[dict[str, Any]]:
-    expected = 8 * 3_600_000
-    gaps: list[dict[str, Any]] = []
-    first = int(page[0]["funding_time_ms"])
-    if first > cursor + expected:
-        gaps.append(
-            {
-                "start": _millis_timestamp(cursor),
-                "end": _millis_timestamp(first - expected),
-                "reason_code": "missing_funding_event",
-            }
-        )
-    for previous, current in zip(page, page[1:], strict=False):
-        previous_time = int(previous["funding_time_ms"])
-        current_time = int(current["funding_time_ms"])
-        if current_time > previous_time + expected:
-            gaps.append(
-                {
-                    "start": _millis_timestamp(previous_time + expected),
-                    "end": _millis_timestamp(current_time - expected),
-                    "reason_code": "missing_funding_event",
                 }
             )
     return gaps

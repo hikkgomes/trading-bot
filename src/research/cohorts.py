@@ -107,6 +107,8 @@ def _open_cohort(connection, cohort, candidate, now, policy_hash, configuration_
         if configuration_hash
         else None
     )
+    if configuration_hash and approval is None:
+        raise CohortPending("research_policy_approval_required_before_protected_access")
     connection.execute(
         insert(selection_cohort_open).values(
             id=cohort["cohort_id"],

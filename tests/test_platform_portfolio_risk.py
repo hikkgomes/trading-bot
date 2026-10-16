@@ -178,7 +178,7 @@ def test_risk_inputs_use_notional_exposure_order_deltas_and_paying_funding_legs(
             "price": 100,
             "spread_bps": 1,
             "volatility": 0.01,
-            "visible_depth": 10000,
+            "visible_depth_quote": 10000,
             "funding": 0.03,
         }
         for symbol in ("A", "B")
@@ -524,3 +524,67 @@ def test_internal_netting_is_separate_from_conserved_partial_external_fills():
             0.17,
             [{"book_id": "A", "signed_quantity": 4}, {"book_id": "B", "signed_quantity": -1}],
         )
+
+
+def test_native_quote_capacity_is_quote_notional_and_preserves_each_side():
+    from src.data.binance_market import normalise_public_event
+    from src.services.data_writer import _market_snapshot_values
+    from src.services.portfolio_engine import _order_depth
+
+    event = normalise_public_event(
+        market="futures",
+        stream="btcusdt@bookTicker",
+        receive_timestamp=NOW,
+        payload={"s": "BTCUSDT", "b": "99999", "B": "1", "a": "100001", "A": "2"},
+    )
+    quote = _market_snapshot_values(event)
+    assert quote["bid_depth_quote"] == 99999
+    assert quote["ask_depth_quote"] == 200002
+    assert quote["visible_depth_quote"] == 99999
+    target = TargetPosition(
+        portfolio_id="portfolio",
+        instrument_id="BTC",
+        target_quantity=1,
+        target_notional=100000,
+        target_fraction=0.1,
+        strategy_contributions={},
+        risk_budget=0.1,
+        valid_until=NOW,
+    )
+    assert _order_depth(target, {"BTC": 0}, {"BTC": quote}) == 200002
+    assert _order_depth(target, {"BTC": 2}, {"BTC": quote}) == 99999
+
+
+def test_native_bracket_owner_closes_before_another_book_can_enter():
+    from src.portfolio.account_plans import _sequence_bracket_entries
+    from src.portfolio.book_plans import net_book_changes
+
+    product = {"product_id": "active_income"}
+    held = {"A": {"BTC": 1}, "B": {}}
+    desired = {"A": {"BTC": 0}, "B": {"BTC": 1}}
+    target = TargetPosition(
+        portfolio_id="portfolio",
+        instrument_id="BTC",
+        target_quantity=1,
+        target_notional=100,
+        target_fraction=0.1,
+        strategy_contributions={},
+        risk_budget=0.1,
+        valid_until=NOW,
+    )
+    deferred = _sequence_bracket_entries(product, held, desired, {("B", "BTC"): target}, {"BTC"})
+    assert deferred[0]["book_id"] == "B"
+    net = net_book_changes(desired, held, {"BTC": 100})
+    assert net.internal_transfers == ()
+    assert net.external_changes == {"BTC": -1}
+    assert net.contributions["BTC"][0]["book_id"] == "A"
+    desired["B"]["BTC"] = 1
+    assert (
+        _sequence_bracket_entries(
+            product, {"A": {}, "B": {}}, desired, {("B", "BTC"): target}, set()
+        )
+        == []
+    )
+    assert net_book_changes(desired, {"A": {}, "B": {}}, {"BTC": 100}).external_changes == {
+        "BTC": 1
+    }

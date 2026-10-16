@@ -10,6 +10,63 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_service_drains_completed_jobs_and_polls_live_inputs_without_cycle_barrier():
+    from unittest.mock import Mock, call
+
+    from src.services.process import _service_loop
+
+    stopping = Mock()
+    stopping.is_set.side_effect = [False, False, True]
+    runtime = SimpleNamespace(
+        service_name="data-writer",
+        run_once=Mock(
+            side_effect=[
+                SimpleNamespace(healthy=True, detail={"job_id": "batch-1"}),
+                SimpleNamespace(healthy=True, detail={"reason_code": "market_event_queue_empty"}),
+            ]
+        ),
+    )
+    assert _service_loop(
+        runtime, Mock(), stopping, SimpleNamespace(once=False, interval_seconds=15)
+    )
+    assert stopping.wait.call_args_list == [call(0.01), call(1.0)]
+
+
+def test_fast_work_keeps_heartbeat_writes_bounded_but_publishes_health_changes(tmp_path):
+    from src.data.database import PlatformDatabase
+    from src.services.config import load_platform_config
+    from src.services.health import DatabaseHeartbeatStore
+    from src.services.runtime import ServiceRuntime
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'heartbeats.sqlite3'}")
+    database.create_schema()
+    store = DatabaseHeartbeatStore(database.engine)
+    runtime = ServiceRuntime(
+        config=load_platform_config(Path("config/platform.json")),
+        node_id="linux-optiplex",
+        service_name="data-writer",
+        heartbeat_store=store,
+        heartbeat_interval_seconds=15,
+    )
+    first = "2026-10-15T00:00:00+00:00"
+    runtime.run_once(lambda: {"reason_code": "market_event_written"}, observed_at=first)
+    runtime.run_once(
+        lambda: {"reason_code": "market_event_queue_empty"}, observed_at="2026-10-15T00:00:01+00:00"
+    )
+    assert store.latest()[0].observed_at == first
+    runtime.run_once(
+        lambda: {"reason_code": "market_event_write_failed", "error": "disk full"},
+        observed_at="2026-10-15T00:00:02+00:00",
+    )
+    assert store.latest()[0].healthy is False
+    runtime.run_once(
+        lambda: {"reason_code": "market_event_written"}, observed_at="2026-10-15T00:00:03+00:00"
+    )
+    assert store.latest()[0].healthy is True
+    assert store.latest()[0].observed_at == "2026-10-15T00:00:03+00:00"
+    database.dispose()
+
+
 def test_parquet_backup_preserves_source_and_quarantined_evidence(tmp_path, monkeypatch):
     from src.services import backup_service
 
@@ -56,7 +113,14 @@ def test_testnet_commands_require_confirmation_before_running_python(tmp_path, t
 
 
 @pytest.mark.parametrize(
-    "scenario", ["backup_failure", "inventory_failure", "lingering_agent", "migration_failure"]
+    "scenario",
+    [
+        "backup_failure",
+        "inventory_failure",
+        "lingering_agent",
+        "migration_failure",
+        "user_authority",
+    ],
 )
 def test_upgrade_stops_all_trading_writers_before_backup(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
@@ -74,6 +138,11 @@ with open(os.environ["TEST_CALLS"], "a") as handle:
 scenario = os.environ["TEST_SCENARIO"]
 if name == "uname": print("Linux")
 elif name == "id": print("0")
+elif name == "getent":
+    if scenario == "user_authority":
+        print("legacy:x:1000:1000::" + os.environ["TEST_ACCOUNT_HOME"] + ":/bin/sh")
+elif name == "runuser":
+    print("trading-bot-candidate-paper.service loaded active running")
 elif name == "python":
     sys.exit(0 if scenario == "migration_failure" and "src.services.backup_service" in args else 37)
 elif name == "systemctl":
@@ -84,12 +153,16 @@ elif name == "systemctl":
         print("trading-platform-backup-parquet.timer loaded active waiting")
     elif args[0] == "show":
         print("activating" if scenario == "lingering_agent" and "agent@" in args[1] else "inactive")
+    elif args[0] == "start":
+        sys.exit(37 if scenario == "backup_failure" else 0)
 else: sys.exit(99)
 """
     )
     mock.chmod(0o755)
-    for name in ("uname", "id", "systemctl", "python"):
+    for name in ("uname", "id", "getent", "runuser", "systemctl", "python"):
         (binaries / name).symlink_to(mock)
+    account_home = tmp_path / "legacy"
+    (account_home / ".config/systemd/user").mkdir(parents=True)
     result = subprocess.run(
         ["bash", str(root / "scripts/upgrade_platform.sh")],
         env={
@@ -101,6 +174,7 @@ else: sys.exit(99)
             "TRADING_PLATFORM_DATABASE_URL": "fixture-only",
             "TEST_CALLS": str(calls),
             "TEST_SCENARIO": scenario,
+            "TEST_ACCOUNT_HOME": str(account_home),
         },
         capture_output=True,
         text=True,
@@ -109,6 +183,11 @@ else: sys.exit(99)
     recorded = [json.loads(line) for line in calls.read_text().splitlines()]
     assert result.returncode != 0
     python_calls = [call for call in recorded if call[0] == "python"]
+    if scenario == "user_authority":
+        assert python_calls == []
+        assert not any(call[:2] == ["systemctl", "stop"] for call in recorded)
+        assert "Retire active legacy user units" in result.stderr
+        return
     if scenario in {"backup_failure", "migration_failure"}:
         stops = next(call[2:] for call in recorded if call[:2] == ["systemctl", "stop"])
         assert {
@@ -116,11 +195,18 @@ else: sys.exit(99)
             "trading-platform-backup@parquet.service",
             "trading-platform-backup-parquet.timer",
         }.issubset(stops)
-        assert len(python_calls) == (1 if scenario == "backup_failure" else 4)
-        assert "src.services.backup_service" in python_calls[0]
+        backup_calls = [call[2] for call in recorded if call[:2] == ["systemctl", "start"]]
+        assert backup_calls == [
+            f"trading-platform-backup@{mode}.service"
+            for mode in (
+                ("postgresql",)
+                if scenario == "backup_failure"
+                else ("postgresql", "parquet", "verify")
+            )
+        ]
+        assert len(python_calls) == (0 if scenario == "backup_failure" else 1)
         if scenario == "migration_failure":
-            assert [call[-1] for call in python_calls[:3]] == ["postgresql", "parquet", "verify"]
-            assert python_calls[3][-1] == "src.services.platform_upgrade"
+            assert python_calls[0][-1] == "src.services.platform_upgrade"
     else:
         assert python_calls == []
         assert (
@@ -356,3 +442,131 @@ def test_backup_retention_keeps_recent_daily_and_last_verified_recovery_points(t
         store.prune(older_than_timestamp=now, thin_before_timestamp=now)
     assert (store.root / "db-latest").is_dir()
     assert (store.root / "parquet-only").is_dir()
+
+
+def test_research_hard_deadline_terminates_a_stuck_process():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from src.services.research_worker import _job_deadline; import time\nwith _job_deadline(.1): time.sleep(10)",
+        ],
+        timeout=60,
+        capture_output=True,
+    )
+    assert result.returncode == 124
+
+
+def test_backup_verification_ignores_unpublished_builds(tmp_path, monkeypatch):
+    from src.services import backup_service
+    from src.services.backups import BackupStore
+
+    root = tmp_path / "backups"
+    source = tmp_path / "source"
+    source.write_bytes(b"verified recovery data")
+    store = BackupStore(root)
+    store.create(
+        backup_id="published", created_at="2026-01-01T00:00:00+00:00", files={"evidence": source}
+    )
+    for name in (".parquet-build-pending", ".postgresql-build-pending", ".incomplete.tmp"):
+        (root / name).mkdir()
+        (root / name / "partial").write_bytes(b"incomplete")
+    config = SimpleNamespace(paths={"backups": str(root)})
+    monkeypatch.setattr(backup_service, "load_platform_config", lambda _: config)
+    assert backup_service.verify_backups(config_path=tmp_path / "config") == 1
+
+
+def test_backup_verification_rehearses_newest_database_and_writes_bound_receipt(
+    tmp_path, monkeypatch
+):
+    from src.services import backup_service
+    from src.services.backups import BackupStore, file_hash
+
+    root = tmp_path / "backups"
+    source = tmp_path / "database.dump"
+    store = BackupStore(root)
+    for identity, created_at in (
+        ("postgresql-old", "2026-10-14T00:00:00+00:00"),
+        ("postgresql-new", "2026-10-15T00:00:00+00:00"),
+    ):
+        source.write_bytes(identity.encode())
+        store.create(
+            backup_id=identity,
+            created_at=created_at,
+            files={"database.dump": source},
+        )
+    config = SimpleNamespace(paths={"backups": str(root)})
+    monkeypatch.setattr(backup_service, "load_platform_config", lambda _: config)
+    verified_dumps = []
+    rehearsed_dumps = []
+    summary = {
+        "schema_revision": "040",
+        "table_counts": {"job": 2},
+    }
+    monkeypatch.setattr(
+        backup_service,
+        "verify_postgresql_dump",
+        lambda path: verified_dumps.append(path),
+    )
+    monkeypatch.setattr(
+        backup_service,
+        "rehearse_postgresql_restore",
+        lambda path, scratch_root: (rehearsed_dumps.append(path), summary)[1],
+    )
+
+    assert backup_service.verify_backups(config_path=tmp_path / "config") == 2
+    assert verified_dumps == [
+        root / "postgresql-new/database.dump",
+        root / "postgresql-old/database.dump",
+    ]
+    assert rehearsed_dumps == [root / "postgresql-new/database.dump"]
+    receipt_path = root / "restore-rehearsal-postgresql-new.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["backup_id"] == "postgresql-new"
+    assert receipt["backup_created_at"] == "2026-10-15T00:00:00+00:00"
+    assert receipt["backup_manifest_hash"] == file_hash(root / "postgresql-new/manifest.json")
+    assert receipt["database_dump_hash"] == file_hash(root / "postgresql-new/database.dump")
+    assert receipt["restore"] == summary
+    assert not (root / "restore-rehearsal-postgresql-old.json").exists()
+    monkeypatch.setattr(
+        backup_service,
+        "prune_backups",
+        lambda **_: pytest.fail("verification must not prune recovery points"),
+    )
+    backup_service.main(["--mode", "verify", "--config", str(tmp_path / "config")])
+    assert (root / "postgresql-old/database.dump").is_file()
+
+
+def test_archive_creation_bounds_inode_metadata_memory(tmp_path):
+    from src.services.backups import verify_directory_archive
+
+    source = tmp_path / "many-files"
+    source.mkdir()
+    for index in range(20_000):
+        (source / f"{index}.parquet").touch()
+    archive = tmp_path / "many-files.tar.gz"
+    # Measure only the archiver, excluding pytest and background test allocations.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys, tracemalloc; "
+            "from src.services.backups import create_directory_archive; "
+            "tracemalloc.start(); "
+            "create_directory_archive(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])); "
+            "print(tracemalloc.get_traced_memory()[1])",
+            str(source),
+            str(archive),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    peak = int(result.stdout.strip())
+    assert peak < 8 * 1024 * 1024
+    assert verify_directory_archive(archive) == 20_001

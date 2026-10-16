@@ -81,7 +81,7 @@ def test_service_login_cannot_hide_runtime_membership_by_switching_role():
     os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
     reason="requires PostgreSQL role fixture",
 )
-def test_evaluator_completes_research_without_runtime_membership(monkeypatch):
+def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tmp_path):
     from test_platform_candidate_lifecycle import NOW, _bundle, _candidate
 
     from src.data.database import PlatformDatabase
@@ -106,17 +106,48 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch):
         database.migrate()
         bundle = _bundle(database)
         candidate = _candidate(database, bundle)
+        from dataclasses import replace
+
+        from sqlalchemy import select, update
+
+        from src.data.database import experiment, research_epoch
+        from src.research.coordinator import ResearchCoordinator
         from src.research.rounds import ResearchRoundCoordinator
 
-        ResearchRoundCoordinator(database.engine).close_finite(
-            bundle.bundle_id,
-            product_id="active_income",
-            candidate_ids=[candidate.candidate_id],
-            at=NOW,
-        )
         evaluator = create_engine(base.set(database=name, username=role, password=password))
         with evaluator.connect() as connection:
             check_connection_role(connection, "trading_evaluator")
+        probe = replace(
+            candidate,
+            definition=replace(
+                candidate.definition,
+                signal_model={
+                    **candidate.definition.signal_model,
+                    "parameters": {"fast": 3, "slow": 5, "allow_short": True},
+                },
+            ),
+        )
+        ResearchCoordinator(SqlResearchStore(evaluator)).submit(probe)
+        with evaluator.begin() as connection:
+            assert (
+                connection.execute(
+                    select(research_epoch.c.consumed).where(
+                        research_epoch.c.dataset_bundle_id == bundle.bundle_id
+                    )
+                ).scalar_one()
+                == 2
+            )
+            connection.execute(
+                update(experiment)
+                .where(experiment.c.id == probe.candidate_id)
+                .values(state="unsupported")
+            )
+        ResearchRoundCoordinator(database.engine).close_finite(
+            bundle.bundle_id,
+            product_id="active_income",
+            candidate_ids=[candidate.candidate_id, probe.candidate_id],
+            at=NOW,
+        )
         queue = DatabaseJobQueue(evaluator)
         queue.register_worker(
             worker_id="evaluation",
@@ -130,6 +161,24 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch):
             p for p in configuration["products"]["products"] if p["product_id"] == "active_income"
         )
         product["dataset_timeframe"] = "1h"
+        import hashlib
+
+        from test_platform_validation_contracts import _approval_calibration_fixture
+
+        from src.research.policy_approval import approve_policy
+
+        calibration_path = tmp_path / "evaluator-calibration.json"
+        calibration_path.write_text(
+            json.dumps(_approval_calibration_fixture(configuration["research"]))
+        )
+        approve_policy(
+            database.engine,
+            receipt_path=calibration_path,
+            expected_hash="sha256:" + hashlib.sha256(calibration_path.read_bytes()).hexdigest(),
+            configuration=configuration["research"],
+            approved_by="test operator",
+            approved_at=NOW,
+        )
         handlers = DatabaseResearchJobHandlers(
             SqlResearchStore(evaluator),
             configuration=configuration,
@@ -235,7 +284,7 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch):
             from src.services.agent_worker import adaptive_research_report
 
             report = adaptive_research_report(adaptive)
-            assert report["research"]["funnel"]["candidates_generated"] == 1
+            assert report["research"]["funnel"]["candidates_generated"] == 2
             restored = SqlResearchStore(adaptive).get_candidate(candidate.candidate_id)
             assert restored.candidate_id == candidate.candidate_id
             assert "evaluation_deferred" not in restored.metadata
@@ -302,6 +351,39 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
     research_job_id = f"role-test-research-job-{run_id}"
     agent_proposal_id = f"role-test-agent-proposal-{run_id}"
     _as_role("trading_runtime", "SELECT id FROM balance_snapshot LIMIT 1")
+    buffer_id = f"role-test-market-input-{run_id}"
+    market_payload = {
+        "kind": "market_data_input",
+        "product_id": "active_income",
+        "instrument_id": "binance:futures:BTCUSDT:USDT",
+        "source_event_type": "best_bid_ask",
+    }
+    statement = (
+        "INSERT INTO market_input_buffer (id, product_id, instrument_id, event_type, created_at, payload) "
+        "VALUES (:id, 'active_income', 'binance:futures:BTCUSDT:USDT', 'best_bid_ask', "
+        "CURRENT_TIMESTAMP, CAST(:payload AS jsonb))"
+    )
+    _as_role("trading_runtime", statement, {"id": buffer_id, "payload": json.dumps(market_payload)})
+    with pytest.raises(DBAPIError):
+        _as_role(
+            "trading_runtime",
+            "UPDATE market_input_buffer SET payload=payload WHERE id=:id",
+            {"id": buffer_id},
+        )
+    with pytest.raises(DBAPIError):
+        _as_role(
+            "trading_runtime",
+            statement,
+            {
+                "id": buffer_id + "-invalid",
+                "payload": json.dumps({**market_payload, "kind": "balance_snapshot"}),
+            },
+        )
+    with pytest.raises(DBAPIError):
+        _as_role(
+            "trading_research", "DELETE FROM market_input_buffer WHERE id=:id", {"id": buffer_id}
+        )
+    _as_role("trading_runtime", "DELETE FROM market_input_buffer WHERE id=:id", {"id": buffer_id})
     _as_role("trading_research", "SELECT id FROM instrument LIMIT 1")
     with pytest.raises(DBAPIError):
         _as_role("trading_research", "SELECT id FROM balance_snapshot LIMIT 1")
@@ -486,3 +568,219 @@ def test_real_result_writer_does_not_expose_protected_stage_feedback():
     ]
     assert _as_role("trading_research", query, parameters) == [("development_rejected",)]
     database.dispose()
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
+    reason="requires PostgreSQL role fixture",
+)
+def test_runtime_prunes_only_expired_tagged_public_market_batch_jobs():
+    token = uuid.uuid4().hex[:16]
+    worker_id = f"retention-worker-{token}"
+    cases = {
+        "expired": (
+            "market_event_batch_write",
+            "completed",
+            8,
+            True,
+            "completed",
+            "released",
+            False,
+        ),
+        "recent": (
+            "market_event_batch_write",
+            "completed",
+            1,
+            True,
+            "completed",
+            "released",
+            False,
+        ),
+        "legacy": (
+            "market_event_batch_write",
+            "completed",
+            8,
+            False,
+            "completed",
+            "released",
+            False,
+        ),
+        "financial": (
+            "financial_live_followup",
+            "completed",
+            8,
+            True,
+            "completed",
+            "released",
+            False,
+        ),
+        "research": ("research_development", "completed", 8, True, "completed", "released", False),
+        "user_stream": ("user_stream_event", "completed", 8, True, "completed", "released", False),
+        "pending": ("market_event_batch_write", "pending", 8, True, None, None, False),
+        "running": ("market_event_batch_write", "running", 8, True, "running", "active", False),
+        "dead_letter": (
+            "market_event_batch_write",
+            "dead_letter",
+            8,
+            True,
+            "failed",
+            "released",
+            False,
+        ),
+        "audited": (
+            "market_event_batch_write",
+            "completed",
+            8,
+            True,
+            "completed",
+            "released",
+            True,
+        ),
+    }
+    job_ids = {key: f"market-retention-{key}-{token}" for key in cases}
+    now = dt.datetime.now(dt.UTC)
+    engine = create_engine(os.environ["TRADING_PLATFORM_DATABASE_URL"])
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("""INSERT INTO worker
+                    (id, node_id, role, last_heartbeat, status, capabilities, payload)
+                    VALUES (:id, 'retention-test', 'market-writer', :now, 'ready', '[]', '{}')"""),
+                {"id": worker_id, "now": now},
+            )
+            for key, (
+                name,
+                state,
+                age_days,
+                tagged,
+                attempt_status,
+                lease_status,
+                audited,
+            ) in cases.items():
+                job_id = job_ids[key]
+                completed_at = now - dt.timedelta(days=age_days)
+                payload = (
+                    {"queue_retention_policy": "public_market_batch_completed_7d/v1"}
+                    if tagged
+                    else {}
+                )
+                content_hash = "sha256:" + uuid.uuid4().hex + uuid.uuid4().hex
+                connection.execute(
+                    text("""INSERT INTO job
+                        (id, name, state, priority, available_at, attempts, max_attempts,
+                            producer_identity, content_hash, payload)
+                        VALUES (:id, :name, :state, 0, :available_at, :attempts, 3,
+                            'retention-fixture', :content_hash, CAST(:payload AS jsonb))"""),
+                    {
+                        "id": job_id,
+                        "name": name,
+                        "state": state,
+                        "available_at": completed_at,
+                        "attempts": 0 if attempt_status is None else 1,
+                        "content_hash": content_hash,
+                        "payload": json.dumps(payload),
+                    },
+                )
+                if attempt_status is None:
+                    continue
+                attempt_id = f"{job_id}:1"
+                finished = None if attempt_status == "running" else completed_at
+                connection.execute(
+                    text("""INSERT INTO job_attempt
+                        (id, job_id, worker_id, started_at, completed_at, status, payload)
+                        VALUES (:id, :job_id, :worker_id, :started_at, :completed_at,
+                            :status, '{}')"""),
+                    {
+                        "id": attempt_id,
+                        "job_id": job_id,
+                        "worker_id": worker_id,
+                        "started_at": completed_at,
+                        "completed_at": finished,
+                        "status": attempt_status,
+                    },
+                )
+                connection.execute(
+                    text("""INSERT INTO worker_lease
+                        (id, job_id, worker_id, expires_at, status, payload)
+                        VALUES (:id, :job_id, :worker_id, :expires_at, :status, '{}')"""),
+                    {
+                        "id": attempt_id,
+                        "job_id": job_id,
+                        "worker_id": worker_id,
+                        "expires_at": completed_at,
+                        "status": lease_status,
+                    },
+                )
+                if audited:
+                    connection.execute(
+                        text("""INSERT INTO job_quarantine
+                            (id, job_id, quarantined_at, original_state, reason, content_hash, payload)
+                            VALUES (:id, :job_id, :now, 'completed', 'retention_test',
+                                :content_hash, CAST(:payload AS jsonb))"""),
+                        {
+                            "id": f"retention-audit-{token}",
+                            "job_id": job_id,
+                            "now": now,
+                            "content_hash": content_hash,
+                            "payload": json.dumps(payload),
+                        },
+                    )
+
+        assert _as_role(
+            "trading_runtime", "SELECT public.prune_completed_public_market_batch_jobs()"
+        ) == [(1,)]
+        with engine.connect() as connection:
+            remaining = {
+                key
+                for key, job_id in job_ids.items()
+                if connection.execute(
+                    text("SELECT 1 FROM job WHERE id=:id"), {"id": job_id}
+                ).first()
+            }
+            assert remaining == set(job_ids) - {"expired"}
+            assert (
+                connection.execute(
+                    text("SELECT 1 FROM job_attempt WHERE job_id=:id"),
+                    {"id": job_ids["expired"]},
+                ).first()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text("SELECT 1 FROM worker_lease WHERE job_id=:id"),
+                    {"id": job_ids["expired"]},
+                ).first()
+                is None
+            )
+
+        with pytest.raises(DBAPIError):
+            _as_role(
+                "trading_runtime",
+                "DELETE FROM job WHERE id=:id",
+                {"id": job_ids["pending"]},
+            )
+        with pytest.raises(DBAPIError):
+            _as_role(
+                "trading_runtime",
+                "DELETE FROM job_attempt WHERE job_id=:id",
+                {"id": job_ids["legacy"]},
+            )
+    finally:
+        with engine.begin() as connection:
+            for job_id in job_ids.values():
+                connection.execute(
+                    text("DELETE FROM worker_lease WHERE job_id=:id"), {"id": job_id}
+                )
+                connection.execute(text("DELETE FROM job_attempt WHERE job_id=:id"), {"id": job_id})
+                connection.execute(
+                    text("DELETE FROM job_quarantine WHERE job_id=:id"), {"id": job_id}
+                )
+                connection.execute(
+                    text("DELETE FROM emergency_action WHERE job_id=:id"), {"id": job_id}
+                )
+                connection.execute(
+                    text("DELETE FROM heavy_compute_lease WHERE job_id=:id"), {"id": job_id}
+                )
+                connection.execute(text("DELETE FROM job WHERE id=:id"), {"id": job_id})
+            connection.execute(text("DELETE FROM worker WHERE id=:id"), {"id": worker_id})
+        engine.dispose()

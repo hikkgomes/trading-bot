@@ -129,6 +129,8 @@ class SandboxRunner:
         return [
             str(self.bwrap),
             "--die-with-parent",
+            "--unshare-user",
+            "--disable-userns",
             "--unshare-net",
             "--unshare-pid",
             "--ro-bind",
@@ -178,6 +180,9 @@ class SandboxRunner:
             "OMP_NUM_THREADS",
             "1",
             "--",
+            "/usr/bin/prlimit",
+            f"--nproc={self.policy.maximum_processes}:{self.policy.maximum_processes}",
+            "--",
             *command,
         ]
 
@@ -210,7 +215,9 @@ class SandboxRunner:
                 resource.RLIMIT_CPU,
                 (self.policy.maximum_cpu_seconds, self.policy.maximum_cpu_seconds),
             )
-        if hasattr(resource, "RLIMIT_NPROC"):
+        # Namespace setup must not count unrelated threads owned by the host
+        # user. The isolated command receives its limit through prlimit above.
+        if not self.require_network_isolation and hasattr(resource, "RLIMIT_NPROC"):
             resource.setrlimit(
                 resource.RLIMIT_NPROC,
                 (self.policy.maximum_processes, self.policy.maximum_processes),

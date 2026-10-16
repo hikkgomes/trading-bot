@@ -13,6 +13,7 @@ Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/numba-cache
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/runtime.env
 Environment=PYTHONUNBUFFERED=1
+Environment=TRADING_EXCHANGE_RATE_LIMIT_DIR=/opt/trading-bot/runtime/exchange-limits
 Environment=OMP_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2
 ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process data-writer --validate

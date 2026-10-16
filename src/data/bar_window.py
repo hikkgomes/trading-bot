@@ -18,8 +18,12 @@ class RecentBarWindow:
         previous = self._rows.get(key)
         if previous is not None:
             _assert_duplicate(previous, row)
-            if str(row["availability_time"]) < str(previous["availability_time"]):
-                self._rows[key] = dict(row)
+            first, second = sorted((previous, row), key=lambda item: str(item["availability_time"]))
+            # Equivalent native observations may add metadata; retain first availability.
+            self._rows[key] = {
+                **second,
+                **{name: value for name, value in first.items() if value is not None},
+            }
             return
         if len(self._rows) == self.maximum_rows and key <= self._times[0]:
             return
@@ -33,6 +37,17 @@ class RecentBarWindow:
 
 
 def _assert_duplicate(first: Mapping[str, Any], second: Mapping[str, Any]) -> None:
-    fields = ("open", "high", "low", "close", "volume", "quote_asset_volume", "number_of_trades")
+    fields = ("open", "high", "low", "close", "volume")
     if any(first.get(key) != second.get(key) for key in fields):
         raise ValueError("conflicting historical bar revisions require explicit resolution")
+    optional = (
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_volume",
+        "taker_buy_quote_volume",
+    )
+    if any(
+        first.get(key) is not None and second.get(key) is not None and first[key] != second[key]
+        for key in optional
+    ):
+        raise ValueError("conflicting historical bar metadata requires explicit resolution")

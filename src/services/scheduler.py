@@ -32,9 +32,9 @@ from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.data_plan import product_data_plan
-from src.research.datasets import SqlDatasetBundleRepository
 from src.research.outcomes import OutcomeCategory, TrialDisposition
 from src.research.rounds import ResearchRoundCoordinator
+from src.research.scheduling import research_inputs
 from src.research.store import SqlResearchStore
 from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
 from src.services.job_schemas import JobSchemaError, validate_job_payload
@@ -67,6 +67,21 @@ def immutable_work_id(
     ignored = volatile or set()
     identity = {str(key): value for key, value in payload.items() if key not in ignored}
     return f"work:{name}:{canonical_hash(identity).removeprefix('sha256:')}"
+
+
+def _queue_payload_identity(name: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    identity = dict(payload)
+    if name == "market_event_batch_write":
+        # Queue retention is bookkeeping and must not change a replayed batch's identity.
+        identity.pop("queue_retention_policy", None)
+    return identity
+
+
+def _queue_values_match(name: str, actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    if name == "market_event_batch_write":
+        actual = {**actual, "payload": _queue_payload_identity(name, actual["payload"])}
+        expected = {**expected, "payload": _queue_payload_identity(name, expected["payload"])}
+    return actual == expected
 
 
 @dataclass(frozen=True)
@@ -270,11 +285,8 @@ class PlatformScheduler:
         if schedule_name == "maintenance" and product_id != min(self.products):
             return ()
         if schedule_name == "historical_bootstrap":
-            symbols = (
-                ["BTCUSDT"]
-                if product_id == "btc_accumulation"
-                else self._universe_symbols(product_id, product, now)
-            )
+            inputs = self._payload("register_strategy_catalogue", product_id, product, now)
+            symbols = inputs["instrument_universe"]
             if not symbols:
                 return ()
             plan = product_data_plan(product, self.research_configuration, symbols)
@@ -284,7 +296,7 @@ class PlatformScheduler:
                 "symbols": symbols,
                 "timeframe": plan.timeframe,
                 "data_plan": plan.to_payload(),
-                "history_as_of": due_at,
+                "history_as_of": inputs["research_as_of"],
             }
             payload["available_at"] = "1970-01-01T00:00:00+00:00"
             payload["content_hash"] = canonical_hash(payload)
@@ -299,7 +311,7 @@ class PlatformScheduler:
                             "minimum_history_days": payload["minimum_history_days"],
                             "timeframe": payload["timeframe"],
                             "data_plan_id": plan.plan_id,
-                            "history_as_of": due_at,
+                            "history_as_of": inputs["research_as_of"],
                         },
                     ),
                     "historical_bootstrap",
@@ -308,9 +320,15 @@ class PlatformScheduler:
             )
         if schedule_name == "register_strategy_catalogue":
             payload = self._payload(schedule_name, product_id, product, now)
+            if not payload["instrument_universe"]:
+                return ()
             payload["available_at"] = "1970-01-01T00:00:00+00:00"
-            if not payload.get("dataset_snapshot_hashes"):
-                payload["catalogue_submitted_at"] = "1970-01-01T00:00:00+00:00"
+            if payload.get("dataset_bundle_id"):
+                payload = self._claim_research_round(
+                    {**payload, "producer": "catalogue", "generation_budget": 12}, now
+                )
+                if payload is None:
+                    return ()
             return (
                 (
                     immutable_work_id(
@@ -339,23 +357,26 @@ class PlatformScheduler:
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
         payload = self._hypothesis_generation_payload(product_id, product, catalogue)
-        limits = self.research_configuration.get("search_budgets", {})
-        if payload.get("dataset_bundle_id"):
-            claimed = ResearchRoundCoordinator(self.engine).claim(
-                payload,
-                now=now,
-                epoch_budget=int(limits.get("maximum_candidates_per_epoch", 100)),
-                daily_budget=int(limits.get("maximum_candidates_per_day", 100)),
-            )
-            if claimed is None:
-                return ()
-            payload = claimed
+        if not payload.get("dataset_bundle_id"):
+            return ()
+        payload = self._claim_research_round({**payload, "producer": "adaptive"}, now)
+        if payload is None:
+            return ()
         return (
             (
                 immutable_work_id("generate_hypotheses", payload),
                 "generate_hypotheses",
                 payload,
             ),
+        )
+
+    def _claim_research_round(self, payload, now):
+        limits = self.research_configuration.get("search_budgets", {})
+        return ResearchRoundCoordinator(self.engine).claim(
+            payload,
+            now=now,
+            epoch_budget=int(limits.get("maximum_candidates_per_epoch", 100)),
+            daily_budget=int(limits.get("maximum_candidates_per_day", 100)),
         )
 
     def _candidate_evaluation_jobs(
@@ -642,7 +663,8 @@ class PlatformScheduler:
                 else "1970-01-01T00:00:00+00:00"
             ),
             "generation_budget": int(product.get("generation_budget", 6)),
-            "universe_id": str(product.get("universe_id") or ""),
+            "universe_id": str(catalogue.get("universe_id") or ""),
+            "research_as_of": catalogue.get("research_as_of"),
             "market_type": "spot" if product_id == "btc_accumulation" else "futures",
             "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
             "data_plan": catalogue.get("data_plan"),
@@ -1058,32 +1080,15 @@ class PlatformScheduler:
                 "maximum_symbols": int(product.get("research_max_symbols", 100)),
             }
         if schedule_name == "register_strategy_catalogue":
-            symbols = self._universe_symbols(product_id, product, now)
-            plan = (
-                product_data_plan(product, self.research_configuration, symbols)
-                if symbols
-                else None
-            )
-            bundle = (
-                SqlDatasetBundleRepository(self.engine).latest_ready(
-                    product_id, at=now, data_plan_id=plan.plan_id
-                )
-                if plan
-                else None
-            )
-            stage_ids = bundle.stage_snapshot_ids if bundle is not None else {}
-            snapshot_ids = list(dict.fromkeys(str(value) for value in stage_ids.values()))
             return {
                 **base,
-                "instrument_universe": symbols,
-                "data_plan": plan.to_payload() if plan else None,
-                "dataset_snapshot_hashes": snapshot_ids,
-                "dataset_bundle_id": bundle.bundle_id if bundle is not None else None,
-                "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
-                "universe_snapshot_id": (
-                    bundle.universe_snapshot_id if bundle is not None else None
+                **research_inputs(
+                    self.engine,
+                    {**product, "product_id": product_id},
+                    self.research_configuration,
+                    now,
                 ),
-                "catalogue_submitted_at": bundle.created_at if bundle is not None else now,
+                "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
             }
         if schedule_name == "agent_review":
             return {
@@ -1092,33 +1097,6 @@ class PlatformScheduler:
                 "reason_code": "scheduled_research_review",
             }
         return base
-
-    def _universe_symbols(self, product_id: str, product: Mapping[str, Any], now: str) -> list[str]:
-        if product_id == "btc_accumulation":
-            return ["BTCUSDT"]
-        universe_id = str(product.get("universe_id") or "")
-        with self.engine.connect() as connection:
-            row = connection.execute(
-                select(universe_snapshot.c.payload)
-                .where(
-                    universe_snapshot.c.universe_id == universe_id,
-                    universe_snapshot.c.observed_at <= now,
-                )
-                .order_by(universe_snapshot.c.observed_at.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-        if isinstance(row, Mapping) and isinstance(row.get("observations"), list):
-            symbols = [
-                str(item["instrument"]["exchange_symbol"])
-                for item in row["observations"]
-                if isinstance(item, Mapping)
-                and item.get("reason_code") == "eligible"
-                and isinstance(item.get("instrument"), Mapping)
-                and item["instrument"].get("exchange_symbol")
-            ]
-            if symbols:
-                return sorted(set(symbols))
-        return [str(product["exchange_symbol"])] if product.get("exchange_symbol") else []
 
 
 class DatabaseJobQueue:
@@ -1195,7 +1173,7 @@ class DatabaseJobQueue:
             "max_attempts": max_attempts,
             "terminal_reason": None,
             "producer_identity": producer,
-            "content_hash": canonical_hash(clean_payload),
+            "content_hash": canonical_hash(_queue_payload_identity(name, clean_payload)),
             "payload": json_value(clean_payload, field="payload"),
         }
         with self.engine.begin() as connection:
@@ -1243,7 +1221,7 @@ class DatabaseJobQueue:
             "max_attempts": max_attempts,
             "terminal_reason": None,
             "producer_identity": producer,
-            "content_hash": canonical_hash(clean_payload),
+            "content_hash": canonical_hash(_queue_payload_identity(name, clean_payload)),
             "payload": json_value(clean_payload, field="payload"),
         }
         dialect = self.engine.dialect.name
@@ -1285,7 +1263,7 @@ class DatabaseJobQueue:
         ):
             expected["available_at"] = values["available_at"]
         actual = {key: existing[key] for key in expected}
-        if actual != expected:
+        if not _queue_values_match(name, actual, expected):
             raise ValueError(f"job identity collision: {job_id}")
         return False
 
@@ -1297,6 +1275,18 @@ class DatabaseJobQueue:
                 select(job.c.state).where(job.c.id == job_id)
             ).scalar_one_or_none()
         return None if value is None else str(value)
+
+    def prune_completed_public_market_batches(self) -> int:
+        """Prune at most 1,000 expired tagged market batch jobs on PostgreSQL."""
+
+        if self.engine.dialect.name != "postgresql":
+            raise RuntimeError("market batch queue retention requires PostgreSQL")
+        with self.engine.begin() as connection:
+            return int(
+                connection.execute(
+                    text("SELECT public.prune_completed_public_market_batch_jobs()")
+                ).scalar_one()
+            )
 
     def requeue(
         self,

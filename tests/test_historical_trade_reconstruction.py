@@ -297,7 +297,10 @@ def test_campaign_alignment_converts_dubai_time_and_excludes_unresolved_inventor
         align_campaign_structure(study, history, horizon=4, embargo=4)
 
 
-def test_bounded_cell_export_roundtrip_preserves_blank_rows_native_ids_and_provenance(tmp_path):
+@pytest.mark.parametrize("settled_pnl", [None, "", "0"])
+def test_bounded_cell_export_roundtrip_preserves_blank_rows_native_ids_and_provenance(
+    tmp_path, settled_pnl
+):
     import json
 
     from src.research.historical.export import export_workbook
@@ -320,7 +323,8 @@ def test_bounded_cell_export_roundtrip_preserves_blank_rows_native_ids_and_prove
             "Liquidation Penalty",
             "Settled PnL",
             "Realized PnL",
-        ]
+        ],
+        ["position-1", "SWAP", "20", "-2", "-0.5", "0", settled_pnl, "17.5"],
     ]
 
     class Session:
@@ -358,7 +362,9 @@ def test_bounded_cell_export_roundtrip_preserves_blank_rows_native_ids_and_prove
                                     "rowData": [
                                         {
                                             "values": [
-                                                {
+                                                {}
+                                                if v is None
+                                                else {
                                                     "userEnteredValue": {
                                                         "numberValue"
                                                         if isinstance(v, int)
@@ -404,8 +410,20 @@ def test_bounded_cell_export_roundtrip_preserves_blank_rows_native_ids_and_prove
     assert result["order_records"][0]["order_id"] == exact_id
     assert result["periods"]["entire_export"]["net_before_funding"] == Decimal(18)
     assert result["balanced_campaigns"] == result["reconciled_campaigns"] == 1
+    assert result["position_history"]["records"] == 1
+    assert result["position_history"]["recomputed_net"] == Decimal("17.5")
+    assert result["position_history"]["inapplicable_swap_settlements"] == (
+        0 if settled_pnl == "0" else 1
+    )
     assert result["timezone_status"] == "unconfirmed"
     assert result["promotable"] is False
+    from src.research.historical.imports import position_totals
+
+    for column in ("Fee", "Funding Fee"):
+        missing = [positions[0], positions[1].copy()]
+        missing[1][positions[0].index(column)] = ""
+        with pytest.raises(ValueError, match=f"invalid historical {column}"):
+            position_totals(missing)
     ids["sheets"][0]["data"][0]["rowData"][1]["values"][0]["userEnteredValue"] = {
         "numberValue": 90071992547409940000
     }

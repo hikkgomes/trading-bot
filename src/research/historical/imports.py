@@ -215,7 +215,7 @@ def position_totals(rows: Sequence[Sequence[Any]]) -> dict[str, Decimal | int]:
         for name, index in columns.items():
             if (
                 name == "Settled PnL"
-                and str(row[index]) == "None"
+                and str(row[index]).strip() in {"None", ""}
                 and row[headers.index("Instrument Type")] == "SWAP"
             ):
                 inapplicable_settlements += 1

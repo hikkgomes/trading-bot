@@ -8,6 +8,7 @@ from src.data.database import account_portfolio_plan, book_event, job, strategy_
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.portfolios import TargetPosition
 from src.execution.position_manager import PositionManager, SqlPositionStore
+from src.execution.stops import live_protected_instruments
 from src.portfolio.book_plans import net_book_changes
 from src.portfolio.books import book_balances, load_book
 from src.products.btc_accumulation import BtcAllocationPolicy
@@ -183,6 +184,13 @@ def _calculate(
         )
         desired[book_id] = {target.instrument_id: target.target_quantity for target in targets}
         originals.update({(book_id, target.instrument_id): target for target in targets})
+    deferred = _sequence_bracket_entries(
+        product,
+        held,
+        desired,
+        originals,
+        live_protected_instruments(engine, product["portfolio_id"], connection=connection),
+    )
     net = net_book_changes(desired, held, prices)
     unallocated = _unallocated_positions(product, current_positions, held)
     targets = _account_targets(
@@ -222,8 +230,40 @@ def _calculate(
         "prices": prices,
         "book_targets": net.desired_positions,
         "internal_transfers": list(net.internal_transfers),
+        "entry_deferrals": deferred,
         "target_objects": targets,
     }
+
+
+def _sequence_bracket_entries(product, held, desired, originals, protected_symbols):
+    if product["product_id"] != "active_income":
+        return []
+    deferred = []
+    for (book, symbol), target in originals.items():
+        if not target.target_quantity or held[book].get(symbol):
+            continue
+        incumbents = [
+            owner for owner, positions in held.items() if owner != book and positions.get(symbol)
+        ]
+        protected = (
+            symbol in protected_symbols
+            or target.metadata.get("position_rules")
+            or any(
+                originals.get((owner, symbol))
+                and originals[owner, symbol].metadata.get("position_rules")
+                for owner in incumbents
+            )
+        )
+        if incumbents and protected:
+            desired[book][symbol] = 0.0
+            deferred.append(
+                {
+                    "book_id": book,
+                    "instrument_id": symbol,
+                    "reason_code": "prior_bracket_owner_must_close",
+                }
+            )
+    return deferred
 
 
 def _owner(assignment):

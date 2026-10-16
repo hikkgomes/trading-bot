@@ -13,6 +13,8 @@ Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/numba-cache
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/backup.env
 ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.backup_service --config /opt/trading-bot/config/platform.json --mode %i
+TimeoutStartSec=8h
+MemoryMax=768M
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

@@ -157,6 +157,7 @@ class SqlUniverseStore:
         instruments: tuple[Instrument, ...],
         selected_at: str,
         specification_hash: str,
+        skipped_reasons: Mapping[str, str] | None = None,
     ) -> str:
         if not instruments or len({item.instrument_id for item in instruments}) != len(instruments):
             raise ValueError("fixed research scope requires distinct instruments")
@@ -181,6 +182,7 @@ class SqlUniverseStore:
             "observed_at": timestamp(selected_at, field="selected_at"),
             "specification_hash": specification_hash,
             "historical_liquidity_eligibility": "not_asserted",
+            "skipped_reasons": dict(sorted((skipped_reasons or {}).items())),
             "observations": [
                 {
                     "instrument": to_primitive(instrument),
@@ -372,8 +374,13 @@ class SqlUniverseStore:
 
         observed_at = timestamp(observed_at, field="observed_at")
         with self.engine.connect() as connection:
+            records = connection.execute(
+                select(universe.c.id, universe.c.payload).order_by(universe.c.id)
+            ).mappings()
             universe_ids = tuple(
-                connection.execute(select(universe.c.id).order_by(universe.c.id)).scalars()
+                str(row["id"])
+                for row in records
+                if not isinstance(row["payload"], Mapping) or row["payload"].get("dynamic", True)
             )
         symbols: set[str] = set()
         for universe_id in universe_ids:

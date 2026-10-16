@@ -7,14 +7,18 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.engine import Engine
 
 from src.accounting.fees import FeeConversionError, convert_fee, instrument_asset
-from src.data.database import account_snapshot, universe_member, universe_snapshot
+from src.data.database import (
+    account_snapshot,
+    market_input_sources,
+    universe_member,
+    universe_snapshot,
+)
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
@@ -35,68 +39,17 @@ from src.research.canonical import (
     SqlStrategyArtefactRepository,
     preflight_is_fresh,
 )
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.exposure_budget import ExposureBudgetGuard
 from src.services.financial_application import FinancialApplication, FinancialScope
 from src.services.income_recovery import checkpoint_income, income_window, reconcile_income
 from src.services.runtime import utc_now
 
-_EXECUTION_IDENTITY_FILES = (
-    Path("src/services/financial_application.py"),
-    Path("src/services/financial_followup.py"),
-    Path("src/accounting/execution.py"),
-    Path("src/accounting/ledger.py"),
-    Path("src/data/transactions.py"),
-    Path("src/execution/order_manager.py"),
-    Path("src/execution/position_manager.py"),
-    Path("src/execution/paper_exchange.py"),
-    Path("src/risk/exposure.py"),
-    Path("src/accounting/spot_allocation.py"),
-    Path("src/accounting/capital.py"),
-    Path("src/accounting/paper_account.py"),
-    Path("src/research/accounting.py"),
-    Path("src/research/economic_series.py"),
-    Path("src/research/executors.py"),
-    Path("src/research/returns.py"),
-    Path("src/strategies/behaviour.py"),
-    Path("src/strategies/position_state.py"),
-    Path("src/strategies/semantic.py"),
-    Path("src/domain/forecasts.py"),
-    Path("src/portfolio/optimiser.py"),
-    Path("src/portfolio/aggregation.py"),
-    Path("src/services/artefact_dispatcher.py"),
-    Path("src/services/portfolio_engine.py"),
-    Path("src/portfolio/account_plans.py"),
-    Path("src/portfolio/book_plans.py"),
-    Path("src/portfolio/books.py"),
-    Path("src/accounting/book_allocations.py"),
-    Path("requirements-runtime.txt"),
-    Path("src/data/binance_user_stream.py"),
-    Path("src/execution/ccxt_broker.py"),
-    Path("src/execution/config.py"),
-    Path("src/execution/live_exchange.py"),
-    Path("src/services/market_gateway.py"),
-    Path("src/services/order_execution.py"),
-    Path("src/services/live_execution.py"),
-    Path("src/services/exposure_budget.py"),
-    Path("src/services/protective_stops.py"),
-    Path("src/services/protective_orders.py"),
-    Path("src/services/order_recovery.py"),
-    Path("src/execution/broker.py"),
-    Path("src/execution/history.py"),
-    Path("src/services/income_recovery.py"),
-    Path("src/services/emergency.py"),
-    Path("src/services/platform_testnet_connected.py"),
-    Path("src/services/account_reconciliation.py"),
-    Path("src/domain/orders.py"),
-    Path("src/execution/stops.py"),
-)
-
 
 def execution_engine_identity() -> str:
-    root = Path(__file__).resolve().parents[2]
-    return canonical_hash(
-        {str(path): (root / path).read_text(encoding="utf-8") for path in _EXECUTION_IDENTITY_FILES}
-    )
+    from src.services.execution_identity import execution_engine_digest
+
+    return execution_engine_digest()
 
 
 def live_authority_configuration_hash(
@@ -298,7 +251,9 @@ class ApprovedLiveExecution:
         if action.action_type is RecoveryActionType.RECONCILE_POSITION:
             return self._reconcile_position(product_id, action.target, action.quantity)
         if action.action_type is RecoveryActionType.EMERGENCY_FLATTEN:
-            return self._emergency_flatten(product_id, action.target, action.quantity)
+            return self._emergency_flatten(
+                product_id, action.target, action.quantity, operation_id=action.operation_id
+            )
         raise ValueError(f"unsupported recovery action: {action.action_type}")
 
     def _cancel_known_order(self, product_id, identity):
@@ -619,8 +574,15 @@ class ApprovedLiveExecution:
         }
 
     def _emergency_flatten(
-        self, product_id: str, instrument_id: str, quantity: float | None
+        self,
+        product_id: str,
+        instrument_id: str,
+        quantity: float | None,
+        *,
+        operation_id: str | None,
     ) -> Mapping[str, Any]:
+        if not operation_id:
+            raise ValueError("emergency recovery requires a durable operation identity")
         venue = self.venues[product_id]
         instrument = venue.instruments.get(instrument_id)
         if instrument is None:
@@ -643,6 +605,7 @@ class ApprovedLiveExecution:
             return {"action": "emergency_flatten", "instrument_id": instrument_id, "status": "flat"}
         reference_price = float(broker.get_price(instrument.exchange_symbol))
         unsigned = {
+            "operation_id": operation_id,
             "product_id": product_id,
             "instrument_id": instrument_id,
             "quantity": abs(signed_quantity),
@@ -738,6 +701,7 @@ class ApprovedLiveExecution:
             raise PermissionError("execution code changed after process startup")
         if order.metadata.get("target_metadata", {}).get("account_plan_id"):
             self._authorise_account_order(payload, order)
+            self._assert_market_admission(payload, order)
             return
         product_id, product, account_id, authority_at = self._order_context(payload, order)
         if not order.reduce_only:
@@ -779,6 +743,64 @@ class ApprovedLiveExecution:
             positions=self.positions.all(),
             orders=self.order_manager.all(),
         )
+        self._assert_market_admission(payload, order)
+
+    def _assert_market_admission(self, payload, order):
+        if order.reduce_only:
+            return
+        product_id, _product, _account, now = self._order_context(payload, order)
+        maximum_age = float(
+            self.risk_configuration["global"]["maximum_market_data_staleness_seconds"]
+        )
+        oldest = (dt.datetime.fromisoformat(now) - dt.timedelta(seconds=maximum_age)).isoformat()
+        source = market_input_sources
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(source.c.id)
+                .where(
+                    source.c.payload["product_id"].as_string() == product_id,
+                    source.c.payload["instrument_id"].as_string() == order.instrument_id,
+                    source.c.payload["values"]["bid_depth_quote"].as_float().is_not(None),
+                    source.c.payload["values"]["ask_depth_quote"].as_float().is_not(None),
+                    source.c.created_at.between(oldest, now),
+                    or_(
+                        source.c.payload["availability_time"].as_string().is_(None),
+                        source.c.payload["availability_time"].as_string() <= now,
+                    ),
+                )
+                .order_by(source.c.created_at.desc(), source.c.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if row is None:
+            raise PermissionError("live entry requires a fresh instrument book quote")
+        quote = SqlRiskSnapshotStore(self.engine).get(str(row))
+        observed_at = quote.get("source_event_time")
+        if (
+            not observed_at
+            or not 0
+            <= (
+                dt.datetime.fromisoformat(now) - dt.datetime.fromisoformat(observed_at)
+            ).total_seconds()
+            <= maximum_age
+        ):
+            raise PermissionError("live entry requires a fresh exchange observation")
+        values = quote["values"]
+        side = "ask" if order.side is OrderSide.BUY else "bid"
+        depth = float(values[f"{side}_depth_quote"])
+        price = float(values["close"])
+        spread = float(values["spread_bps"])
+        if (
+            not all(math.isfinite(value) and value >= 0 for value in (depth, price, spread))
+            or price <= 0
+        ):
+            raise PermissionError("live instrument quote is invalid")
+        limits = self.risk_configuration["instrument"]
+        if spread > float(limits["maximum_slippage_bps"]):
+            raise PermissionError("live instrument spread exceeds its risk limit")
+        if order.remaining_quantity * price > depth * float(
+            limits["maximum_visible_depth_fraction"]
+        ):
+            raise PermissionError("live order exceeds current side-specific quote depth")
 
     def authorise_plan(self, plan, *, now, connection):
         """Validate every current book authority before an atomic local allocation."""

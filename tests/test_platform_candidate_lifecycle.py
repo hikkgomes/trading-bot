@@ -1,6 +1,7 @@
 """A synthetic correctness path through the real research and paper scheduler."""
 
 import datetime as dt
+import json
 import math
 import os
 import uuid
@@ -250,13 +251,13 @@ def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
         research_qualification,
         revoke_policy,
     )
-    from src.services.execution_identity import execution_engine_digest
+    from src.research.policy_identity import research_policy_engine_digest
 
     if approved_research:
         calibration_id = canonical_hash({"fixture": "reviewed calibration"})
         approval = {
             "schema": "research.policy_approval/v1",
-            "method": "selection_adjusted_block_bootstrap/v1",
+            "method": "selection_adjusted_block_bootstrap/v2",
             "status": "approved",
             "approved_by": "test operator",
             "approved_at": NOW,
@@ -264,7 +265,7 @@ def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
             "policy_hash": EvidencePolicy.from_configuration(
                 configuration["research"]["evidence_policy"]
             ).policy_hash,
-            "engine_hash": execution_engine_digest(),
+            "engine_hash": research_policy_engine_digest(),
             "nominal_test_alpha": 0.05,
             "calibration_id": calibration_id,
         }
@@ -325,6 +326,17 @@ def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
             )
             assert claimed is not None and claimed.attempt == 1
             result = handlers.evaluate_candidate(claimed, lambda claimed=claimed: claimed)
+        if stage == "protected" and not approved_research:
+            from src.data.database import selection_cohort_open
+
+            assert result["reason_code"] == "cohort_pending", result
+            assert "research_policy_approval_required" in result["_defer_reason"]
+            with database.engine.connect() as connection:
+                assert connection.execute(select(holdout_claim)).first() is None
+                assert connection.execute(select(selection_cohort_open)).first() is None
+                assert connection.execute(select(active_strategy_assignment)).first() is None
+            database.dispose()
+            return
         assert result["accepted"], result
         queue.complete(claimed, completed_at=clock[0], outcome=result)
     with database.engine.connect() as connection:
@@ -551,7 +563,9 @@ def _forward_services(database, configuration, queue, clock, root, monkeypatch):
         results = [trading[0]()]
         results.extend(trading[1]() for _ in range(3))
         results.extend(cycle() for cycle in trading[2:])
-        assert not any(result.get("error_type") for result in results), results
+        assert not any(result.get("error_type") for result in results), json.dumps(
+            results, default=str
+        )
         outcomes.append(results)
     with database.engine.connect() as connection:
         forecasts = connection.execute(select(alpha_forecast.c.payload)).scalars().all()
@@ -713,7 +727,7 @@ def _repair_window_cycle(database, configuration, queue, clock, services, assign
         payload={"completed_job": evaluated["job_id"]},
     )
     results = [cycle() for cycle in trading]
-    assert not any(result.get("error_type") for result in results), results
+    assert not any(result.get("error_type") for result in results), json.dumps(results, default=str)
     advance()
     observe("new-window-first-observation")
     _, new_summary = evidence.build_summary(**scope, observed_at=clock[0])
@@ -802,7 +816,7 @@ def _resume_paper_cycle(database, configuration, queue, clock, services, assignm
     results = [trading[0]()]
     results.extend(trading[1]() for _ in range(3))
     results.extend(cycle() for cycle in trading[2:])
-    assert not any(result.get("error_type") for result in results), results
+    assert not any(result.get("error_type") for result in results), json.dumps(results, default=str)
     clock[0] = (dt.datetime.fromisoformat(clock[0]) + dt.timedelta(minutes=1)).isoformat()
     queue.enqueue(
         job_id="resumed-observation",
@@ -1131,6 +1145,15 @@ def _write_market_support(queue, writer, at, index, price):
         result = writer()
         assert result["reason_code"] == "market_event_written", result
 
+    for service_name in ("market-gateway", "data-writer"):
+        DatabaseHeartbeatStore(queue.engine).record(
+            service_name=service_name,
+            node_id="fixture",
+            observed_at=at,
+            healthy=True,
+            payload={"reason_code": "fixture_public_events_persisted"},
+        )
+
 
 def test_protected_economic_result_ignores_other_market_and_excludes_exhausted_worker(
     tmp_path, monkeypatch
@@ -1173,9 +1196,26 @@ def test_protected_economic_result_ignores_other_market_and_excludes_exhausted_w
             capabilities=("evaluate_candidate",),
             observed_at=NOW,
         )
+        import hashlib
+
+        from test_platform_validation_contracts import _approval_calibration_fixture
+
+        from src.research.policy_approval import approve_policy
+
+        configuration = load_split_configuration(Path(__file__).resolve().parents[1] / "config")
+        calibration = tmp_path / f"scope-calibration-{scale}.json"
+        calibration.write_text(json.dumps(_approval_calibration_fixture(configuration["research"])))
+        approve_policy(
+            database.engine,
+            receipt_path=calibration,
+            expected_hash="sha256:" + hashlib.sha256(calibration.read_bytes()).hexdigest(),
+            configuration=configuration["research"],
+            approved_by="test operator",
+            approved_at=NOW,
+        )
         handlers = DatabaseResearchJobHandlers(
             SqlResearchStore(database.engine),
-            configuration=load_split_configuration(Path(__file__).resolve().parents[1] / "config"),
+            configuration=configuration,
             dataset_resolver=CanonicalDatasetResolver(
                 SqlCanonicalDatasetRepository(database.engine)
             ),

@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import subprocess
 import sys
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
@@ -299,6 +300,53 @@ def registered_strategy_candidates(
                 )
             )
     return tuple(candidates)
+
+
+def registered_strategy_candidate_page(
+    *,
+    product: str,
+    dataset_snapshot_hashes: Iterable[str],
+    instrument_universe: Iterable[str],
+    cursor: int,
+    limit: int,
+    submitted_at: str,
+    dataset_bundle_id: str | None = None,
+    universe_snapshot_id: str | None = None,
+) -> tuple[tuple[Candidate, ...], int, bool]:
+    if cursor < 0 or limit < 1:
+        raise ValueError("catalogue cursor must be non-negative and page limit positive")
+    candidates = registered_strategy_candidates(
+        product=product,
+        dataset_snapshot_hashes=dataset_snapshot_hashes,
+        instrument_universe=instrument_universe,
+        submitted_at=submitted_at,
+        dataset_bundle_id=dataset_bundle_id,
+        universe_snapshot_id=universe_snapshot_id,
+    )
+    ordered = _round_robin_candidates(candidates)
+    start = min(cursor, len(ordered))
+    end = min(start + limit, len(ordered))
+    return ordered[start:end], end, end == len(ordered)
+
+
+def _round_robin_candidates(candidates: tuple[Candidate, ...]) -> tuple[Candidate, ...]:
+    groups: dict[tuple[str, str], deque[Candidate]] = defaultdict(deque)
+    for candidate in sorted(candidates, key=lambda item: item.definition.identity):
+        symbols = candidate.definition.universe.get("symbols", ())
+        symbol = (
+            str(symbols[0]) if isinstance(symbols, list | tuple) and len(symbols) == 1 else "panel"
+        )
+        family = str(
+            candidate.definition.metadata.get("manifest_family") or candidate.definition.family
+        )
+        groups[(family, symbol)].append(candidate)
+    ordered: list[Candidate] = []
+    keys = sorted(groups)
+    while any(groups[key] for key in keys):
+        for key in keys:
+            if groups[key]:
+                ordered.append(groups[key].popleft())
+    return tuple(ordered)
 
 
 def _registered_position_model(strategy_class: Any) -> dict[str, Any]:
