@@ -31,8 +31,7 @@ data/raw/futures/
 outputs/
 
 # ---- Runtime state (generated on server) ----
-runtime/*
-!runtime/control.example.json
+runtime/
 
 # ---- Secrets / local config ----
 .env
