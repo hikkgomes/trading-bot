@@ -164,12 +164,14 @@ def main(argv: list[str] | None = None) -> None:
     config = load_platform_config(args.config)
     lock_target = Path(config.paths["backups"]) / "maintenance"
     with acquire_file_update_lock(lock_target, label="backup maintenance"):
+        discarded: tuple[str, ...] = ()
         if args.mode in {"postgresql", "parquet"}:
+            discarded = BackupStore(lock_target.parent).discard_abandoned_builds()
             prune_backups(config_path=args.config)
-        _run_command(args)
+        _run_command(args, discarded_temporary=discarded)
 
 
-def _run_command(args: argparse.Namespace) -> None:
+def _run_command(args: argparse.Namespace, *, discarded_temporary: tuple[str, ...] = ()) -> None:
     if args.mode == "postgresql":
         result: object = create_database_backup(config_path=args.config)
     elif args.mode == "parquet":
@@ -195,11 +197,17 @@ def _run_command(args: argparse.Namespace) -> None:
             destination=args.destination,
         )
     removed = (
-        prune_backups(config_path=args.config)
-        if args.mode in {"postgresql", "parquet"}
-        else ()
+        prune_backups(config_path=args.config) if args.mode in {"postgresql", "parquet"} else ()
     )
-    print({"ok": True, "mode": args.mode, "result": result, "removed": list(removed)})
+    print(
+        {
+            "ok": True,
+            "mode": args.mode,
+            "result": result,
+            "removed": list(removed),
+            "discarded_temporary_builds": list(discarded_temporary),
+        }
+    )
 
 
 if __name__ == "__main__":

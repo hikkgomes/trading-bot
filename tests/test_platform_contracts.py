@@ -1600,6 +1600,31 @@ def test_split_configuration_assigns_every_service_and_blocks_mac_execution():
         }
     )
     assert "connect_timeout=5" in secure_url
+    for query, inherited in (
+        ("host=database", {}),
+        ("host=database&sslmode=require&sslmode=", {}),
+        ("host=/var/run/postgresql,database", {}),
+        ("hostaddr=127.0.0.1", {}),
+        ("service=remote", {}),
+        ("", {"PGHOST": "database"}),
+        ("host=", {"PGHOST": "database"}),
+        ("host=/var/run/postgresql&host=", {"PGHOST": "database"}),
+        ("", {"PGHOSTADDR": "127.0.0.1"}),
+        ("", {"PGSERVICE": "remote"}),
+    ):
+        with pytest.raises(ValueError, match="TLS"):
+            config.database_url(
+                {
+                    config.database_url_env: f"postgresql+psycopg://platform@/platform?{query}",
+                    **inherited,
+                }
+            )
+    local_url = config.database_url(
+        {
+            config.database_url_env: "postgresql+psycopg://platform@/platform?host=/var/run/postgresql"
+        }
+    )
+    assert "connect_timeout=5" in local_url
 
 
 def test_platform_configuration_rejects_execution_on_non_linux_authority():

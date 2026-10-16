@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeGuard
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from src.research.evidence import EvidenceProfile
 
@@ -253,6 +253,18 @@ class NodeConfig:
         )
 
 
+def _local_postgresql_socket(
+    hostname: str | None, query: Mapping[str, str], environment: Mapping[str, str]
+) -> bool:
+    if hostname or any(
+        query.get(key) or environment.get(variable)
+        for key, variable in (("hostaddr", "PGHOSTADDR"), ("service", "PGSERVICE"))
+    ):
+        return False
+    hosts = query.get("host") or environment.get("PGHOST", "")
+    return all(not host or host.startswith("/") for host in hosts.split(","))
+
+
 @dataclass(frozen=True)
 class PlatformConfig:
     schema: str
@@ -326,14 +338,11 @@ class PlatformConfig:
         if not value.startswith(("postgresql+psycopg://", "postgresql://")):
             raise ValueError("the shared database URL must use PostgreSQL")
         parts = urlsplit(value)
-        is_local_socket = not parts.hostname and (
-            "host=" in parts.query or parts.path.startswith("/")
-        )
-        if self.database_require_tls and not is_local_socket:
-            sslmode = parse_qs(parts.query).get("sslmode", [])
-            if not sslmode or sslmode[-1] not in {"require", "verify-ca", "verify-full"}:
-                raise ValueError("the shared PostgreSQL URL must require TLS")
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        is_local_socket = _local_postgresql_socket(parts.hostname, query, source)
+        if self.database_require_tls and not is_local_socket:
+            if query.get("sslmode") not in {"require", "verify-ca", "verify-full"}:
+                raise ValueError("the shared PostgreSQL URL must require TLS")
         query.setdefault("connect_timeout", str(self.database_connect_timeout_seconds))
         return urlunsplit(
             (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)

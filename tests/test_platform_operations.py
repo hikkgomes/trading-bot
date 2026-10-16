@@ -479,6 +479,39 @@ def test_backup_verification_ignores_unpublished_builds(tmp_path, monkeypatch):
     assert backup_service.verify_backups(config_path=tmp_path / "config") == 1
 
 
+def test_backup_restart_removes_only_unpublished_builds(tmp_path, monkeypatch):
+    from src.services import backup_service
+    from src.services.backups import BackupStore
+
+    root = tmp_path / "backups"
+    source = tmp_path / "evidence"
+    source.write_bytes(b"published recovery point")
+    store = BackupStore(root)
+    store.create(
+        backup_id="published", created_at="2026-10-15T00:00:00+00:00", files={"evidence": source}
+    )
+    abandoned = (
+        ".parquet-build-interrupted",
+        ".postgresql-build-interrupted",
+        ".postgresql-20261015T000000Z.tmp",
+    )
+    retained = (".restore-rehearsal-inspect", ".operator-notes", ".postgresql-unknown.tmp")
+    for name in (*abandoned, *retained):
+        (root / name).mkdir()
+        (root / name / "data").write_bytes(b"evidence")
+    (root / ".parquet-build-link").symlink_to(tmp_path, target_is_directory=True)
+    config = SimpleNamespace(paths={"backups": str(root)})
+    monkeypatch.setattr(backup_service, "load_platform_config", lambda _: config)
+    monkeypatch.setattr(backup_service, "prune_backups", lambda **_: ())
+    monkeypatch.setattr(backup_service, "create_database_backup", lambda **_: "created")
+    backup_service.main(["--mode", "postgresql", "--config", str(tmp_path / "config")])
+    assert all(not (root / name).exists() for name in abandoned)
+    assert all((root / name / "data").read_bytes() == b"evidence" for name in retained)
+    assert (root / ".parquet-build-link").is_symlink()
+    assert source.read_bytes() == b"published recovery point"
+    assert store.verify("published").files
+
+
 def test_backup_verification_rehearses_newest_database_and_writes_bound_receipt(
     tmp_path, monkeypatch
 ):

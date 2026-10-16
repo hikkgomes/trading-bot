@@ -174,6 +174,24 @@ class BackupStore:
     def __init__(self, root: Path):
         self.root = root
 
+    def discard_abandoned_builds(self) -> tuple[str, ...]:
+        """Remove unpublished builds while the caller owns the maintenance lock."""
+        pattern = re.compile(
+            r"\.(?:postgresql|parquet)-build-[A-Za-z0-9_]+"
+            r"|\.(?:postgresql|parquet)-[0-9]{8}T[0-9]{6}Z\.tmp"
+        )
+        removed = []
+        for path in self.root.iterdir():
+            if not pattern.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
+                continue
+            if path.stat().st_uid != os.getuid():
+                continue
+            shutil.rmtree(path)
+            removed.append(path.name)
+        if removed:
+            _fsync_directory(self.root)
+        return tuple(sorted(removed))
+
     def create(
         self,
         *,

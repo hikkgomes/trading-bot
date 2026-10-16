@@ -141,7 +141,7 @@ retire_legacy_units() {
   )
   for unit in "${legacy_units[@]}"; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$unit"; then
+    if [[ "$unit" != *@.service ]] && systemctl is-active --quiet "$unit"; then
       echo "Refusing to enable the PostgreSQL platform while legacy unit is active: $unit" >&2
       exit 1
     fi
@@ -174,7 +174,7 @@ retire_legacy_units() {
   for file in "${legacy_files[@]}"; do
     unit="${file##*/}"
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$unit"; then
+    if [[ "$unit" != *@.service ]] && systemctl is-active --quiet "$unit"; then
       echo "Refusing to enable the PostgreSQL platform while replaced unit is active: $unit" >&2
       exit 1
     fi

@@ -309,10 +309,13 @@ def test_installed_database_service_users_can_run_one_real_service_cycle() -> No
         assert url.database
         assert url.database.casefold() not in {"trading_platform", production_database}, domain
         assert url.username
-        host = (url.host or "").casefold()
-        if host in {"localhost", "127.0.0.1", "::1"}:
-            host = "loopback"
-        target_identities.add((host, url.port or 5432, url.database.casefold()))
+        target_identities.add(
+            (
+                url.host or url.query.get("host", ""),
+                url.port or url.query.get("port", "5432"),
+                url.database,
+            )
+        )
         logins.add(url.username)
     assert len(target_identities) == 1
     assert len(logins) == 3
