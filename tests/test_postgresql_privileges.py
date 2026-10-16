@@ -520,16 +520,18 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
         with ThreadPoolExecutor(max_workers=2) as pool:
             publications = [
                 pool.submit(
-                    store.save_market_input,
-                    pinned_payload,
-                    created_at=observed_at,
+                    store.save_market_inputs,
+                    (
+                        (pinned_payload, observed_at),
+                        ({**pinned_payload, "values": {"price": 102}}, observed_at),
+                    ),
                     retention_at=observed_at,
                 )
                 for _ in range(2)
             ]
             identities = {publication.result() for publication in publications}
         assert len(identities) == 1
-        pinned_id = identities.pop()
+        pinned_id, batch_peer_id = identities.pop()
         assert (
             store.save_market_input(
                 pinned_payload, created_at=observed_at, retention_at=observed_at
@@ -550,6 +552,8 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
         assert store.get(pinned_id) == pinned_payload
         with pytest.raises(KeyError):
             store.get(transient_id)
+        with pytest.raises(KeyError):
+            store.get(batch_peer_id)
     finally:
         runtime.dispose()
         cleanup = create_engine(os.environ["TRADING_PLATFORM_DATABASE_URL"])

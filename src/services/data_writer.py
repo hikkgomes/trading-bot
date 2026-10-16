@@ -295,13 +295,7 @@ class DatabaseMarketDataWriter:
                         previous_sequence=previous_sequence,
                     )
                 )
-        snapshot_ids = [
-            snapshot_id
-            for event, _venue, market, _symbol in events
-            for snapshot_id in self._publish_market_snapshots(
-                event=event, market=market, retention_at=now
-            )
-        ]
+        snapshot_ids = self._publish_batch_market_snapshots(events, now=now)
         archivable_events = tuple(
             (event, venue, market, symbol)
             for event, venue, market, symbol in events
@@ -492,6 +486,32 @@ class DatabaseMarketDataWriter:
             "paths": paths,
             "bar_paths": [str(path) for path in bar_paths],
         }
+
+    def _publish_batch_market_snapshots(self, events, *, now: str) -> list[str]:
+        buffered: list[tuple[dict[str, object], str]] = []
+        immutable: list[str] = []
+        for event, _venue, market, _symbol in events:
+            if not _requires_market_input_buffer(event):
+                immutable.extend(self._publish_market_snapshots(event=event, market=market))
+                continue
+            products = self.product_ids_by_market.get(market, ())
+            if self.snapshot_store is None:
+                if products:
+                    raise RuntimeError("high-rate market input requires the recent snapshot buffer")
+                continue
+            if not products:
+                raise RuntimeError(
+                    "high-rate market input has no product scope for snapshot storage"
+                )
+            values = _market_snapshot_values(event) or {}
+            buffered.extend(
+                (_market_snapshot_payload(event, product_id, values), event.availability_timestamp)
+                for product_id in products
+            )
+        if buffered:
+            assert self.snapshot_store is not None
+            immutable.extend(self.snapshot_store.save_market_inputs(buffered, retention_at=now))
+        return immutable
 
     def _publish_market_snapshots(
         self, *, event: MarketEvent, market: str, retention_at: str | None = None

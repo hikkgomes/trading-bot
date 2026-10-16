@@ -73,6 +73,29 @@ def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path) -
     assert store.get(identities[-1]) == payloads[-1]
     with pytest.raises(KeyError, match="risk snapshot does not exist"):
         store.get(identities[-2])
+    bulk = store.save_market_inputs(
+        (
+            (payloads[-1], (start + dt.timedelta(minutes=20)).isoformat()),
+            (payloads[-2], (start + dt.timedelta(minutes=19)).isoformat()),
+            (latest_payload, later.isoformat()),
+            (latest_payload, later.isoformat()),
+        ),
+        retention_at=later.isoformat(),
+    )
+    assert bulk == (identities[-1], identities[-2], latest_id, latest_id)
+    assert store.get(bulk[0]) == payloads[-1]
+    with pytest.raises(KeyError):
+        store.get(bulk[1])
+    with database.engine.connect() as connection:
+        assert set(connection.execute(select(market_input_buffer.c.id)).scalars()) == {latest_id}
+    with pytest.raises(ValueError, match="content or timestamp"):
+        store.save_market_inputs(
+            (
+                (latest_payload, later.isoformat()),
+                (latest_payload, (later + dt.timedelta(seconds=1)).isoformat()),
+            ),
+            retention_at=later.isoformat(),
+        )
     database.dispose()
 
 

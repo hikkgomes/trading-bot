@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -256,64 +257,81 @@ class SqlRiskSnapshotStore:
         created_at: str,
         retention_at: str | None = None,
     ) -> str:
-        clean, event_type, product_id, instrument_id = self._prepare_market_input(payload)
-        snapshot_id = canonical_hash(clean)
-        created_at = timestamp(created_at, field="created_at")
+        return self.save_market_inputs(((payload, created_at),), retention_at=retention_at)[0]
+
+    def save_market_inputs(
+        self,
+        inputs: Iterable[tuple[dict[str, object], str]],
+        *,
+        retention_at: str | None = None,
+    ) -> tuple[str, ...]:
         retained_at = timestamp(
             retention_at or dt.datetime.now(dt.UTC).isoformat(), field="retention_at"
         )
         cutoff = (dt.datetime.fromisoformat(retained_at) - _MARKET_INPUT_RETENTION).isoformat()
+        identities, rows = self._market_input_rows(inputs, cutoff)
         with self.engine.begin() as connection:
-            self._lock_identity(connection, snapshot_id)
-            existing = connection.execute(
-                select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
-            ).scalar_one_or_none()
-            if existing is not None:
-                if dict(existing) != clean:
-                    raise ValueError("risk snapshot content-hash collision")
-                connection.execute(
-                    delete(market_input_buffer_table).where(
-                        market_input_buffer_table.c.id == snapshot_id
-                    )
-                )
-                self._expire_unpinned_market_inputs(connection, cutoff)
-                return snapshot_id
-            buffered = connection.execute(
-                select(market_input_buffer_table.c.payload).where(
-                    market_input_buffer_table.c.id == snapshot_id
-                )
-            ).scalar_one_or_none()
-            if buffered is not None:
-                if dict(buffered) != clean:
-                    raise ValueError("market input content-hash collision")
-            else:
-                existing = connection.execute(
-                    select(risk_snapshot_table.c.payload).where(
-                        risk_snapshot_table.c.id == snapshot_id
-                    )
-                ).scalar_one_or_none()
-                if existing is not None:
-                    if dict(existing) != clean:
-                        raise ValueError("risk snapshot content-hash collision")
-                    connection.execute(
-                        delete(market_input_buffer_table).where(
-                            market_input_buffer_table.c.id == snapshot_id
-                        )
-                    )
-                    self._expire_unpinned_market_inputs(connection, cutoff)
-                    return snapshot_id
-                connection.execute(
-                    insert(market_input_buffer_table).values(
-                        id=snapshot_id,
-                        product_id=product_id,
-                        instrument_id=instrument_id,
-                        event_type=event_type,
-                        created_at=created_at,
-                        payload=clean,
-                    )
-                )
+            if rows:
+                for identity in sorted(rows):
+                    self._lock_identity(connection, identity)
+                self._store_market_input_rows(connection, rows)
             self._expire_unpinned_market_inputs(connection, cutoff)
-        return snapshot_id
+        return identities
+
+    def _market_input_rows(self, inputs, cutoff):
+        identities, rows = [], {}
+        for payload, created_at in inputs:
+            clean, event_type, product_id, instrument_id = self._prepare_market_input(payload)
+            identity = canonical_hash(clean)
+            observed = timestamp(created_at, field="created_at")
+            identities.append(identity)
+            # Expired quotes cannot authorise a current decision. Immutable pins
+            # already survive independently, so replay need not write then delete.
+            if observed < cutoff:
+                continue
+            row = {
+                "id": identity,
+                "product_id": product_id,
+                "instrument_id": instrument_id,
+                "event_type": event_type,
+                "created_at": observed,
+                "payload": clean,
+            }
+            if identity in rows and rows[identity] != row:
+                raise ValueError("market input identity has conflicting content or timestamp")
+            rows[identity] = row
+        return tuple(identities), rows
+
+    @staticmethod
+    def _store_market_input_rows(connection, rows):
+        pinned = dict(
+            connection.execute(
+                select(risk_snapshot_table.c.id, risk_snapshot_table.c.payload).where(
+                    risk_snapshot_table.c.id.in_(rows)
+                )
+            ).all()
+        )
+        buffered = dict(
+            connection.execute(
+                select(market_input_buffer_table.c.id, market_input_buffer_table.c.payload).where(
+                    market_input_buffer_table.c.id.in_(rows)
+                )
+            ).all()
+        )
+        for identity, existing in (*pinned.items(), *buffered.items()):
+            if dict(existing) != rows[identity]["payload"]:
+                raise ValueError("market input content-hash collision")
+        if pinned:
+            connection.execute(
+                delete(market_input_buffer_table).where(market_input_buffer_table.c.id.in_(pinned))
+            )
+        missing = [
+            row
+            for identity, row in rows.items()
+            if identity not in pinned and identity not in buffered
+        ]
+        if missing:
+            connection.execute(insert(market_input_buffer_table), missing)
 
     def expire_market_inputs(self, *, at: str) -> int:
         current = timestamp(at, field="at")
