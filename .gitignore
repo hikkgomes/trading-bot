@@ -8,7 +8,7 @@ dist/
 .ipynb_checkpoints/
 
 # ---- Virtualenvs ----
-.venv/
+.venv
 venv/
 env/
 
