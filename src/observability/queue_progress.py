@@ -1,6 +1,6 @@
 """Aggregate queue history in SQL without loading every job payload into memory."""
 
-from sqlalchemy import case, exists, func, select
+from sqlalchemy import case, func, select
 
 from src.data.database import job, job_attempt
 from src.domain._codec import to_primitive
@@ -133,16 +133,32 @@ def _scheduled_progress(connection):
         if connection.dialect.name == "postgresql"
         else func.substr(suffix, 1, func.instr(suffix, ":") - 1)
     )
-    started = exists(select(job_attempt.c.id).where(job_attempt.c.job_id == job.c.id))
+    scheduled_jobs = (
+        select(job.c.id.label("job_id"), schedule.label("schedule"))
+        .where(job.c.id.startswith("scheduled:"))
+        .cte("scheduled_jobs")
+    )
+    if connection.dialect.name == "postgresql":
+        scheduled_jobs = scheduled_jobs.prefix_with("MATERIALIZED", dialect="postgresql")
+    attempted_jobs = (
+        select(job_attempt.c.job_id.label("job_id"))
+        .join(scheduled_jobs, scheduled_jobs.c.job_id == job_attempt.c.job_id)
+        .distinct()
+        .cte("attempted_scheduled_jobs")
+    )
     rows = (
         connection.execute(
             select(
-                schedule.label("schedule"),
+                scheduled_jobs.c.schedule,
                 func.count().label("scheduled"),
-                func.sum(case((started, 1), else_=0)).label("started"),
+                func.count(attempted_jobs.c.job_id).label("started"),
             )
-            .where(job.c.id.startswith("scheduled:"))
-            .group_by(schedule)
+            .select_from(
+                scheduled_jobs.outerjoin(
+                    attempted_jobs, attempted_jobs.c.job_id == scheduled_jobs.c.job_id
+                )
+            )
+            .group_by(scheduled_jobs.c.schedule)
         )
         .mappings()
         .all()

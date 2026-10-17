@@ -1937,8 +1937,14 @@ def test_dataset_bundle_rejects_missing_and_mismatched_stage_manifests(tmp_path)
 
 
 def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path) -> None:
+    import copy
+
     from src.data.database import universe, universe_snapshot
-    from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+    from src.research.datasets import (
+        CanonicalDatasetResolver,
+        SqlCanonicalDatasetRepository,
+        _decode_canonical_dataset_snapshot,
+    )
 
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'snapshot-corruption.sqlite3'}")
     database.create_schema()
@@ -1971,7 +1977,10 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
     bundle = CanonicalResearchDatasetBuilder(database.engine).build(
         "active_income",
         intervals=intervals,
-        payload_by_role={role: {"bars": [{"close": 100.0}]} for role in CORE_RESEARCH_BUNDLE_ROLES},
+        payload_by_role={
+            role: {"bars": [{"close": 100.0}], "event_replay": {"events": [1]}}
+            for role in CORE_RESEARCH_BUNDLE_ROLES
+        },
         universe_snapshot_id=identity,
         feature_manifest_id=identity,
         cost_model_id=identity,
@@ -1983,22 +1992,112 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
     repository = SqlDatasetBundleRepository(database.engine)
     assert repository.get(bundle.bundle_id) == bundle
     snapshot_id = bundle.stage_snapshot_ids["development"]
-    with database.engine.begin() as connection:
-        payload = connection.execute(
+    with database.engine.connect() as connection:
+        stored = connection.execute(
             select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
         ).scalar_one()
-        payload["payload"]["bars"][0]["close"] = 101.0
+    assert stored["payload_encoding"] == "canonical-json-gzip/v1"
+    logical_snapshot = _decode_canonical_dataset_snapshot(stored)
+    assert logical_snapshot["payload"] == {
+        "bars": [{"close": 100.0}],
+        "event_replay": {"events": [1]},
+    }
+    assert _decode_canonical_dataset_snapshot(stored) == logical_snapshot
+    resolver = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+    resolved = resolver.resolve(snapshot_id, expected={})
+    assert resolved.payload == {
+        "bars": [{"close": 100.0}],
+        "event_replay": {"events": [1]},
+    }
+    assert resolved.content_hash == canonical_hash(resolved.payload)
+    scheduler = PlatformScheduler(engine=database.engine, products={}, node_id="fixture")
+    assert (
+        scheduler._candidate_snapshot((snapshot_id,), required_payload="event_replay")[0]
+        == snapshot_id
+    )
+    assert scheduler._candidate_snapshot((snapshot_id,), required_payload="ml_rows")[0] is None
+    with database.engine.begin() as connection:
         connection.execute(
-            update(dataset_snapshot)
-            .where(dataset_snapshot.c.id == snapshot_id)
-            .values(payload=payload)
+            dataset_snapshot.insert().values(
+                id="legacy-inline-snapshot",
+                created_at=NOW,
+                payload={
+                    "snapshot_id": "legacy-inline-snapshot",
+                    "role": "development",
+                    "payload": {"event_replay": {"events": [1]}},
+                },
+            )
         )
+    assert (
+        scheduler._candidate_snapshot(("legacy-inline-snapshot",), required_payload="event_replay")[
+            0
+        ]
+        == "legacy-inline-snapshot"
+    )
+
+    collision_payload = {
+        "snapshot_id": snapshot_id,
+        "product_id": resolved.product_id,
+        "role": resolved.role,
+        "content_hash": resolved.content_hash,
+        "interval": dict(resolved.interval),
+        "universe_snapshot_id": resolved.universe_snapshot_id,
+        "availability_timestamp": resolved.availability_timestamp,
+        "feature_manifest_id": resolved.feature_manifest_hash,
+        "cost_model_id": resolved.cost_model_hash,
+        "parameter_set_id": resolved.parameter_set_hash,
+        "engine_version": resolved.engine_version,
+        "instrument_scope": list(resolved.instrument_scope),
+        "payload": {
+            "bars": [{"close": 101.0}],
+            "event_replay": {"events": [1]},
+        },
+    }
+    with database.engine.begin() as connection:
+        with pytest.raises(DatasetResolutionError, match="immutable dataset identity collision"):
+            CanonicalResearchDatasetBuilder._insert_immutable(
+                connection,
+                dataset_snapshot,
+                {
+                    "id": snapshot_id,
+                    "created_at": NOW,
+                    "payload": collision_payload,
+                },
+            )
+
+    for mutate in (
+        lambda storage: storage.__setitem__("data", storage["data"][:-8]),
+        lambda storage: storage.__setitem__("uncompressed_bytes", 2 * 1024 * 1024 * 1024 + 1),
+    ):
+        corrupted = copy.deepcopy(stored)
+        storage = corrupted["payload"][corrupted["payload_storage_key"]]
+        mutate(storage)
+        with database.engine.begin() as connection:
+            connection.execute(
+                update(dataset_snapshot)
+                .where(dataset_snapshot.c.id == snapshot_id)
+                .values(payload=corrupted)
+            )
+        with pytest.raises(DatasetResolutionError, match="compressed dataset snapshot"):
+            resolver.resolve(snapshot_id, expected={})
+        with database.engine.begin() as connection:
+            connection.execute(
+                update(dataset_snapshot)
+                .where(dataset_snapshot.c.id == snapshot_id)
+                .values(payload=stored)
+            )
 
     assert repository.get(bundle.bundle_id) == bundle
     with pytest.raises(DatasetResolutionError, match="content hash verification failed"):
-        CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine)).resolve(
-            snapshot_id, expected={}
-        )
+        corrupt_hash = copy.deepcopy(stored)
+        corrupt_hash["content_hash"] = canonical_hash({"bars": [{"close": 101.0}]})
+        with database.engine.begin() as connection:
+            connection.execute(
+                update(dataset_snapshot)
+                .where(dataset_snapshot.c.id == snapshot_id)
+                .values(payload=corrupt_hash)
+            )
+        resolver.resolve(snapshot_id, expected={})
     database.dispose()
 
 
@@ -2119,14 +2218,15 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
     assert all(len(call.kwargs["intervals"]) == 1 for call in role_payload_builder.call_args_list)
     bundle = SqlDatasetBundleRepository(database.engine).get(str(result.bundle_id))
     assert set(bundle.stage_snapshot_ids) == set(CORE_RESEARCH_BUNDLE_ROLES)
-    with database.engine.connect() as connection:
-        snapshot_payload = connection.execute(
-            select(dataset_snapshot.c.payload).where(
-                dataset_snapshot.c.id == bundle.stage_snapshot_ids["screening"]
-            )
-        ).scalar_one()
-    assert snapshot_payload["payload"]["market_frame"]
-    assert snapshot_payload["payload"]["point_in_time_universe"] is not fixed_scope
+    from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+
+    snapshot_payload = (
+        CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+        .resolve(bundle.stage_snapshot_ids["screening"], expected={})
+        .payload
+    )
+    assert snapshot_payload["market_frame"]
+    assert snapshot_payload["point_in_time_universe"] is not fixed_scope
 
     forward = DatabaseDatasetBundleService(database.engine, root, timeframe="1d").run_forward(
         product_id="btc_accumulation",
@@ -2294,15 +2394,15 @@ def test_dataset_service_keeps_delisted_symbols_in_their_historical_roles(tmp_pa
 
     assert result.state == "ready"
     bundle = SqlDatasetBundleRepository(database.engine).get(str(result.bundle_id))
-    with database.engine.connect() as connection:
-        payloads = {
-            role: connection.execute(
-                select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
-            ).scalar_one()
-            for role, snapshot_id in bundle.stage_snapshot_ids.items()
-        }
-    screening_rows = payloads["screening"]["payload"]["market_frame"]
-    robustness_rows = payloads["robustness"]["payload"]["market_frame"]
+    from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+
+    resolver = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+    screening_rows = resolver.resolve(bundle.stage_snapshot_ids["screening"], expected={}).payload[
+        "market_frame"
+    ]
+    robustness_rows = resolver.resolve(
+        bundle.stage_snapshot_ids["robustness"], expected={}
+    ).payload["market_frame"]
     assert any(row["instrument_id"] == eth.instrument_id for row in screening_rows)
     assert all(row["instrument_id"] != eth.instrument_id for row in robustness_rows)
 

@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
+import gzip
+import io
+import json
 import math
+import zlib
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -20,6 +26,247 @@ from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 
 class DatasetResolutionError(RuntimeError):
     pass
+
+
+_CANONICAL_PAYLOAD_ENCODING = "canonical-json-gzip/v1"
+_CANONICAL_STORAGE_KEY = "__canonical_dataset_storage_v1__"
+_CANONICAL_FLAG_FIELDS = ("synthetic", "diagnostic", "promotable")
+_MAX_CANONICAL_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_CANONICAL_PAYLOAD_BASE64_BYTES = 240 * 1024 * 1024
+
+
+class _Base64TextWriter:
+    def __init__(self, output: io.StringIO) -> None:
+        self.output = output
+        self.pending = b""
+        self.encoded_bytes = 0
+
+    def write(self, chunk: bytes) -> int:
+        combined = self.pending + chunk
+        complete = len(combined) - len(combined) % 3
+        if complete:
+            encoded = base64.b64encode(combined[:complete])
+            self._write(encoded)
+        self.pending = combined[complete:]
+        return len(chunk)
+
+    def flush(self) -> None:
+        self.output.flush()
+
+    def finish(self) -> None:
+        if self.pending:
+            self._write(base64.b64encode(self.pending))
+            self.pending = b""
+
+    def _write(self, encoded: bytes) -> None:
+        size = self.encoded_bytes + len(encoded)
+        if size > _MAX_CANONICAL_PAYLOAD_BASE64_BYTES:
+            raise DatasetResolutionError(
+                "compressed dataset payload exceeds the PostgreSQL JSONB storage limit"
+            )
+        self.output.write(encoded.decode("ascii"))
+        self.encoded_bytes = size
+
+
+def _compress_canonical_dataset(data: Any) -> tuple[str, int]:
+    output = io.StringIO()
+    writer = _Base64TextWriter(output)
+    encoder = json.JSONEncoder(
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    uncompressed_bytes = 0
+    try:
+        with gzip.GzipFile(
+            fileobj=writer,
+            mode="wb",
+            filename="",
+            mtime=0,
+            compresslevel=6,
+        ) as compressed:
+            buffered = bytearray()
+            for chunk in encoder.iterencode(data):
+                encoded = chunk.encode("utf-8")
+                uncompressed_bytes += len(encoded)
+                if uncompressed_bytes > _MAX_CANONICAL_PAYLOAD_BYTES:
+                    raise DatasetResolutionError(
+                        "canonical dataset payload exceeds the bounded storage size"
+                    )
+                offset = 0
+                while offset < len(encoded):
+                    take = min(64 * 1024 - len(buffered), len(encoded) - offset)
+                    buffered.extend(encoded[offset : offset + take])
+                    offset += take
+                    if len(buffered) == 64 * 1024:
+                        compressed.write(buffered)
+                        buffered.clear()
+            if buffered:
+                compressed.write(buffered)
+        writer.finish()
+    except (TypeError, ValueError, OSError, zlib.error) as exc:
+        if isinstance(exc, DatasetResolutionError):
+            raise
+        raise DatasetResolutionError("canonical dataset payload could not be compressed") from exc
+    return output.getvalue(), uncompressed_bytes
+
+
+def _encode_canonical_dataset_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
+    logical_data = payload.get("payload")
+    encoded_data, uncompressed_bytes = _compress_canonical_dataset(logical_data)
+    data_keys = set(logical_data) if isinstance(logical_data, Mapping) else set()
+    wrapper: dict[str, Any] = {
+        "payload_keys": sorted(logical_data) if isinstance(logical_data, Mapping) else []
+    }
+    if isinstance(logical_data, Mapping):
+        for field in _CANONICAL_FLAG_FIELDS:
+            value = logical_data.get(field)
+            if isinstance(value, bool):
+                wrapper[field] = value
+    storage_key = _CANONICAL_STORAGE_KEY
+    while storage_key in wrapper or storage_key in data_keys:
+        storage_key += "_"
+    wrapper[storage_key] = {
+        "encoding": "gzip-base64/v1",
+        "uncompressed_bytes": uncompressed_bytes,
+        "data": encoded_data,
+    }
+    stored = dict(payload)
+    stored["payload"] = wrapper
+    stored["payload_encoding"] = _CANONICAL_PAYLOAD_ENCODING
+    stored["payload_storage_key"] = storage_key
+    return stored
+
+
+def _canonical_snapshot_storage(payload: Mapping[str, Any]):
+    encoding = payload.get("payload_encoding")
+    if encoding is None:
+        return None
+    if encoding != _CANONICAL_PAYLOAD_ENCODING:
+        raise DatasetResolutionError("dataset snapshot storage encoding is unsupported")
+    wrapper = payload.get("payload")
+    storage_key = payload.get("payload_storage_key")
+    if not isinstance(wrapper, Mapping) or not isinstance(storage_key, str):
+        raise DatasetResolutionError("compressed dataset snapshot envelope is invalid")
+    storage = wrapper.get(storage_key)
+    if (
+        not isinstance(storage, Mapping)
+        or storage.get("encoding") != "gzip-base64/v1"
+        or set(storage) != {"encoding", "uncompressed_bytes", "data"}
+    ):
+        raise DatasetResolutionError("compressed dataset snapshot envelope is invalid")
+    return wrapper, storage_key, storage
+
+
+def _decompress_canonical_json(compressed: bytes, expected_bytes: int) -> bytearray:
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    decoded = bytearray()
+    input_chunk_bytes = 64 * 1024
+    output_chunk_bytes = 1024 * 1024
+    for offset in range(0, len(compressed), input_chunk_bytes):
+        chunk_end = min(len(compressed), offset + input_chunk_bytes)
+        pending = compressed[offset:chunk_end]
+        while pending:
+            chunk = decompressor.decompress(
+                pending,
+                min(output_chunk_bytes, expected_bytes + 1 - len(decoded)),
+            )
+            decoded.extend(chunk)
+            if len(decoded) > expected_bytes:
+                raise DatasetResolutionError(
+                    "decompressed dataset payload exceeds its declared size"
+                )
+            if decompressor.unused_data:
+                raise DatasetResolutionError("compressed dataset snapshot has trailing data")
+            pending = decompressor.unconsumed_tail
+        if decompressor.eof and chunk_end < len(compressed):
+            raise DatasetResolutionError("compressed dataset snapshot has trailing data")
+    if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+        raise DatasetResolutionError(
+            "compressed dataset snapshot is truncated or has trailing data"
+        )
+    decoded.extend(decompressor.flush())
+    return decoded
+
+
+def _decode_canonical_json(storage: Mapping[str, Any]):
+    encoded = storage.get("data")
+    expected_bytes = storage.get("uncompressed_bytes")
+    if (
+        not isinstance(encoded, str)
+        or len(encoded) > _MAX_CANONICAL_PAYLOAD_BASE64_BYTES
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes < 0
+        or expected_bytes > _MAX_CANONICAL_PAYLOAD_BYTES
+    ):
+        raise DatasetResolutionError("compressed dataset snapshot size is invalid")
+    try:
+        encoded_bytes = encoded.encode("ascii")
+        compressed = base64.b64decode(encoded_bytes, validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise DatasetResolutionError("compressed dataset snapshot encoding is invalid") from exc
+    if base64.b64encode(compressed) != encoded_bytes:
+        raise DatasetResolutionError("compressed dataset snapshot encoding is not canonical")
+    del encoded, encoded_bytes
+    try:
+        decoded = _decompress_canonical_json(compressed, expected_bytes)
+    except zlib.error as exc:
+        raise DatasetResolutionError("compressed dataset snapshot is corrupt") from exc
+    del compressed
+    if len(decoded) != expected_bytes or len(decoded) > _MAX_CANONICAL_PAYLOAD_BYTES:
+        raise DatasetResolutionError("compressed dataset snapshot size does not match its envelope")
+    try:
+        decoded_text = decoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DatasetResolutionError("compressed dataset snapshot is not valid JSON") from exc
+    del decoded
+    try:
+        return json.loads(decoded_text)
+    except json.JSONDecodeError as exc:
+        raise DatasetResolutionError("compressed dataset snapshot is not valid JSON") from exc
+
+
+def _validate_compressed_wrapper(
+    logical_data: Any, wrapper: Mapping[str, Any], storage_key: str
+) -> None:
+    data_keys = set(logical_data) if isinstance(logical_data, Mapping) else set()
+    expected_wrapper_keys = {"payload_keys", storage_key}
+    if isinstance(logical_data, Mapping):
+        expected_wrapper_keys.update(
+            field for field in _CANONICAL_FLAG_FIELDS if isinstance(logical_data.get(field), bool)
+        )
+    expected_payload_keys = sorted(logical_data) if isinstance(logical_data, Mapping) else []
+    if (
+        storage_key in data_keys
+        or set(wrapper) != expected_wrapper_keys
+        or wrapper.get("payload_keys") != expected_payload_keys
+    ):
+        raise DatasetResolutionError("compressed dataset snapshot keys do not match its data")
+    if isinstance(logical_data, Mapping):
+        for field in _CANONICAL_FLAG_FIELDS:
+            expected_flag = (
+                logical_data[field] if isinstance(logical_data.get(field), bool) else None
+            )
+            if field in data_keys and wrapper.get(field) is not expected_flag:
+                raise DatasetResolutionError(
+                    "compressed dataset snapshot flags do not match its data"
+                )
+
+
+def _decode_canonical_dataset_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
+    storage_info = _canonical_snapshot_storage(payload)
+    if storage_info is None:
+        return dict(payload)
+    wrapper, storage_key, storage = storage_info
+    logical_data = _decode_canonical_json(storage)
+    _validate_compressed_wrapper(logical_data, wrapper, storage_key)
+    logical_payload = dict(payload)
+    logical_payload.pop("payload_encoding")
+    logical_payload.pop("payload_storage_key")
+    logical_payload["payload"] = logical_data
+    return logical_payload
 
 
 DATASET_ROLES = frozenset(
@@ -1206,9 +1453,37 @@ class CanonicalResearchDatasetBuilder:
             connection.execute(select(table).where(table.c.id == values["id"])).mappings().first()
         )
         if existing is None:
-            connection.execute(insert(table), dict(values))
+            insert_values = dict(values)
+            payload = insert_values.get("payload")
+            required = {
+                "snapshot_id",
+                "product_id",
+                "role",
+                "content_hash",
+                "interval",
+                "universe_snapshot_id",
+                "availability_timestamp",
+                "feature_manifest_id",
+                "cost_model_id",
+                "parameter_set_id",
+                "engine_version",
+                "instrument_scope",
+                "payload",
+            }
+            if (
+                table is dataset_snapshot
+                and isinstance(payload, Mapping)
+                and required.issubset(payload)
+                and payload.get("snapshot_id") == values["id"]
+            ):
+                insert_values["payload"] = _encode_canonical_dataset_snapshot(payload)
+            connection.execute(insert(table), insert_values)
             return
-        if any(existing[key] != value for key, value in values.items()):
+        existing_values = dict(existing)
+        existing_payload = existing_values.get("payload")
+        if table is dataset_snapshot and isinstance(existing_payload, Mapping):
+            existing_values["payload"] = _decode_canonical_dataset_snapshot(existing_payload)
+        if any(existing_values[key] != value for key, value in values.items()):
             raise DatasetResolutionError(f"immutable dataset identity collision: {values['id']}")
 
 
@@ -1738,6 +2013,7 @@ class SqlCanonicalDatasetRepository:
                 )
         if not isinstance(payload, Mapping):
             raise DatasetResolutionError(f"dataset snapshot does not exist: {snapshot_id}")
+        payload = _decode_canonical_dataset_snapshot(payload)
         if (
             universe_row is None
             or canonical_hash(universe_row["payload"]) != universe_row["content_hash"]

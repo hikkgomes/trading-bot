@@ -970,7 +970,9 @@ class PlatformDatabase:
             if url.startswith("postgresql://")
             else url
         )
-        self.engine: Engine = create_engine(self.url, echo=echo, future=True, pool_pre_ping=True)
+        self.engine: Engine = create_engine(
+            self.url, echo=echo, future=True, pool_pre_ping=True, hide_parameters=True
+        )
 
     @property
     def is_postgresql(self) -> bool:

@@ -976,14 +976,19 @@ def test_bounded_two_market_plan_publishes_complete_warmup_and_funding(
     history_start_ms, history_end_ms = plan.acquisition_interval(now)
     history_start = dt.datetime.fromtimestamp(history_start_ms / 1000, dt.UTC).isoformat()
     history_end = dt.datetime.fromtimestamp(history_end_ms / 1000, dt.UTC).isoformat()
-    with database.engine.connect() as connection:
-        snapshots = list(connection.execute(select(dataset_snapshot)).mappings())
+    from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+
+    resolver = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+    snapshots = [
+        resolver.resolve(snapshot_id, expected={})
+        for snapshot_id in bundle.stage_snapshot_ids.values()
+    ]
     stage_intervals = {}
     total_events = 0
     for record in snapshots:
-        payload = record["payload"]["payload"]
+        payload = record.payload
         intervals = payload["data_plan"]["intervals"]
-        stage_intervals[record["payload"]["role"]] = intervals
+        stage_intervals[record.role] = intervals
         assert payload["data_plan_id"] == plan.plan_id
         assert len(intervals) == 4
         assert max(interval["end"] for interval in intervals.values()) == history_end
@@ -999,7 +1004,7 @@ def test_bounded_two_market_plan_publishes_complete_warmup_and_funding(
         assert {row["instrument_id"] for row in payload["market_frame"]} == {
             i.instrument_id for i in instruments
         }
-        assert record["payload"]["availability_timestamp"] == build_at
+        assert record.availability_timestamp == build_at
         for bar in (*payload["market_frame"], *payload["warmup_market_frame"]):
             assert history_start <= bar["close_timestamp"] < history_end
         assert all(
@@ -1007,7 +1012,7 @@ def test_bounded_two_market_plan_publishes_complete_warmup_and_funding(
             for bar in (*payload["market_frame"], *payload["warmup_market_frame"])
         )
         assert all(
-            row["close_timestamp"] < record["payload"]["interval"]["start"]
+            row["close_timestamp"] < record.interval["start"]
             for row in payload["warmup_market_frame"]
         )
         total_events += sum(len(row["funding_events"]) for row in payload["market_frame"])
@@ -1027,15 +1032,11 @@ def test_bounded_two_market_plan_publishes_complete_warmup_and_funding(
     assert retried.bundle_id == bundle.bundle_id
     retry_bundle = SqlDatasetBundleRepository(database.engine).get(retried.bundle_id)
     assert retry_bundle.created_at == build_at
-    with database.engine.connect() as connection:
-        retry_snapshots = list(
-            connection.execute(
-                select(dataset_snapshot).where(dataset_snapshot.c.id.in_(retried.snapshot_ids))
-            ).mappings()
-        )
+    retry_snapshots = [
+        resolver.resolve(snapshot_id, expected={}) for snapshot_id in retried.snapshot_ids
+    ]
     assert {
-        row["payload"]["role"]: row["payload"]["payload"]["data_plan"]["intervals"]
-        for row in retry_snapshots
+        row.role: row.payload["data_plan"]["intervals"] for row in retry_snapshots
     } == stage_intervals
     database.dispose()
 

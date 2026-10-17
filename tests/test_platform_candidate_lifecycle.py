@@ -199,7 +199,6 @@ def test_scheduler_quarantines_nonpromotable_diagnostics_but_keeps_explicit_work
     from sqlalchemy import insert, update
 
     from src.data.database import (
-        dataset_snapshot,
         experiment,
         job,
         job_quarantine,
@@ -238,10 +237,16 @@ def test_scheduler_quarantines_nonpromotable_diagnostics_but_keeps_explicit_work
     )
     assert stored.metadata.get("diagnostic") is True
     snapshot_id = bundle.stage_snapshot_ids["screening"]
-    with database.engine.connect() as connection:
-        snapshot_payload = connection.execute(
-            select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
-        ).scalar_one()
+    resolved_snapshot = CanonicalDatasetResolver(
+        SqlCanonicalDatasetRepository(database.engine)
+    ).resolve(snapshot_id, expected={})
+    snapshot_payload = {
+        "role": resolved_snapshot.role,
+        "feature_manifest_id": resolved_snapshot.feature_manifest_hash,
+        "cost_model_id": resolved_snapshot.cost_model_hash,
+        "parameter_set_id": resolved_snapshot.parameter_set_hash,
+        "availability_timestamp": resolved_snapshot.availability_timestamp,
+    }
     scheduler = PlatformScheduler(
         engine=database.engine,
         products={"active_income": {"product_id": "active_income"}},

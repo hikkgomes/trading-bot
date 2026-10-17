@@ -8,19 +8,23 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert
 
 from src.data.database import (
     PlatformDatabase,
     cost_model_manifest,
-    dataset_snapshot,
     feature_manifest,
 )
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
 from src.domain._codec import canonical_hash
 from src.domain.instruments import Instrument, MarketType
 from src.research.dataset_service import DatabaseDatasetBundleService
-from src.research.datasets import CORE_RESEARCH_BUNDLE_ROLES, SqlDatasetBundleRepository
+from src.research.datasets import (
+    CORE_RESEARCH_BUNDLE_ROLES,
+    CanonicalDatasetResolver,
+    SqlCanonicalDatasetRepository,
+    SqlDatasetBundleRepository,
+)
 
 
 @pytest.mark.skipif(
@@ -150,13 +154,12 @@ def test_platform_postgres_builds_idempotent_bundle_from_real_parquet(tmp_path: 
         assert first.bundle_id is not None
         bundle = SqlDatasetBundleRepository(database.engine).get(first.bundle_id)
         assert set(bundle.stage_snapshot_ids) == set(CORE_RESEARCH_BUNDLE_ROLES)
-        with database.engine.connect() as connection:
-            payload = connection.execute(
-                select(dataset_snapshot.c.payload).where(
-                    dataset_snapshot.c.id == bundle.stage_snapshot_ids["development"]
-                )
-            ).scalar_one()
-        assert payload["payload"]["market_frame"]
-        assert payload["payload"]["data_quality"]["rows"] > 0
+        payload = (
+            CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+            .resolve(bundle.stage_snapshot_ids["development"], expected={})
+            .payload
+        )
+        assert payload["market_frame"]
+        assert payload["data_quality"]["rows"] > 0
     finally:
         database.dispose()

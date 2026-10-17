@@ -808,10 +808,18 @@ class PlatformScheduler:
                 if role is not None and str(payload.get("role") or "unspecified") != role:
                     continue
                 data = payload.get("payload")
-                if required_payload is not None and (
-                    not isinstance(data, Mapping) or required_payload not in data
-                ):
-                    continue
+                if required_payload is not None:
+                    if payload.get("payload_encoding") == "canonical-json-gzip/v1":
+                        available_keys = (
+                            data.get("payload_keys") if isinstance(data, Mapping) else None
+                        )
+                        if (
+                            not isinstance(available_keys, list | tuple)
+                            or required_payload not in available_keys
+                        ):
+                            continue
+                    elif not isinstance(data, Mapping) or required_payload not in data:
+                        continue
                 return str(row["id"]), payload
         return None, None
 

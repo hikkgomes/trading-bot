@@ -903,6 +903,44 @@ def test_adaptive_roles_cannot_read_protected_data_or_legacy_holdout_metrics(pha
         "protected": ids["protected_holdout"],
         "forward": ids["forward_observation"],
     }
+    from src.research.datasets import CORE_RESEARCH_BUNDLE_ROLES, CanonicalResearchDatasetBuilder
+
+    canonical_start = dt.datetime(2026, 8, 25, tzinfo=dt.UTC)
+    canonical_intervals = {
+        role: {
+            "start": (canonical_start + dt.timedelta(days=index)).isoformat(),
+            "end": (canonical_start + dt.timedelta(days=index + 1)).isoformat(),
+        }
+        for index, role in enumerate(CORE_RESEARCH_BUNDLE_ROLES)
+    }
+    compressed_bundle = CanonicalResearchDatasetBuilder(engine).build(
+        "active_income",
+        intervals=canonical_intervals,
+        payload_by_role={
+            role: {
+                "rows": [123],
+                "raw_marker": "COMPRESSED_RAW_STAGE_SENTINEL",
+                **(
+                    {"synthetic": True}
+                    if role == "screening"
+                    else {"synthetic": "true", "diagnostic": "true", "promotable": "false"}
+                    if role == "development"
+                    else {"diagnostic": True}
+                    if role == "robustness"
+                    else {"promotable": False}
+                ),
+            }
+            for role in CORE_RESEARCH_BUNDLE_ROLES
+        },
+        universe_snapshot_id=universe_id,
+        feature_manifest_id=feature_id,
+        cost_model_id=cost_id,
+        parameter_set_id=parameter_id,
+        instrument_scope=tuple(scope),
+        availability_timestamp="2026-08-30T10:00:00+00:00",
+        created_at="2026-08-30T10:00:00+00:00",
+        engine_version="compressed-privilege-test/v1",
+    )
     query = (
         "SELECT * FROM dataset_snapshot_manifest WHERE snapshot_id IN "
         "(:screening, :development, :robustness, :protected, :forward) ORDER BY role"
@@ -933,6 +971,54 @@ def test_adaptive_roles_cannot_read_protected_data_or_legacy_holdout_metrics(pha
         )
         == []
     )
+    compressed_development = compressed_bundle.stage_snapshot_ids["development"]
+    compressed_protected = compressed_bundle.stage_snapshot_ids["protected_holdout"]
+    assert (
+        _as_role(
+            "trading_research",
+            "SELECT payload FROM dataset_snapshot WHERE id=:id",
+            {"id": compressed_protected},
+        )
+        == []
+    )
+    compressed_ids = dict(compressed_bundle.stage_snapshot_ids)
+    compressed_manifest_rows = _as_role(
+        "trading_research",
+        "SELECT role, non_promotable FROM dataset_snapshot_manifest "
+        "WHERE snapshot_id IN (:screening, :development, :robustness, :protected)",
+        {
+            "screening": compressed_ids["screening"],
+            "development": compressed_ids["development"],
+            "robustness": compressed_ids["robustness"],
+            "protected": compressed_ids["protected_holdout"],
+        },
+    )
+    assert dict(compressed_manifest_rows) == {
+        "screening": True,
+        "development": False,
+        "robustness": True,
+        "protected_holdout": True,
+    }
+    evaluator_reader = create_engine(
+        os.environ["TRADING_PLATFORM_DATABASE_URL"],
+        connect_args={"options": "-c role=trading_evaluator"},
+    )
+    try:
+        compressed_resolved = CanonicalDatasetResolver(
+            SqlCanonicalDatasetRepository(evaluator_reader)
+        ).resolve(
+            compressed_development,
+            expected={"product_id": "active_income", "role": "development"},
+        )
+        assert compressed_resolved.payload == {
+            "rows": [123],
+            "raw_marker": "COMPRESSED_RAW_STAGE_SENTINEL",
+            "synthetic": "true",
+            "diagnostic": "true",
+            "promotable": "false",
+        }
+    finally:
+        evaluator_reader.dispose()
     public_payload = _as_role(
         "trading_research",
         "SELECT payload FROM dataset_snapshot WHERE id=:id",

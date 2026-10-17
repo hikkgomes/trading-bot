@@ -10,6 +10,29 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_database_errors_do_not_format_or_expose_large_payloads():
+    from sqlalchemy import JSON, Column, MetaData, String, Table, insert
+    from sqlalchemy.exc import IntegrityError
+
+    from src.data.database import PlatformDatabase
+
+    database = PlatformDatabase("sqlite+pysqlite:///:memory:")
+    records = Table(
+        "error_privacy", MetaData(), Column("id", String, primary_key=True), Column("payload", JSON)
+    )
+    records.create(database.engine)
+    secret = "private-payload-sentinel-" * 100_000
+    with database.engine.begin() as connection:
+        connection.execute(insert(records), {"id": "duplicate", "payload": {}})
+    with pytest.raises(IntegrityError) as error, database.engine.begin() as connection:
+        connection.execute(insert(records), {"id": "duplicate", "payload": {"data": secret}})
+    message = str(error.value)
+    assert "UNIQUE constraint failed" in message
+    assert "private-payload-sentinel" not in message
+    assert len(message) < 1_000
+    database.dispose()
+
+
 def test_service_drains_completed_jobs_and_polls_live_inputs_without_cycle_barrier():
     from unittest.mock import Mock, call
 

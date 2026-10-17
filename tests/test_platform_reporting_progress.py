@@ -603,31 +603,83 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
             )
         )
         connection.execute(
-            insert(job).values(
-                id="scheduled:research:1",
-                name="research",
-                state="completed",
-                priority=0,
-                available_at=NOW,
-                attempts=1,
-                max_attempts=3,
-                terminal_reason=None,
-                producer_identity="platform-scheduler:test",
-                content_hash="sha256:" + "1" * 64,
-                payload={"candidate_id": "candidate-1"},
-            )
+            insert(job),
+            [
+                {
+                    "id": "scheduled:research:1",
+                    "name": "research",
+                    "state": "completed",
+                    "priority": 0,
+                    "available_at": NOW,
+                    "attempts": 1,
+                    "max_attempts": 3,
+                    "terminal_reason": None,
+                    "producer_identity": "platform-scheduler:test",
+                    "content_hash": "sha256:" + "1" * 64,
+                    "payload": {"candidate_id": "candidate-1"},
+                },
+                {
+                    "id": "scheduled:research:2",
+                    "name": "research",
+                    "state": "pending",
+                    "priority": 0,
+                    "available_at": NOW,
+                    "attempts": 0,
+                    "max_attempts": 3,
+                    "terminal_reason": None,
+                    "producer_identity": "platform-scheduler:test",
+                    "content_hash": "sha256:" + "2" * 64,
+                    "payload": {"candidate_id": "candidate-2"},
+                },
+                {
+                    "id": "scheduled:risk:1",
+                    "name": "risk",
+                    "state": "pending",
+                    "priority": 0,
+                    "available_at": NOW,
+                    "attempts": 0,
+                    "max_attempts": 3,
+                    "terminal_reason": None,
+                    "producer_identity": "platform-scheduler:test",
+                    "content_hash": "sha256:" + "3" * 64,
+                    "payload": {},
+                },
+            ],
         )
         connection.execute(
-            insert(job_attempt).values(
-                id="scheduled:research:1:1",
-                job_id="scheduled:research:1",
-                worker_id="worker",
-                started_at=NOW,
-                completed_at=NOW,
-                status="completed",
-                error=None,
-                payload={},
-            )
+            insert(job_attempt),
+            [
+                {
+                    "id": "scheduled:research:1:1",
+                    "job_id": "scheduled:research:1",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "completed",
+                    "error": None,
+                    "payload": {},
+                },
+                {
+                    "id": "scheduled:research:2:1",
+                    "job_id": "scheduled:research:2",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "deferred",
+                    "error": "temporary database load",
+                    "payload": {"outcome_category": "blocked_infrastructure"},
+                },
+                {
+                    "id": "scheduled:research:2:2",
+                    "job_id": "scheduled:research:2",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "deferred",
+                    "error": "temporary database load",
+                    "payload": {"outcome_category": "blocked_infrastructure"},
+                },
+            ],
         )
         connection.execute(
             insert(account_snapshot).values(
@@ -670,10 +722,13 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
     funnel = report["research"]["funnel"]
     slis = report["operations"]["slis"]
     assert funnel["scheduled_versus_started_jobs"] == {
-        "scheduled": 1,
-        "started": 1,
-        "not_started": 0,
-        "by_schedule": {"research": {"scheduled": 1, "started": 1}},
+        "scheduled": 3,
+        "started": 2,
+        "not_started": 1,
+        "by_schedule": {
+            "research": {"scheduled": 2, "started": 2},
+            "risk": {"scheduled": 1, "started": 0},
+        },
     }
     assert slis["unresolved_recovery_count"] == 1
     assert slis["stale_account_authority"]["count"] == 1
