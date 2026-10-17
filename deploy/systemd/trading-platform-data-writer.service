@@ -19,6 +19,7 @@ Environment=OPENBLAS_NUM_THREADS=2
 ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process data-writer --validate
 ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process data-writer
 Restart=always
+TimeoutStartSec=300
 RestartSec=5
 TimeoutStopSec=45
 KillSignal=SIGINT

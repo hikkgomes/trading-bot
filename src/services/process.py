@@ -20,29 +20,8 @@ from src.services.config import (
     load_platform_config,
     load_split_configuration,
 )
-from src.services.control_api import DatabaseControlPlane
 from src.services.health import DatabaseHeartbeatStore
 from src.services.runtime import ServiceRuntime
-from src.services.supervisor import (
-    _account_reconciliation_cycle,
-    _accounting_cycle,
-    _agent_cycle,
-    _data_writer_cycle,
-    _execution_cycle,
-    _feature_cycle,
-    _market_gateway_cycle,
-    _paper_cycle,
-    _platform_scheduler_cycle,
-    _portfolio_cycle,
-    _portfolio_state_cycle,
-    _product_coordination_cycle,
-    _promotion_cycle,
-    _report_cycle,
-    _research_cycle,
-    _risk_cycle,
-    _strategy_evaluator_cycle,
-    _universe_cycle,
-)
 
 PROCESS_SERVICES = {
     process: services
@@ -69,6 +48,26 @@ def _build_trading_work(
     alerts: Any,
     selected_services: tuple[str, ...] | None = None,
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
+    from src.services.control_api import DatabaseControlPlane
+    from src.services.supervisor import (
+        _account_reconciliation_cycle,
+        _accounting_cycle,
+        _data_writer_cycle,
+        _execution_cycle,
+        _feature_cycle,
+        _market_gateway_cycle,
+        _paper_cycle,
+        _platform_scheduler_cycle,
+        _portfolio_cycle,
+        _portfolio_state_cycle,
+        _product_coordination_cycle,
+        _promotion_cycle,
+        _report_cycle,
+        _risk_cycle,
+        _strategy_evaluator_cycle,
+        _universe_cycle,
+    )
+
     selected = set(selected_services or PLATFORM_PROCESS_SERVICES["trading-runtime"])
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     control_plane = DatabaseControlPlane(
@@ -148,6 +147,8 @@ def _build_research_work(
     node_id: str,
     selected_services: tuple[str, ...] | None = None,
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
+    from src.services.supervisor import _feature_cycle, _promotion_cycle, _research_cycle
+
     selected = set(selected_services or PLATFORM_PROCESS_SERVICES["research-runtime"])
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     runtime_by_service = {
@@ -204,6 +205,8 @@ def _build_research_work(
 def _build_agent_coordinator_work(
     *, database: PlatformDatabase, config: Any, configuration: Mapping[str, Any], node_id: str
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
+    from src.services.supervisor import _agent_cycle
+
     runtime = ServiceRuntime(
         config=config,
         node_id=node_id,

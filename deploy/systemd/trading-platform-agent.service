@@ -19,6 +19,7 @@ SupplementaryGroups=trading-model-broker
 ExecStartPre=/opt/trading-bot/.venv-agent/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process agent-runtime --validate
 ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process agent-runtime
 Restart=always
+TimeoutStartSec=300
 RestartSec=10
 TimeoutStopSec=30
 KillSignal=SIGINT

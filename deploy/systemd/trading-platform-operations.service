@@ -17,6 +17,7 @@ Environment=TRADING_EXCHANGE_RATE_LIMIT_DIR=/opt/trading-bot/runtime/exchange-li
 ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations --validate
 ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations
 Restart=always
+TimeoutStartSec=300
 RestartSec=5
 TimeoutStopSec=45
 KillSignal=SIGINT
