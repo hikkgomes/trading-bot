@@ -1567,6 +1567,10 @@ def test_pbo_uses_the_configured_window_count_and_parameter_cohort() -> None:
 
 
 def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(tmp_path) -> None:
+    from unittest.mock import Mock
+
+    from sqlalchemy import func
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'datasets.sqlite3'}")
     database.create_schema()
     identity = "sha256:" + "a" * 64
@@ -1583,7 +1587,10 @@ def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(
                 "end": "2026-08-29T12:00:00+00:00",
             },
         },
-        "payload_by_role": {"screening": {"rows": 1}, "development": {"rows": 2}},
+        "payload_by_role": {
+            "screening": {"rows": 1, "timeframe": "1h", "data_plan_id": identity},
+            "development": {"rows": 2, "timeframe": "1h", "data_plan_id": identity},
+        },
         "universe_snapshot_id": identity,
         "feature_manifest_id": identity,
         "cost_model_id": identity,
@@ -1596,12 +1603,24 @@ def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(
     bundle = builder.build(**request)
 
     assert bundle.lifecycle_state is DatasetLifecycleState.DATA_PENDING
+    assert bundle.timeframe == "1h"
+    assert bundle.data_plan_id == identity
     assert set(bundle.stage_snapshot_ids) == {"screening", "development"}
     assert SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id) == bundle
     later = "2026-09-08T00:00:00+00:00"
+    factory = Mock(side_effect=lambda role: request["payload_by_role"][role])
     assert (
-        builder.build(**{**request, "created_at": later, "availability_timestamp": later}) == bundle
+        builder.build(
+            **{
+                **request,
+                "created_at": later,
+                "availability_timestamp": later,
+                "payload_by_role": factory,
+            }
+        )
+        == bundle
     )
+    assert factory.call_count == len(request["payload_by_role"])
     changed = builder.build(
         **{
             **request,
@@ -1612,6 +1631,37 @@ def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(
     )
     assert changed.bundle_id != bundle.bundle_id
     assert changed.stage_snapshot_ids["development"] != bundle.stage_snapshot_ids["development"]
+
+    with database.engine.connect() as connection:
+        snapshot_count = connection.execute(
+            select(func.count()).select_from(dataset_snapshot)
+        ).scalar_one()
+    calls = []
+    changing_factory = Mock(
+        side_effect=lambda role: (
+            calls.append(role),
+            {
+                "rows": request["payload_by_role"][role]["rows"]
+                + 2
+                + (100 if role == "screening" and calls.count(role) > 1 else 0)
+            },
+        )[1]
+    )
+    with pytest.raises(DatasetResolutionError, match="changed during bundle build"):
+        builder.build(
+            **{
+                **request,
+                "created_at": "2026-09-09T00:00:00+00:00",
+                "availability_timestamp": "2026-09-09T00:00:00+00:00",
+                "payload_by_role": changing_factory,
+            }
+        )
+    assert changing_factory.call_count == len(request["payload_by_role"]) * 2
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(select(func.count()).select_from(dataset_snapshot)).scalar_one()
+            == snapshot_count
+        )
 
 
 def test_ready_dataset_bundle_rejects_overlapping_intervals(tmp_path) -> None:
@@ -1956,6 +2006,8 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
 def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
     tmp_path, fixed_scope, monkeypatch
 ) -> None:
+    from unittest.mock import Mock
+
     monkeypatch.setattr("src.services.research_jobs.utc_now", lambda: NOW)
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'dataset-service.sqlite3'}")
     database.create_schema()
@@ -2051,6 +2103,8 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
         partition / "bars.parquet",
     )
 
+    role_payload_builder = Mock(wraps=DatabaseDatasetBundleService._role_payloads)
+    monkeypatch.setattr(DatabaseDatasetBundleService, "_role_payloads", role_payload_builder)
     result = DatabaseDatasetBundleService(database.engine, root, timeframe="1d").run(
         product_id="btc_accumulation",
         universe_id=universe_id,
@@ -2061,6 +2115,8 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
     assert result.state == "ready"
     assert result.bundle_id is not None
     assert len(result.source_partition_hashes) == 1
+    assert role_payload_builder.call_count == len(CORE_RESEARCH_BUNDLE_ROLES) * 2
+    assert all(len(call.kwargs["intervals"]) == 1 for call in role_payload_builder.call_args_list)
     bundle = SqlDatasetBundleRepository(database.engine).get(str(result.bundle_id))
     assert set(bundle.stage_snapshot_ids) == set(CORE_RESEARCH_BUNDLE_ROLES)
     with database.engine.connect() as connection:

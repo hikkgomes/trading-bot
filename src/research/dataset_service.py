@@ -167,6 +167,7 @@ class DatabaseDatasetBundleService:
         if isinstance(prepared, DatasetBundleBuildResult):
             return prepared
         bars, source_hashes = prepared
+        del prepared
         try:
             if market_type.lower() == "futures":
                 bars = self._attach_funding_rates(
@@ -198,23 +199,26 @@ class DatabaseDatasetBundleService:
                 intervals=intervals,
                 history_end=history_end,
             )
-            payload_by_role = self._role_payloads(
-                bars,
-                intervals=intervals,
-                memberships=resolved_universe.memberships,
-                snapshot_ids=resolved_universe.snapshot_ids,
-                timeframe=timeframe or self.timeframe,
-                selection_mode=resolved_universe.selection_mode,
-                warmup_bars=plan.warmup_bars,
-                require_complete_warmup=True,
-            )
-            for payload in payload_by_role.values():
+
+            def payload_for_role(role: str) -> dict[str, Any]:
+                payload = self._role_payloads(
+                    bars,
+                    intervals={role: intervals[role]},
+                    memberships=resolved_universe.memberships,
+                    snapshot_ids=resolved_universe.snapshot_ids,
+                    timeframe=timeframe or self.timeframe,
+                    selection_mode=resolved_universe.selection_mode,
+                    warmup_bars=plan.warmup_bars,
+                    require_complete_warmup=True,
+                )[role]
                 payload["data_plan"] = {**plan.to_payload(), "intervals": intervals}
                 payload["data_plan_id"] = plan.plan_id
+                return payload
+
             bundle = CanonicalResearchDatasetBuilder(self.engine).build(
                 product_id,
                 intervals=intervals,
-                payload_by_role=payload_by_role,
+                payload_by_role=payload_for_role,
                 universe_snapshot_id=universe_snapshot_id,
                 feature_manifest_id=feature_id,
                 cost_model_id=cost_id,

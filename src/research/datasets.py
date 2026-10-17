@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
@@ -594,12 +594,23 @@ class CanonicalResearchDatasetBuilder:
         self.engine = engine
         self.default_engine_version = non_empty(default_engine_version, field="engine_version")
 
+    @staticmethod
+    def _payload_source(
+        payload_by_role: Mapping[str, Any] | Callable[[str], Any],
+        intervals: Mapping[str, Mapping[str, str]],
+    ) -> tuple[set[str], Callable[[str], Any]]:
+        if callable(payload_by_role):
+            return set(intervals), payload_by_role
+        if isinstance(payload_by_role, Mapping):
+            return set(payload_by_role), payload_by_role.__getitem__
+        raise DatasetResolutionError("dataset payloads must be a mapping or role factory")
+
     def build(
         self,
         product_id: str,
         *,
         intervals: Mapping[str, Mapping[str, str]],
-        payload_by_role: Mapping[str, Any],
+        payload_by_role: Mapping[str, Any] | Callable[[str], Any],
         universe_snapshot_id: str,
         feature_manifest_id: str,
         cost_model_id: str,
@@ -613,7 +624,7 @@ class CanonicalResearchDatasetBuilder:
     ) -> DatasetBundle:
         product_id = non_empty(product_id, field="product_id")
         state = DatasetLifecycleState(lifecycle_state)
-        roles = set(payload_by_role)
+        roles, payload_for_role = self._payload_source(payload_by_role, intervals)
         unsupported = sorted(roles - set(RESEARCH_BUNDLE_ROLES))
         if unsupported:
             raise DatasetResolutionError(
@@ -648,31 +659,43 @@ class CanonicalResearchDatasetBuilder:
             raise DatasetResolutionError("instrument_scope cannot be empty")
         _validate_product_scope(product_id, scope)
         snapshots: dict[str, str] = {}
-        snapshot_payloads: dict[str, dict[str, Any]] = {}
+        snapshot_sources: dict[str, dict[str, Any]] = {}
+        timing_payloads: dict[str, Any] = {}
+        snapshot_specs: dict[str, dict[str, Any]] = {
+            role: {
+                "product_id": product_id,
+                "interval": normalised_intervals[role],
+                "universe_id": universe_id,
+                "availability": availability[role],
+                "manifest_id": manifest_id,
+                "costs_id": costs_id,
+                "parameters_id": parameters_id,
+                "engine": engine,
+                "scope": scope,
+            }
+            for role in sorted(roles)
+        }
         for role in sorted(roles):
-            data = json_value(payload_by_role[role], field=f"{role} dataset payload")
             if availability[role] < normalised_intervals[role]["end"]:
                 raise DatasetResolutionError(
                     f"{role} dataset became available before its information interval ended"
                 )
-            content_hash = canonical_hash(data)
-            metadata = {
-                "product_id": product_id,
-                "role": role,
-                "content_hash": content_hash,
-                "interval": normalised_intervals[role],
-                "universe_snapshot_id": universe_id,
-                "availability_timestamp": availability[role],
-                "feature_manifest_id": manifest_id,
-                "cost_model_id": costs_id,
-                "parameter_set_id": parameters_id,
-                "engine_version": engine,
-                "instrument_scope": list(scope),
-            }
-            snapshot_id = canonical_hash(metadata)
-            payload = {"snapshot_id": snapshot_id, **metadata, "payload": data}
+            raw_payload = payload_for_role(role)
+            data = json_value(raw_payload, field=f"{role} dataset payload")
+            snapshot_id, payload = self._snapshot_payload(
+                role=role, data=data, **snapshot_specs[role]
+            )
             snapshots[role] = snapshot_id
-            snapshot_payloads[role] = payload
+            snapshot_sources[role] = _snapshot_source(payload)
+            timing_payloads[role] = (
+                {
+                    "timeframe": raw_payload.get("timeframe"),
+                    "data_plan_id": raw_payload.get("data_plan_id"),
+                }
+                if isinstance(raw_payload, Mapping)
+                else None
+            )
+            del raw_payload, data, payload
         bundle_payload: dict[str, Any] = {
             "schema": "platform.dataset_bundle/v1",
             "product_id": product_id,
@@ -687,7 +710,7 @@ class CanonicalResearchDatasetBuilder:
             "lifecycle_state": state.value,
             "source_partition_hashes": list(source_partition_hashes),
         }
-        bundle_payload.update(_bundle_timing(payload_by_role))
+        bundle_payload.update(_bundle_timing(timing_payloads))
         bundle_id = canonical_hash(bundle_payload)
         bundle = DatasetBundle(
             bundle_id=bundle_id,
@@ -705,23 +728,85 @@ class CanonicalResearchDatasetBuilder:
             timeframe=bundle_payload.get("timeframe"),
             data_plan_id=bundle_payload.get("data_plan_id"),
         )
-        return self._publish(bundle, snapshot_payloads)
+        return self._publish(
+            bundle,
+            snapshot_sources,
+            payload_for_role,
+            snapshots,
+            snapshot_specs,
+        )
 
-    def _publish(self, bundle, snapshot_payloads):
+    @staticmethod
+    def _prepare_snapshot(
+        role: str,
+        payload_for_role: Callable[[str], Any],
+        snapshot_id: str,
+        snapshot_source: Mapping[str, Any],
+        snapshot_spec: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        raw_payload = payload_for_role(role)
+        data = json_value(raw_payload, field=f"{role} dataset payload")
+        current_id, payload = CanonicalResearchDatasetBuilder._snapshot_payload(
+            role=role, data=data, **snapshot_spec
+        )
+        if current_id != snapshot_id or _snapshot_source(payload) != snapshot_source:
+            raise DatasetResolutionError(f"{role} dataset payload changed during bundle build")
+        return payload
+
+    @staticmethod
+    def _snapshot_payload(
+        *,
+        role: str,
+        data: Any,
+        product_id: str,
+        interval: Mapping[str, str],
+        universe_id: str,
+        availability: str,
+        manifest_id: str,
+        costs_id: str,
+        parameters_id: str,
+        engine: str,
+        scope: tuple[str, ...],
+    ) -> tuple[str, dict[str, Any]]:
+        metadata = {
+            "product_id": product_id,
+            "role": role,
+            "content_hash": canonical_hash(data),
+            "interval": interval,
+            "universe_snapshot_id": universe_id,
+            "availability_timestamp": availability,
+            "feature_manifest_id": manifest_id,
+            "cost_model_id": costs_id,
+            "parameter_set_id": parameters_id,
+            "engine_version": engine,
+            "instrument_scope": list(scope),
+        }
+        snapshot_id = canonical_hash(metadata)
+        return snapshot_id, {"snapshot_id": snapshot_id, **metadata, "payload": data}
+
+    def _publish(self, bundle, snapshot_sources, payload_for_role, snapshots, snapshot_specs):
         with self.engine.begin() as connection:
-            reused = self._reusable_bundle(connection, bundle, snapshot_payloads)
+            reused = self._reusable_bundle(connection, bundle, snapshot_sources)
             if reused is not None:
                 return SqlDatasetBundleRepository(self.engine).get(reused)
-            for role in sorted(snapshot_payloads):
+            for role in sorted(snapshot_sources):
+                payload = self._prepare_snapshot(
+                    role,
+                    payload_for_role,
+                    snapshots[role],
+                    snapshot_sources[role],
+                    snapshot_specs[role],
+                )
                 self._insert_immutable(
                     connection,
                     dataset_snapshot,
                     {
                         "id": bundle.stage_snapshot_ids[role],
                         "created_at": bundle.created_at,
-                        "payload": snapshot_payloads[role],
+                        "payload": payload,
                     },
                 )
+                del payload
             self._insert_immutable(
                 connection,
                 dataset_bundle,
@@ -736,10 +821,10 @@ class CanonicalResearchDatasetBuilder:
         return bundle
 
     @staticmethod
-    def _reusable_bundle(connection, bundle, snapshots):
+    def _reusable_bundle(connection, bundle, snapshot_sources):
         ignored = {"bundle_id", "content_hash", "created_at", "stage_snapshot_ids"}
         source = {key: value for key, value in bundle.content.items() if key not in ignored}
-        expected = {role: _snapshot_source(row) for role, row in snapshots.items()}
+        expected = snapshot_sources
         identity = canonical_hash({"source": source, "snapshots": expected})
         if connection.dialect.name == "postgresql":
             connection.execute(
@@ -1121,7 +1206,7 @@ class CanonicalResearchDatasetBuilder:
             connection.execute(select(table).where(table.c.id == values["id"])).mappings().first()
         )
         if existing is None:
-            connection.execute(insert(table).values(**dict(values)))
+            connection.execute(insert(table), dict(values))
             return
         if any(existing[key] != value for key, value in values.items()):
             raise DatasetResolutionError(f"immutable dataset identity collision: {values['id']}")
