@@ -1061,3 +1061,56 @@ def test_backup_monitor_requires_verified_offsite_without_obsolete_tar(tmp_path)
     receipt["retention_succeeded"] = False
     path.write_text(json.dumps(receipt))
     assert worker._backup_status(now.isoformat())["healthy"] is False
+
+
+def test_restic_backup_restores_pins_and_excludes_writer_temporary_files(tmp_path, monkeypatch):
+    import shutil
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+
+    executable = shutil.which("restic")
+    if executable is None:
+        pytest.skip("requires installed restic for the real encrypted filesystem round trip")
+    root = tmp_path / "backups"
+    root.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "platform.json").write_text("{}")
+    for name in ("bars.parquet", ".writer.parquet.tmp", "partition.lock"):
+        (data / name).write_bytes(name.encode())
+    pinned = root / ".offsite-source"
+    pinned.mkdir()
+    dump = pinned / "database.dump"
+    dump.write_bytes(b"captured-database-bytes")
+    password = tmp_path / "password"
+    password.write_text("test-encryption-only")
+    monkeypatch.setenv("RESTIC_REPOSITORY", str(tmp_path / "encrypted-repository"))
+    monkeypatch.setenv("RESTIC_PASSWORD_FILE", str(password))
+    subprocess.run([executable, "init"], check=True, capture_output=True)
+    manifest = {"backup_id": "fixture", "files": {"database.dump": offsite_backup.file_hash(dump)}}
+    monkeypatch.setattr(offsite_backup, "_pin_database", Mock(return_value=(pinned, manifest)))
+    config = SimpleNamespace(
+        paths={"parquet": str(data), "artefacts": str(data / "artefacts")},
+        backup={"hourly_retention_hours": 6, "retention_days": 7},
+    )
+    receipt = offsite_backup._capture_offsite(config_dir / "platform.json", config, root)
+    assert receipt["database_dump_roundtrip_verified"] and receipt["data_file_roundtrip_verified"]
+    assert receipt["retention_succeeded"]
+    listing = subprocess.run(
+        [executable, "ls", "--json", receipt["snapshot_id"]],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    paths = {
+        row["path"]
+        for line in listing.stdout.splitlines()
+        if (row := json.loads(line)).get("type") == "file"
+    }
+    assert str(data / "bars.parquet") in paths
+    assert str(pinned / "database.dump") in paths
+    assert str(pinned / "data.parquet") in paths
+    assert not any(path.endswith((".tmp", ".lock")) for path in paths)
