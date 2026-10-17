@@ -89,6 +89,53 @@ def test_completed_futures_campaigns_ignore_marks_and_partial_reductions():
     assert completed_campaigns(None) is None
 
 
+def test_derived_btc_rebalances_match_quote_cash_ledger_with_fees_and_slippage():
+    import datetime as dt
+    import random
+
+    from src.research.executors import _derived_btc_accounting_inputs
+
+    start = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
+    generator = random.Random(0)
+    price = 110_000.0
+    rows = []
+    signals = []
+    for index in range(49):
+        price = max(1_000.0, price * (1.0 + generator.uniform(-0.01, 0.01)))
+        rows.append(
+            {
+                "timestamp": (start + dt.timedelta(hours=index)).isoformat(),
+                "close": price,
+            }
+        )
+        signals.append(generator.choice((0, 1, -1)))
+    trades, marks = _derived_btc_accounting_inputs(
+        {
+            "market_frame": rows,
+            "signals": signals,
+            "initial_btc": 0.01,
+            "initial_stablecoin": 1_000.0,
+            "btc_minimum_fraction": 0.7,
+            "btc_max_tactical_fraction": 0.3,
+            "fee_bps": 10.0,
+            "slippage_bps": 2.0,
+        }
+    )
+    report = BtcResearchAccounting().evaluate(
+        initial_btc=0.01,
+        initial_stablecoin=1_000.0,
+        trade_events=trades,
+        marks=marks,
+        reserve_fraction=0.7,
+        max_tactical_fraction=0.3,
+        benchmark_fee_rate=0.001,
+        benchmark_slippage_rate=0.0002,
+    )
+
+    assert any(event["side"] == "buy" and event["fee"] > 0.0 for event in trades)
+    assert min(snapshot.stablecoin_balance for snapshot in report.nav_series) >= 0.0
+
+
 @pytest.mark.parametrize("asset,amount", [("BTC", 0.25), ("USDT", 200)])
 def test_btc_partial_reentry_is_not_a_cycle_and_external_flows_are_not_cycle_profit(asset, amount):
     trades = [

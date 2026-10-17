@@ -1284,7 +1284,6 @@ def _derived_btc_accounting_inputs(
             btc=btc,
             stable=stable,
             trade=trade,
-            fee_rate=fee_rate,
         )
     return tuple(trades), tuple(marks)
 
@@ -1331,13 +1330,14 @@ def _btc_trade(
 
 
 def _btc_balances_after_trade(
-    *, btc: float, stable: float, trade: Mapping[str, Any], fee_rate: float
+    *, btc: float, stable: float, trade: Mapping[str, Any]
 ) -> tuple[float, float]:
     quantity = float(trade["quantity_btc"])
     price = float(trade["price"])
+    fee_quote = float(trade["fee"])
     if trade["side"] == "buy":
-        return btc + quantity, stable - quantity * price * (1.0 + fee_rate)
-    return btc - quantity, stable + quantity * price * (1.0 - fee_rate)
+        return btc + quantity, stable - (quantity * price + fee_quote)
+    return btc - quantity, stable + (quantity * price - fee_quote)
 
 
 def _derived_futures_accounting_inputs(

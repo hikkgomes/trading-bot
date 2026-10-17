@@ -9,6 +9,7 @@ import hmac
 import json
 import math
 import os
+import stat
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -527,23 +528,34 @@ def _spool_retention(
         raise ValueError("spool retention time must be finite")
     removed_files = 0
     removed_bytes = 0
+    total_bytes = 0
     paths = tuple(
         path
         for state in ("pending", "claimed", "committed", "deleted")
         for path in (root / state).glob("segment-*.jsonl")
     )
     for path in paths:
-        if path.is_symlink() or not path.is_file():
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
             continue
         if path.parent.name != "committed":
+            total_bytes += metadata.st_size
             continue
         if is_acknowledged is not None and not is_acknowledged(path):
+            total_bytes += metadata.st_size
             continue
-        if current_time - path.stat().st_mtime > retention_seconds:
-            removed_bytes += path.stat().st_size
+        if current_time - metadata.st_mtime <= retention_seconds:
+            total_bytes += metadata.st_size
+            continue
+        try:
             path.unlink()
-            removed_files += 1
-    total_bytes = sum(path.stat().st_size for path in paths if path.is_file())
+        except FileNotFoundError:
+            continue
+        removed_bytes += metadata.st_size
+        removed_files += 1
     return {
         "removed_files": removed_files,
         "removed_bytes": removed_bytes,

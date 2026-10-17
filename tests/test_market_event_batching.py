@@ -40,6 +40,57 @@ def test_spool_publishes_one_atomic_segment_for_multiple_events(tmp_path) -> Non
     assert len(persisted) == 2
 
 
+def test_spool_retention_tolerates_files_removed_during_acknowledgement(tmp_path) -> None:
+    import os
+    from unittest.mock import Mock
+
+    from src.services.market_gateway import _spool_retention
+
+    root = tmp_path / "retention-spool"
+    pending = root / "pending"
+    committed = root / "committed"
+    pending.mkdir(parents=True)
+    committed.mkdir(parents=True)
+    vanished = committed / "segment-vanished.jsonl"
+    acknowledged = committed / "segment-acknowledged.jsonl"
+    unacknowledged = committed / "segment-unacknowledged.jsonl"
+    pending_file = pending / "segment-pending.jsonl"
+    file_contents = {
+        vanished: b"vanished",
+        acknowledged: b"acknowledged",
+        unacknowledged: b"unacknowledged",
+        pending_file: b"pending",
+    }
+    for path, content in file_contents.items():
+        path.write_bytes(content)
+        os.utime(path, (0, 0))
+    symlink = committed / "segment-symlink.jsonl"
+    symlink.symlink_to(unacknowledged)
+    is_acknowledged = Mock(
+        side_effect=lambda path: (path.unlink(), True)[1]
+        if path == vanished
+        else path == acknowledged
+    )
+
+    result = _spool_retention(
+        root,
+        retention_seconds=10,
+        now=100,
+        is_acknowledged=is_acknowledged,
+    )
+
+    assert result == {
+        "removed_files": 1,
+        "removed_bytes": len(file_contents[acknowledged]),
+        "total_bytes": len(file_contents[unacknowledged]) + len(file_contents[pending_file]),
+    }
+    assert not vanished.exists()
+    assert not acknowledged.exists()
+    assert unacknowledged.read_bytes() == file_contents[unacknowledged]
+    assert pending_file.read_bytes() == file_contents[pending_file]
+    assert symlink.is_symlink()
+
+
 def test_new_public_batch_job_is_explicitly_tagged_for_retention(tmp_path) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     job.create(engine)

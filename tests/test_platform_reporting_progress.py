@@ -31,6 +31,7 @@ from src.data.database import (
     universe,
     universe_member,
     universe_snapshot,
+    validation_result,
     validation_stage,
 )
 from src.domain._codec import canonical_hash
@@ -120,6 +121,8 @@ def test_report_counts_real_queue_states_and_terminal_attempts(tmp_path) -> None
 
 
 def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_path) -> None:
+    from src.observability.reports import REPORT_SNAPSHOT_MAX_BYTES, read_persisted_platform_report
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'bounded-report.sqlite3'}")
     database.create_schema()
     count = 1001
@@ -136,6 +139,7 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
     btc_entries = []
     navs = []
     traces = []
+    bulky_evidence = "x" * (REPORT_SNAPSHOT_MAX_BYTES + 1)
     previous_hash = "0" * 64
     fee = Decimal("0.000000001")
     for index, timestamp in enumerate(observed_at):
@@ -154,6 +158,23 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
             }
         )
         runs.append({"id": run_id, "created_at": timestamp, "payload": {}})
+        stage_payload = {
+            "signal_frequency": 0.001,
+            "candidate_correlation": 0.25,
+        }
+        if index == 0:
+            stage_payload["evidence"] = {
+                "signal_frequency": 0.001,
+                "opaque_history": bulky_evidence,
+            }
+        elif 1 <= index <= 5:
+            nested_values = {1: True, 2: False, 3: None, 4: "0.5"}
+            stage_payload["evidence"] = (
+                {"signal_frequency": nested_values[index]} if index in nested_values else {}
+            )
+        elif 6 <= index <= 9:
+            fallback_values = {6: True, 7: False, 8: None, 9: "0.5"}
+            stage_payload["signal_frequency"] = fallback_values[index]
         stages.append(
             {
                 "id": f"stage-{index:04d}",
@@ -168,10 +189,7 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
                 "evaluation_identity": None,
                 "engine_version": ECONOMIC_ENGINE_VERSION,
                 "outcome_category": "accepted",
-                "payload": {
-                    "signal_frequency": 0.001,
-                    "candidate_correlation": 0.25,
-                },
+                "payload": stage_payload,
             }
         )
         trace = DecisionTrace.start(
@@ -298,6 +316,21 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
         connection.execute(insert(experiment), experiments)
         connection.execute(insert(experiment_run), runs)
         connection.execute(insert(validation_stage), stages)
+        connection.execute(
+            insert(validation_result).values(
+                id="legacy-validation-result",
+                experiment_id="candidate-0000",
+                state="screening_rejected",
+                accepted=False,
+                reason_code="fixture_rejection",
+                evidence={
+                    "candidate_id": "candidate-0000",
+                    "definition_hash": "sha256:" + "d" * 64,
+                    "evaluated_at": observed_at[0],
+                    "opaque_history": "legacy evidence detail",
+                },
+            )
+        )
         connection.execute(insert(decision_trace), traces)
         connection.execute(insert(alpha_forecast), forecasts)
         connection.execute(insert(holdout_claim), claims)
@@ -307,7 +340,18 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
         connection.execute(insert(accounting_entry), btc_entries)
         connection.execute(insert(nav_snapshot), navs)
 
-    report = DatabasePlatformReport(database.engine).build(now=observed_at[-1])
+    report_root = tmp_path / "runtime" / "reports"
+    assert (
+        DatabaseReportWorker(engine=database.engine, root=report_root).run_once(
+            now=observed_at[-1]
+        )["reason_code"]
+        == "operator_report_written"
+    )
+    latest_report = report_root / "latest.json"
+    assert latest_report.stat().st_size < REPORT_SNAPSHOT_MAX_BYTES
+    snapshot = read_persisted_platform_report(report_root, now=observed_at[-1])
+    assert snapshot["snapshot_status"] == "fresh"
+    report = snapshot["report"]
     research = report["research"]
     funnel = research["funnel"]
     active_income = report["products"]["active_income"]
@@ -319,13 +363,29 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
     assert research["detail_counts"]["candidate_queue"] == count
     assert len(research["validation_stages"]) == 100
     assert research["detail_counts"]["validation_stages"] == count
+    stage_detail = research["validation_stages"][0]
+    assert stage_detail["id"] == "stage-0000"
+    assert stage_detail["experiment_id"] == "candidate-0000"
+    assert stage_detail["candidate_id"] == "candidate-0000"
+    assert stage_detail["product_id"] == "active_income"
+    assert stage_detail["dataset_snapshot_hashes"] == []
+    assert stage_detail["source_run_id"] == "run-0000"
+    assert stage_detail["evidence_hash"] == "sha256:" + "0" * 64
+    assert stage_detail["evaluated_at"] == observed_at[0]
+    assert stage_detail["accepted"] is True
+    assert "payload" not in stage_detail
+    assert len(research["validation_results"]) == 1
+    result_detail = research["validation_results"][0]
+    assert result_detail["candidate_id"] == "candidate-0000"
+    assert result_detail["definition_hash"] == "sha256:" + "d" * 64
+    assert "evidence" not in result_detail
     assert len(research["holdout_outcomes"]) == 100
     assert research["detail_counts"]["holdout_outcomes"] == count
     assert funnel["candidates_generated"] == count
     assert funnel["candidates_evaluated"] == count
     assert funnel["candidates_compiled"] == count
     assert funnel["candidate_age_by_state"]["screening"]["count"] == count
-    assert funnel["signal_frequency_count"] == count
+    assert funnel["signal_frequency_count"] == count - 9
     assert len(funnel["signal_frequency_distribution"]) == 100
     assert funnel["candidate_correlation_count"] == count
     assert funnel["protected_holdout_count"] == count
@@ -698,6 +758,43 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
             )
         )
         connection.execute(
+            insert(account_snapshot),
+            [
+                {
+                    "id": "account-1-latest",
+                    "account_id": "account-1",
+                    "observed_at": "2026-08-31T09:59:00+00:00",
+                    "source": "user_stream_reconciliation",
+                    "content_hash": "sha256:" + "4" * 64,
+                    "payload": {"account_state_known": True},
+                },
+                {
+                    "id": "account-2-tie-a",
+                    "account_id": "account-2",
+                    "observed_at": "2026-08-31T09:59:00+00:00",
+                    "source": "user_stream_reconciliation",
+                    "content_hash": "sha256:" + "5" * 64,
+                    "payload": {"account_state_known": True},
+                },
+                {
+                    "id": "account-2-tie-z",
+                    "account_id": "account-2",
+                    "observed_at": "2026-08-31T09:59:00+00:00",
+                    "source": "user_stream_delta",
+                    "content_hash": "sha256:" + "6" * 64,
+                    "payload": {"account_state_known": False},
+                },
+                {
+                    "id": "account-3-latest",
+                    "account_id": "account-3",
+                    "observed_at": "2026-08-31T09:59:00+00:00",
+                    "source": "user_stream_delta",
+                    "content_hash": "sha256:" + "7" * 64,
+                    "payload": {"account_state_known": False},
+                },
+            ],
+        )
+        connection.execute(
             insert(risk_snapshot).values(
                 id="risk-snapshot",
                 created_at="2026-08-31T09:00:00+00:00",
@@ -737,7 +834,11 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
         },
     }
     assert slis["unresolved_recovery_count"] == 1
-    assert slis["stale_account_authority"]["count"] == 1
+    assert slis["stale_account_authority"]["count"] == 2
+    assert [item["snapshot_id"] for item in slis["stale_account_authority"]["accounts"]] == [
+        "account-2-tie-z",
+        "account-3-latest",
+    ]
     assert slis["stale_market_data"]["count"] == 1
     database.dispose()
 
@@ -1268,3 +1369,207 @@ def test_control_and_metrics_read_published_report_without_rebuilding(
     assert 'platform_report_snapshot_status{status="missing"} 1' in missing_metrics
     build.assert_not_called()
     database.dispose()
+
+
+def test_postgres_market_input_scope_walk_matches_window_reference() -> None:
+    import os
+    import uuid
+
+    from sqlalchemy import create_engine, func, text, union_all
+    from sqlalchemy.engine import make_url
+
+    from src.data.database import market_input_buffer
+
+    url = os.environ.get("TRADING_PLATFORM_DATABASE_URL", "")
+    if not url.startswith("postgresql"):
+        pytest.skip("requires isolated PostgreSQL report-query validation")
+
+    base = make_url(url)
+    name = "market_scope_" + uuid.uuid4().hex[:16]
+    admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    database = None
+    with admin.connect() as connection:
+        connection.execute(text(f"CREATE DATABASE {name}"))
+    try:
+        database = PlatformDatabase(base.set(database=name).render_as_string(hide_password=False))
+        database.migrate()
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(risk_snapshot),
+                [
+                    {
+                        "id": "null-null-old",
+                        "created_at": "2026-08-31T09:00:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": None,
+                            "instrument_id": None,
+                        },
+                    },
+                    {
+                        "id": "null-null-tie-a",
+                        "created_at": "2026-08-31T09:30:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": None,
+                            "instrument_id": None,
+                        },
+                    },
+                    {
+                        "id": "null-null-tie-z",
+                        "created_at": "2026-08-31T09:30:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": None,
+                            "instrument_id": None,
+                        },
+                    },
+                    {
+                        "id": "null-empty",
+                        "created_at": "2026-08-31T09:30:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": None,
+                            "instrument_id": "",
+                        },
+                    },
+                    {
+                        "id": "empty-null",
+                        "created_at": "2026-08-31T09:30:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "",
+                            "instrument_id": None,
+                        },
+                    },
+                    {
+                        "id": "empty-empty",
+                        "created_at": "2026-08-31T09:30:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "",
+                            "instrument_id": "",
+                        },
+                    },
+                    {
+                        "id": "normal-old",
+                        "created_at": "2026-08-31T09:00:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "active_income",
+                            "instrument_id": "BTCUSDT",
+                        },
+                    },
+                    {
+                        "id": "normal-new",
+                        "created_at": "2026-08-31T09:30:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "active_income",
+                            "instrument_id": "BTCUSDT",
+                        },
+                    },
+                    {
+                        "id": "shared-id",
+                        "created_at": "2026-08-31T09:15:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "active_income",
+                            "instrument_id": "ETHUSDT",
+                            "source_event_type": "trade",
+                        },
+                    },
+                ],
+            )
+            connection.execute(
+                insert(market_input_buffer),
+                [
+                    {
+                        "id": "buffer-newest",
+                        "product_id": "active_income",
+                        "instrument_id": "BTCUSDT",
+                        "event_type": "trade",
+                        "created_at": "2026-08-31T09:45:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "active_income",
+                            "instrument_id": "BTCUSDT",
+                            "source_event_type": "trade",
+                        },
+                    },
+                    {
+                        "id": "shared-id",
+                        "product_id": "active_income",
+                        "instrument_id": "ETHUSDT",
+                        "event_type": "trade",
+                        "created_at": "2026-08-31T09:16:00+00:00",
+                        "payload": {
+                            "kind": "market_data_input",
+                            "product_id": "active_income",
+                            "instrument_id": "ETHUSDT",
+                            "source_event_type": "trade",
+                        },
+                    },
+                ],
+            )
+
+        immutable = select(
+            risk_snapshot.c.id, risk_snapshot.c.created_at, risk_snapshot.c.payload
+        ).where(risk_snapshot.c.payload["kind"].as_string() == "market_data_input")
+        buffered = select(
+            market_input_buffer.c.id,
+            market_input_buffer.c.created_at,
+            market_input_buffer.c.payload,
+        ).where(market_input_buffer.c.payload["kind"].as_string() == "market_data_input")
+        sources = union_all(immutable, buffered).subquery()
+        reference_ranked = select(
+            sources.c.id,
+            sources.c.created_at,
+            sources.c.payload,
+            func.row_number()
+            .over(
+                partition_by=(
+                    sources.c.payload["product_id"].as_string(),
+                    sources.c.payload["instrument_id"].as_string(),
+                ),
+                order_by=(sources.c.created_at.desc(), sources.c.id.desc()),
+            )
+            .label("recency"),
+        ).subquery()
+        reference = select(
+            reference_ranked.c.id,
+            reference_ranked.c.created_at,
+            reference_ranked.c.payload,
+        ).where(reference_ranked.c.recency == 1)
+        with database.engine.connect() as connection:
+            expected = {
+                row["id"]: (row["created_at"], row["payload"])
+                for row in connection.execute(reference).mappings()
+            }
+            assert (
+                connection.execute(
+                    text("SELECT to_regclass('ix_risk_snapshot_market_scope_latest')")
+                ).scalar_one()
+                == "ix_risk_snapshot_market_scope_latest"
+            )
+
+        actual_rows = list(
+            DatabasePlatformReport(database.engine)._latest_risk_rows(
+                "market_data_input", per_instrument=True
+            )
+        )
+        actual = {row["id"]: (row["created_at"], row["payload"]) for row in actual_rows}
+        assert actual == expected
+        assert "null-null-tie-z" in actual
+        assert "null-empty" in actual
+        assert "empty-null" in actual
+        assert "empty-empty" in actual
+        assert "buffer-newest" in actual
+        assert [row["id"] for row in actual_rows].count("shared-id") == 1
+        assert actual["shared-id"][1]["source_event_type"] == "trade"
+    finally:
+        if database is not None:
+            database.dispose()
+        with admin.connect() as connection:
+            connection.execute(text(f"DROP DATABASE IF EXISTS {name}"))
+        admin.dispose()

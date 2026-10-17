@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, case, exists, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select, text, union_all
 from sqlalchemy.engine import Connection, Engine
 
 from src.accounting.ledger import LedgerEntry
@@ -40,7 +40,7 @@ from src.data.database import (
     holdout_claim,
     holdout_outcome,
     job,
-    market_input_sources,
+    market_input_buffer,
     nav_snapshot,
     platform_schedule,
     position,
@@ -371,6 +371,83 @@ class DatabasePlatformReport:
             self._check_deadline()
         return [to_primitive(dict(row)) for row in rows], total
 
+    def _validation_result_details(self) -> tuple[list[dict[str, Any]], int]:
+        evidence = validation_result.c.evidence
+        statement = (
+            select(
+                validation_result.c.id,
+                validation_result.c.experiment_id,
+                experiment.c.id.label("candidate_id"),
+                strategy_definition.c.product_id,
+                validation_result.c.state,
+                validation_result.c.accepted,
+                validation_result.c.reason_code,
+                evidence["definition_hash"].as_string().label("definition_hash"),
+                evidence["evaluated_at"].as_string().label("evaluated_at"),
+            )
+            .select_from(
+                validation_result.outerjoin(
+                    experiment, experiment.c.id == validation_result.c.experiment_id
+                )
+                .outerjoin(
+                    strategy_version,
+                    strategy_version.c.id == experiment.c.strategy_version_id,
+                )
+                .outerjoin(
+                    strategy_definition,
+                    strategy_definition.c.id == strategy_version.c.definition_id,
+                )
+            )
+            .order_by(validation_result.c.id)
+            .limit(REPORT_DETAIL_LIMIT)
+        )
+        with self._read_connection() as connection:
+            total = self._count(validation_result)
+            rows = self._execute(connection, statement).mappings().all()
+            self._check_deadline()
+        return [to_primitive(dict(row)) for row in rows], total
+
+    def _validation_stage_details(self) -> tuple[list[dict[str, Any]], int]:
+        statement = (
+            select(
+                validation_stage.c.id,
+                validation_stage.c.experiment_id,
+                experiment.c.id.label("candidate_id"),
+                experiment.c.dataset_snapshot_hashes,
+                strategy_definition.c.product_id,
+                validation_stage.c.stage,
+                validation_stage.c.source_run_id,
+                validation_stage.c.evaluated_at,
+                validation_stage.c.state,
+                validation_stage.c.accepted,
+                validation_stage.c.reason_code,
+                validation_stage.c.evidence_hash,
+                validation_stage.c.evaluation_identity,
+                validation_stage.c.engine_version,
+                validation_stage.c.outcome_category,
+            )
+            .select_from(
+                validation_stage.outerjoin(
+                    experiment, experiment.c.id == validation_stage.c.experiment_id
+                )
+                .outerjoin(
+                    strategy_version,
+                    strategy_version.c.id == experiment.c.strategy_version_id,
+                )
+                .outerjoin(
+                    strategy_definition,
+                    strategy_definition.c.id == strategy_version.c.definition_id,
+                )
+            )
+            .order_by(validation_stage.c.id)
+            .limit(REPORT_DETAIL_LIMIT)
+        )
+        with self._read_connection() as connection:
+            total = self._count(validation_stage)
+            rows = self._execute(connection, statement).mappings().all()
+            self._check_deadline()
+        return [to_primitive(dict(row)) for row in rows], total
+
     def _iter_rows(self, statement):
         statement = statement.execution_options(
             stream_results=True, yield_per=REPORT_STREAM_BATCH_SIZE
@@ -437,8 +514,8 @@ class DatabasePlatformReport:
         )
         diagnostic_ids, diagnostic_candidate_count = self._diagnostic_candidate_ids()
         candidate_queue, active_candidate_count = self._candidate_queue()
-        results, result_count = self._detail_rows(validation_result)
-        validation_stages, stage_count = self._detail_rows(validation_stage)
+        results, result_count = self._validation_result_details()
+        validation_stages, stage_count = self._validation_stage_details()
         holdout_claims, holdout_claim_count = self._detail_rows(holdout_claim)
         holdout_outcomes, holdout_outcome_count = self._detail_rows(holdout_outcome)
         forward_details = {
@@ -615,8 +692,49 @@ class DatabasePlatformReport:
                 evidence_invalidation.c.payload["source_id"].as_string() == validation_stage.c.id,
             )
         )
+        stage_payload = validation_stage.c.payload
+        stage_evidence = stage_payload["evidence"]
+        evidence_is_object = (
+            func.jsonb_typeof(stage_evidence) == "object"
+            if self.engine.dialect.name == "postgresql"
+            else func.json_type(stage_payload, "$.evidence") == "object"
+        )
+        evidence_frequency = stage_evidence["signal_frequency"].as_json()
+        fallback_frequency = stage_payload["signal_frequency"].as_json()
+        if self.engine.dialect.name == "sqlite":
+            evidence_frequency = case(
+                (
+                    func.json_type(stage_payload, "$.evidence.signal_frequency").in_(
+                        ("integer", "real")
+                    ),
+                    evidence_frequency,
+                ),
+                else_=None,
+            )
+            fallback_frequency = case(
+                (
+                    func.json_type(stage_payload, "$.signal_frequency").in_(("integer", "real")),
+                    fallback_frequency,
+                ),
+                else_=None,
+            )
         current = (
-            select(validation_stage)
+            select(
+                validation_stage.c.id,
+                validation_stage.c.experiment_id,
+                validation_stage.c.stage,
+                validation_stage.c.evaluated_at,
+                validation_stage.c.accepted,
+                validation_stage.c.reason_code,
+                validation_stage.c.engine_version,
+                stage_payload["candidate_correlation"].as_json().label("candidate_correlation"),
+                stage_payload["candidate_correlation"]
+                .as_string()
+                .label("candidate_correlation_text"),
+                evidence_is_object.label("evidence_is_object"),
+                evidence_frequency.label("evidence_signal_frequency"),
+                fallback_frequency.label("fallback_signal_frequency"),
+            )
             .where(validation_stage.c.engine_version == ECONOMIC_ENGINE_VERSION, ~invalidated)
             .subquery()
         )
@@ -698,8 +816,8 @@ class DatabasePlatformReport:
         candidate_summary = self._candidate_summary(diagnostic_ids, now=now)
         missing_stage_datasets = candidate_summary["missing_stage_datasets"]
         candidate_correlations, candidate_correlation_count = self._detail_values(
-            select(production_stages.c.payload["candidate_correlation"].as_json())
-            .where(production_stages.c.payload["candidate_correlation"].as_string().is_not(None))
+            select(production_stages.c.candidate_correlation)
+            .where(production_stages.c.candidate_correlation_text.is_not(None))
             .order_by(production_stages.c.evaluated_at, production_stages.c.id)
         )
         signal_frequencies, signal_frequency_count = self._signal_frequencies(production_stages)
@@ -845,15 +963,15 @@ class DatabasePlatformReport:
         values: list[float] = []
         count = 0
         statement = select(
-            stages.c.payload["evidence"].as_json().label("evidence"),
-            stages.c.payload["signal_frequency"].as_json().label("fallback_frequency"),
+            stages.c.evidence_is_object,
+            stages.c.evidence_signal_frequency,
+            stages.c.fallback_signal_frequency,
         ).order_by(stages.c.evaluated_at, stages.c.id)
         for row in self._iter_rows(statement):
-            evidence = row["evidence"]
             value = (
-                evidence.get("signal_frequency")
-                if isinstance(evidence, Mapping)
-                else row["fallback_frequency"]
+                row["evidence_signal_frequency"]
+                if row["evidence_is_object"]
+                else row["fallback_signal_frequency"]
             )
             if isinstance(value, int | float) and not isinstance(value, bool):
                 count += 1
@@ -1437,8 +1555,6 @@ class DatabasePlatformReport:
             account_snapshot.c.id,
             account_snapshot.c.account_id,
             account_snapshot.c.observed_at,
-            account_snapshot.c.source,
-            account_snapshot.c.payload,
             func.row_number()
             .over(
                 partition_by=account_snapshot.c.account_id,
@@ -1448,7 +1564,18 @@ class DatabasePlatformReport:
         ).subquery()
         stale: list[dict[str, Any]] = []
         stale_count = 0
-        statement = select(ranked).where(ranked.c.recency == 1).order_by(ranked.c.account_id)
+        statement = (
+            select(
+                ranked.c.id,
+                ranked.c.account_id,
+                ranked.c.observed_at,
+                account_snapshot.c.source,
+                account_snapshot.c.payload,
+            )
+            .select_from(ranked.join(account_snapshot, account_snapshot.c.id == ranked.c.id))
+            .where(ranked.c.recency == 1)
+            .order_by(ranked.c.account_id)
+        )
         for row in self._iter_rows(statement):
             account_id = str(row.get("account_id") or "")
             if not account_id:
@@ -1594,16 +1721,129 @@ class DatabasePlatformReport:
         }
 
     def _latest_risk_rows(self, kind, *, per_instrument=False):
-        source = market_input_sources if kind == "market_data_input" else risk_snapshot
-        groups = [source.c.payload["product_id"].as_string()]
-        if per_instrument:
-            groups.append(source.c.payload["instrument_id"].as_string())
+        if (
+            kind == "market_data_input"
+            and per_instrument
+            and self.engine.dialect.name == "postgresql"
+        ):
+            immutable = self._latest_market_input_scopes_postgresql()
+        else:
+            immutable = self._latest_snapshot_selection(risk_snapshot, kind, per_instrument)
+        if kind != "market_data_input":
+            return self._iter_rows(immutable)
+        source = union_all(
+            immutable,
+            self._latest_snapshot_selection(market_input_buffer, kind, per_instrument),
+        ).subquery()
+        ranked = select(
+            source,
+            func.row_number()
+            .over(
+                partition_by=self._snapshot_groups(source, per_instrument),
+                order_by=(source.c.created_at.desc(), source.c.id.desc()),
+            )
+            .label("recency"),
+        ).subquery()
+        return self._iter_rows(
+            select(ranked.c.id, ranked.c.created_at, ranked.c.payload).where(ranked.c.recency == 1)
+        )
+
+    @staticmethod
+    def _latest_market_input_scopes_postgresql():
+        statement = text(
+            """
+            WITH RECURSIVE latest_scope (
+                product_key, product_is_null, instrument_key, instrument_is_null,
+                id, created_at
+            ) AS (
+                (
+                    SELECT
+                        COALESCE(CAST(payload->>'product_id' AS VARCHAR), ''),
+                        CAST(payload->>'product_id' AS VARCHAR) IS NULL,
+                        COALESCE(CAST(payload->>'instrument_id' AS VARCHAR), ''),
+                        CAST(payload->>'instrument_id' AS VARCHAR) IS NULL,
+                        id,
+                        created_at
+                    FROM risk_snapshot
+                    WHERE CAST(payload->>'kind' AS VARCHAR) = 'market_data_input'
+                    ORDER BY
+                        COALESCE(CAST(payload->>'product_id' AS VARCHAR), ''),
+                        CAST(payload->>'product_id' AS VARCHAR) IS NULL,
+                        COALESCE(CAST(payload->>'instrument_id' AS VARCHAR), ''),
+                        CAST(payload->>'instrument_id' AS VARCHAR) IS NULL,
+                        created_at DESC,
+                        id DESC
+                    LIMIT 1
+                )
+                UNION ALL
+                SELECT
+                    next_scope.product_key,
+                    next_scope.product_is_null,
+                    next_scope.instrument_key,
+                    next_scope.instrument_is_null,
+                    next_scope.id,
+                    next_scope.created_at
+                FROM latest_scope AS previous_scope
+                CROSS JOIN LATERAL (
+                    SELECT
+                        COALESCE(CAST(payload->>'product_id' AS VARCHAR), '') AS product_key,
+                        CAST(payload->>'product_id' AS VARCHAR) IS NULL AS product_is_null,
+                        COALESCE(CAST(payload->>'instrument_id' AS VARCHAR), '') AS instrument_key,
+                        CAST(payload->>'instrument_id' AS VARCHAR) IS NULL AS instrument_is_null,
+                        id,
+                        created_at
+                    FROM risk_snapshot
+                    WHERE CAST(payload->>'kind' AS VARCHAR) = 'market_data_input'
+                      AND ROW(
+                          COALESCE(CAST(payload->>'product_id' AS VARCHAR), ''),
+                          CAST(payload->>'product_id' AS VARCHAR) IS NULL,
+                          COALESCE(CAST(payload->>'instrument_id' AS VARCHAR), ''),
+                          CAST(payload->>'instrument_id' AS VARCHAR) IS NULL
+                      ) > ROW(
+                          previous_scope.product_key,
+                          previous_scope.product_is_null,
+                          previous_scope.instrument_key,
+                          previous_scope.instrument_is_null
+                      )
+                    ORDER BY
+                        COALESCE(CAST(payload->>'product_id' AS VARCHAR), ''),
+                        CAST(payload->>'product_id' AS VARCHAR) IS NULL,
+                        COALESCE(CAST(payload->>'instrument_id' AS VARCHAR), ''),
+                        CAST(payload->>'instrument_id' AS VARCHAR) IS NULL,
+                        created_at DESC,
+                        id DESC
+                    LIMIT 1
+                ) AS next_scope
+            )
+            SELECT latest_scope.id, latest_scope.created_at, selected.payload
+            FROM latest_scope
+            JOIN risk_snapshot AS selected ON selected.id = latest_scope.id
+            """
+        ).columns(
+            id=risk_snapshot.c.id.type,
+            created_at=risk_snapshot.c.created_at.type,
+            payload=risk_snapshot.c.payload.type,
+        )
+        latest = statement.subquery()
+        return select(latest.c.id, latest.c.created_at, latest.c.payload)
+
+    @staticmethod
+    def _snapshot_groups(source, per_instrument):
+        typed = source is market_input_buffer
+        fields = ("product_id", "instrument_id") if per_instrument else ("product_id",)
+        return [
+            getattr(source.c, field) if typed else source.c.payload[field].as_string()
+            for field in fields
+        ]
+
+    def _latest_snapshot_selection(self, source, kind, per_instrument):
         ranked = (
             select(
                 source.c.id,
+                source.c.created_at,
                 func.row_number()
                 .over(
-                    partition_by=groups,
+                    partition_by=self._snapshot_groups(source, per_instrument),
                     order_by=(source.c.created_at.desc(), source.c.id.desc()),
                 )
                 .label("recency"),
@@ -1611,8 +1851,16 @@ class DatabasePlatformReport:
             .where(source.c.payload["kind"].as_string() == kind)
             .subquery()
         )
-        return self._iter_rows(
-            select(source).join(ranked, ranked.c.id == source.c.id).where(ranked.c.recency == 1)
+        lookup = source.alias()
+        payload = (
+            select(lookup.c.payload)
+            .where(lookup.c.id == ranked.c.id)
+            .limit(1)
+            .correlate(ranked)
+            .scalar_subquery()
+        )
+        return select(ranked.c.id, ranked.c.created_at, payload.label("payload")).where(
+            ranked.c.recency == 1
         )
 
     def _latest_status_details(self, table, *, key: str, status: str):
