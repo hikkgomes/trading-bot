@@ -209,9 +209,14 @@ def consume_review(*, api_url: str, key: bytes, broker_socket: Path) -> dict[str
     context = AgentContext(created_at=request["requested_at"], values=request["context"])
     if request["context_hash"] != context.content_hash:
         raise ValueError("agent request context hash does not match")
-    from src.agents.model_broker import request_model_proposal
+    from src.agents.model_broker import ModelBrokerError, request_model_proposal
 
-    proposal = request_model_proposal(broker_socket, request, timeout=timeout + 5)
+    try:
+        proposal = request_model_proposal(broker_socket, request, timeout=timeout + 5)
+    except ModelBrokerError as exc:
+        if exc.reason_code == "rate_limited":
+            return {"state": "deferred", "reason_code": "model_hourly_limit"}
+        raise
     build_agent_proposal(proposal)
     envelope = sign_review_response(request, proposal, key=key)
     response = post_review_api(api_url, "/agent/responses", envelope, key=key)

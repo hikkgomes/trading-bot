@@ -107,6 +107,41 @@ def test_openclaw_typed_thesis_rejects_live_fields() -> None:
         build_agent_proposal(payload)
 
 
+def test_consumer_defers_the_hourly_limit_without_retrying_or_fabricating_a_response(monkeypatch):
+    from unittest.mock import Mock
+
+    from src.agents import consumer, model_broker
+    from src.agents.context import AgentContext
+
+    context = AgentContext(created_at=NOW, values={"product_id": "active_income"})
+    request = {
+        "requested_at": NOW,
+        "expires_at": (dt.datetime.fromisoformat(NOW) + dt.timedelta(minutes=10)).isoformat(),
+        "context": dict(context.values),
+        "context_hash": context.content_hash,
+    }
+    post = Mock(return_value={"request": request})
+    model = Mock(side_effect=model_broker.ModelBrokerError("rate_limited"))
+    monkeypatch.setattr(consumer, "post_review_api", post)
+    monkeypatch.setattr(model_broker, "request_model_proposal", model)
+    monkeypatch.setattr("src.services.runtime.utc_now", lambda: NOW)
+    broker_socket = Mock()
+    broker_socket.is_socket.return_value = True
+    assert consumer.consume_review(
+        api_url="http://127.0.0.1:8088", key=b"fixture-key", broker_socket=broker_socket
+    ) == {"state": "deferred", "reason_code": "model_hourly_limit"}
+    model.assert_called_once()
+    post.assert_called_once_with(
+        "http://127.0.0.1:8088", "/agent/requests/next", {}, key=b"fixture-key"
+    )
+
+    model.side_effect = model_broker.ModelBrokerError("invalid_model_proposal")
+    with pytest.raises(model_broker.ModelBrokerError, match="invalid_model_proposal"):
+        consumer.consume_review(
+            api_url="http://127.0.0.1:8088", key=b"fixture-key", broker_socket=broker_socket
+        )
+
+
 def test_openclaw_typed_thesis_compiles_only_through_trusted_dsl(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'openclaw.sqlite3'}")
     database.create_schema()
