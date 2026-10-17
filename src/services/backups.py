@@ -566,7 +566,7 @@ def _restore_server_options(socket_directory: Path) -> str:
         "-c",
         "autovacuum=off",
         "-c",
-        "statement_timeout=1800000",
+        f"statement_timeout={_RESTORE_TIMEOUT_SECONDS * 1_000}",
         "-c",
         "idle_in_transaction_session_timeout=60000",
     )
