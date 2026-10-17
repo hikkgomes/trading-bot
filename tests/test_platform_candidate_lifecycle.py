@@ -475,6 +475,233 @@ def _candidate(database, bundle):
     return candidate
 
 
+def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from sqlalchemy import func
+
+    from src.data.database import (
+        experiment,
+        experiment_run,
+        job,
+        job_attempt,
+        thesis_trial,
+        validation_stage,
+    )
+    from src.research.outcomes import TrialDisposition, terminal_trial_disposition
+    from src.services.research_worker import ResearchWorker
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'blocked-data.sqlite3'}")
+    database.create_schema()
+    bundle = _bundle(database)
+    initial = _candidate(database, bundle)
+    next_candidate = replace(
+        initial,
+        definition=replace(
+            initial.definition,
+            signal_model={
+                **dict(initial.definition.signal_model),
+                "parameters": {"fast": 3, "slow": 6, "allow_short": True},
+            },
+        ),
+    )
+    ResearchCoordinator(SqlResearchStore(database.engine)).submit(next_candidate)
+
+    configuration = load_split_configuration(Path(__file__).resolve().parents[1] / "config")
+    product = next(
+        row for row in configuration["products"]["products"] if row["product_id"] == "active_income"
+    )
+    product["dataset_timeframe"] = "1h"
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="blocked-data-worker",
+        node_id="fixture",
+        role="research",
+        capabilities=("evaluate_candidate",),
+        observed_at=NOW,
+    )
+    handlers = DatabaseResearchJobHandlers(
+        SqlResearchStore(database.engine),
+        configuration=configuration,
+        dataset_resolver=CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine)),
+    )
+    worker = ResearchWorker(
+        runtime=SimpleNamespace(
+            node=SimpleNamespace(operating_system="linux"), can_submit_orders=False
+        ),
+        queue=queue,
+        worker_id="blocked-data-worker",
+        handlers={"evaluate_candidate": handlers.evaluate_candidate},
+    )
+    monkeypatch.setattr("src.services.research_worker.utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        "src.services.scheduler.AUTONOMOUS_SCHEDULES", (ScheduleSpec("candidate_evaluation", 1),)
+    )
+    scheduler = PlatformScheduler(
+        engine=database.engine, products={"active_income": product}, node_id="fixture"
+    )
+
+    first_schedule = scheduler.run_once(now=NOW)
+    assert first_schedule["jobs_enqueued"] == 2
+    with database.engine.connect() as connection:
+        scheduled_jobs = (
+            connection.execute(
+                select(job.c.id, job.c.payload)
+                .where(job.c.name == "evaluate_candidate")
+                .order_by(job.c.id)
+            )
+            .mappings()
+            .all()
+        )
+    held_candidate_id = str(scheduled_jobs[0]["payload"]["candidate_id"])
+    continuing_candidate_id = str(scheduled_jobs[1]["payload"]["candidate_id"])
+    assert {held_candidate_id, continuing_candidate_id} == {
+        initial.candidate_id,
+        next_candidate.candidate_id,
+    }
+    held_job_id = str(scheduled_jobs[0]["id"])
+    original_executor = handlers.executors._executors[initial.definition.source_type]
+    unavailable_executor = Mock(
+        side_effect=DataUnavailableError("frozen futures inputs cannot order stop and funding")
+    )
+    monkeypatch.setitem(
+        handlers.executors._executors, initial.definition.source_type, unavailable_executor
+    )
+
+    blocked = worker.run_once(now=NOW)
+    assert blocked["reason_code"] == "research_job_completed"
+    assert blocked["candidate_id"] == held_candidate_id
+    assert blocked["outcome_category"] == "blocked_data"
+    assert blocked["deferred"] is True
+    assert "_defer" not in blocked
+    assert unavailable_executor.call_count == 1
+
+    with database.engine.connect() as connection:
+        held_state, held_metadata = connection.execute(
+            select(experiment.c.state, experiment.c.metadata).where(
+                experiment.c.id == held_candidate_id
+            )
+        ).one()
+        queue_state, attempts = connection.execute(
+            select(job.c.state, job.c.attempts).where(job.c.id == held_job_id)
+        ).one()
+        attempt = (
+            connection.execute(
+                select(job_attempt.c.status, job_attempt.c.error, job_attempt.c.payload).where(
+                    job_attempt.c.job_id == held_job_id
+                )
+            )
+            .mappings()
+            .one()
+        )
+        held_run_count = connection.execute(
+            select(func.count())
+            .select_from(experiment_run)
+            .where(experiment_run.c.payload["candidate_id"].as_string() == held_candidate_id)
+        ).scalar_one()
+    assert held_state == "screening_deferred"
+    assert held_metadata["evaluation_deferred"]["outcome_category"] == "blocked_data"
+    assert terminal_trial_disposition(held_state, held_metadata) is TrialDisposition.BLOCKED_DATA
+    assert (queue_state, attempts) == ("completed", 1)
+    assert (attempt["status"], attempt["error"]) == ("completed", None)
+    assert attempt["payload"]["outcome_category"] == "blocked_data"
+    assert held_run_count == 1
+
+    later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=1)).isoformat()
+    second_schedule = scheduler.run_once(now=later)
+    assert second_schedule["jobs_enqueued"] == 0
+    unavailable_executor.assert_called_once()
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(func.count())
+                .select_from(experiment_run)
+                .where(experiment_run.c.payload["candidate_id"].as_string() == held_candidate_id)
+            ).scalar_one()
+            == 1
+        )
+        assert (
+            connection.execute(
+                select(job.c.state).where(job.c.id == str(scheduled_jobs[1]["id"]))
+            ).scalar_one()
+            == "pending"
+        )
+
+    monkeypatch.setitem(
+        handlers.executors._executors, initial.definition.source_type, original_executor
+    )
+    continued = worker.run_once(now=later)
+    assert continued["reason_code"] == "research_job_completed"
+    assert continued["candidate_id"] == continuing_candidate_id
+    assert continued.get("outcome_category") != "blocked_data"
+    with database.engine.connect() as connection:
+        continuing_state = connection.execute(
+            select(experiment.c.state).where(experiment.c.id == continuing_candidate_id)
+        ).scalar_one()
+        continuing_stage_count = connection.execute(
+            select(func.count())
+            .select_from(validation_stage)
+            .where(validation_stage.c.experiment_id == continuing_candidate_id)
+        ).scalar_one()
+    assert continuing_state in {"screening", "screening_rejected"}
+    assert continuing_stage_count == 1
+
+    changed_bundle = _bundle(database, source_revision=1)
+    fresh_candidate = _candidate(database, changed_bundle)
+    assert fresh_candidate.candidate_id not in {held_candidate_id, continuing_candidate_id}
+    with database.engine.connect() as connection:
+        old_trial = connection.execute(
+            select(thesis_trial.c.ordinal).where(thesis_trial.c.candidate_id == held_candidate_id)
+        ).scalar_one()
+        run_count = connection.execute(
+            select(func.count())
+            .select_from(experiment_run)
+            .where(experiment_run.c.payload["candidate_id"].as_string() == held_candidate_id)
+        ).scalar_one()
+        holdout_count = connection.execute(
+            select(func.count()).select_from(holdout_claim)
+        ).scalar_one()
+    assert run_count == 1
+    assert holdout_count == 0
+
+    third_schedule = scheduler.run_once(
+        now=(dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=2)).isoformat()
+    )
+    assert third_schedule["jobs_enqueued"] >= 1
+    with database.engine.connect() as connection:
+        fresh_job = (
+            connection.execute(
+                select(job.c.id, job.c.payload, job.c.state).where(
+                    job.c.name == "evaluate_candidate",
+                    job.c.payload["candidate_id"].as_string() == fresh_candidate.candidate_id,
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert fresh_job["state"] == "pending"
+        assert (
+            fresh_job["payload"]["dataset_snapshot_ids"]
+            != scheduled_jobs[0]["payload"]["dataset_snapshot_ids"]
+        )
+        assert (
+            connection.execute(
+                select(experiment.c.state).where(experiment.c.id == held_candidate_id)
+            ).scalar_one()
+            == "screening_deferred"
+        )
+        assert (
+            connection.execute(
+                select(thesis_trial.c.ordinal).where(
+                    thesis_trial.c.candidate_id == held_candidate_id
+                )
+            ).scalar_one()
+            == old_trial
+        )
+    database.dispose()
+
+
 @pytest.mark.parametrize("approved_research", [False, True])
 def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
     tmp_path, monkeypatch, approved_research, lifecycle_database

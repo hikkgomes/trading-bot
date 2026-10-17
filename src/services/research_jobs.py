@@ -1499,8 +1499,6 @@ class DatabaseResearchJobHandlers:
                 "outcome_category"
             ),
         }
-        if result.deferred and response["outcome_category"] == "blocked_data":
-            response.update({"_defer": True, "_defer_reason": result.reason_code})
         if result.deferred and response["outcome_category"] == "blocked_infrastructure":
             raise ExecutorError(f"evaluation infrastructure failure: {result.reason_code}")
         if result.stage == "protected" and result.accepted:
