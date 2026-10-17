@@ -143,6 +143,41 @@ def _safe_logical_name(value: object) -> str:
     return value
 
 
+def _has_published_backup_manifest(directory: Path) -> bool:
+    return (
+        not directory.name.startswith(".")
+        and not directory.is_symlink()
+        and directory.is_dir()
+        and (directory / "manifest.json").is_file()
+    )
+
+
+def _backup_directories(root: Path, *, kind: str | None):
+    if kind not in {None, "postgresql", "parquet"}:
+        raise ValueError(f"unsupported backup kind: {kind}")
+    if not root.exists():
+        return
+    required_prefix = f"{kind}-" if kind is not None else None
+    opposite_prefix = (
+        "parquet-" if kind == "postgresql" else "postgresql-" if kind == "parquet" else None
+    )
+    for directory in sorted(root.iterdir()):
+        if required_prefix is None:
+            if _has_published_backup_manifest(directory):
+                yield directory
+            continue
+        # Filter before stat/read because the opposite pruner owns its lock.
+        if opposite_prefix is not None and directory.name.startswith(opposite_prefix):
+            continue
+        if directory.name.startswith(required_prefix):
+            if not _has_published_backup_manifest(directory):
+                raise ValueError(f"backup directory is invalid: {directory.name}")
+            yield directory
+            continue
+        if _has_published_backup_manifest(directory):
+            raise ValueError(f"unclassified backup directory: {directory.name}")
+
+
 def _safe_backup_id(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -208,12 +243,11 @@ class BackupStore:
     def __init__(self, root: Path):
         self.root = root
 
-    def discard_abandoned_builds(self) -> tuple[str, ...]:
-        """Remove unpublished builds while the caller owns the maintenance lock."""
-        pattern = re.compile(
-            r"\.(?:postgresql|parquet)-build-[A-Za-z0-9_]+"
-            r"|\.(?:postgresql|parquet)-[0-9]{8}T[0-9]{6}Z\.tmp"
-        )
+    def discard_abandoned_builds(self, *, kind: str) -> tuple[str, ...]:
+        """Remove unpublished builds of one kind while its lock is held."""
+        if kind not in {"postgresql", "parquet"}:
+            raise ValueError(f"unsupported backup kind: {kind}")
+        pattern = re.compile(rf"\.{kind}-build-[A-Za-z0-9_]+|\.{kind}-[0-9]{{8}}T[0-9]{{6}}Z\.tmp")
         removed = []
         for path in self.root.iterdir():
             if not pattern.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
@@ -321,9 +355,9 @@ class BackupStore:
 
     def verify(self, backup_id: str) -> BackupBundle:
         bundle = self._read_bundle(backup_id)
-        for logical_name, expected_hash in bundle.files.items():
-            if file_hash(self.root / backup_id / logical_name) != expected_hash:
-                raise ValueError(f"backup content hash does not match: {logical_name}")
+        for name, expected_hash in bundle.files.items():
+            if file_hash(self.root / backup_id / name) != expected_hash:
+                raise ValueError(f"backup content hash does not match: {name}")
         return bundle
 
     def restore(
@@ -365,19 +399,21 @@ class BackupStore:
     ) -> tuple[str, ...]:
         if not self.root.exists():
             return ()
+        kind = None
         if logical_name is not None:
             logical_name = _safe_logical_name(logical_name)
+            kind = {
+                "database.dump": "postgresql",
+                "parquet.tar.gz": "parquet",
+            }.get(logical_name)
+            if kind is None:
+                raise ValueError(f"unsupported backup retention type: {logical_name}")
         bundles = []
-        for directory in self.root.iterdir():
-            if (
-                directory.is_dir()
-                and not directory.is_symlink()
-                and not directory.name.startswith(".")
-                and (directory / "manifest.json").is_file()
-            ):
-                bundle = self._read_bundle(directory.name)
-                if logical_name is None or tuple(sorted(bundle.files)) == (logical_name,):
-                    bundles.append(bundle)
+        for directory in _backup_directories(self.root, kind=kind):
+            bundle = self._read_bundle(directory.name)
+            if logical_name is not None and tuple(sorted(bundle.files)) != (logical_name,):
+                raise ValueError(f"backup kind does not match its ID: {directory.name}")
+            bundles.append(bundle)
         removed, latest = _retention_plan(bundles, older_than_timestamp, thin_before_timestamp)
         # Never delete an earlier recovery point unless its replacement verifies.
         for backup_id in latest:

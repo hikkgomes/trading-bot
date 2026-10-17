@@ -13,6 +13,7 @@ from src.services.backups import (
     BackupBundle,
     BackupStore,
     PostgreSQLBackup,
+    _backup_directories,
     create_directory_archive,
     rehearse_postgresql_restore,
     restore_directory_archive,
@@ -69,31 +70,35 @@ def create_parquet_backup(*, config_path: Path, now: dt.datetime | None = None) 
 
 def verify_backups(*, config_path: Path) -> int:
     config = load_platform_config(config_path)
-    store = BackupStore(Path(config.paths["backups"]))
-    verified = 0
+    root = Path(config.paths["backups"])
+    store = BackupStore(root)
+    verified_ids: set[str] = set()
     database_bundles: list[BackupBundle] = []
-    for directory in sorted(store.root.iterdir() if store.root.exists() else ()):
-        if directory.name.startswith(".") or directory.is_symlink() or not directory.is_dir():
-            continue
-        bundle = store.verify(directory.name)
-        archive = directory / "parquet.tar.gz"
-        dump = directory / "database.dump"
-        if "parquet.tar.gz" in bundle.files:
-            verify_directory_archive(archive)
-        if "database.dump" in bundle.files:
-            verify_postgresql_dump(dump)
-            database_bundles.append(bundle)
-        if not bundle.files:
-            raise ValueError(f"backup has no content: {directory.name}")
-        verified += 1
-    if database_bundles:
-        newest = max(database_bundles, key=_backup_created_timestamp)
-        dump = store.root / newest.backup_id / "database.dump"
-        summary = rehearse_postgresql_restore(dump, scratch_root=store.root)
-        if store.verify(newest.backup_id) != newest:
-            raise ValueError("backup changed during PostgreSQL restore rehearsal")
-        write_postgresql_restore_receipt(store.root, newest, summary)
-    return verified
+    for kind, logical_name in (
+        ("postgresql", "database.dump"),
+        ("parquet", "parquet.tar.gz"),
+    ):
+        lock_target = root / f"maintenance-{kind}"
+        with acquire_file_update_lock(lock_target, label=f"{kind} backup verification"):
+            for directory in _backup_directories(root, kind=kind):
+                bundle = store._read_bundle(directory.name)
+                if tuple(sorted(bundle.files)) != (logical_name,):
+                    raise ValueError(f"backup kind does not match its ID: {directory.name}")
+                store.verify(bundle.backup_id)
+                if kind == "parquet":
+                    verify_directory_archive(directory / logical_name)
+                else:
+                    verify_postgresql_dump(directory / logical_name)
+                    database_bundles.append(bundle)
+                verified_ids.add(bundle.backup_id)
+            if kind == "postgresql" and database_bundles:
+                newest = max(database_bundles, key=_backup_created_timestamp)
+                dump = root / newest.backup_id / "database.dump"
+                summary = rehearse_postgresql_restore(dump, scratch_root=root)
+                if store.verify(newest.backup_id) != newest:
+                    raise ValueError("backup changed during PostgreSQL restore rehearsal")
+                write_postgresql_restore_receipt(root, newest, summary)
+    return len(verified_ids)
 
 
 def _backup_created_timestamp(bundle: BackupBundle) -> float:
@@ -125,10 +130,11 @@ def restore_postgresql_backup(
 ) -> str:
     config = load_platform_config(config_path)
     store = BackupStore(Path(config.paths["backups"]))
-    bundle = store.verify(backup_id)
+    bundle = store._read_bundle(backup_id)
+    if tuple(sorted(bundle.files)) != ("database.dump",):
+        raise ValueError(f"backup does not contain only a PostgreSQL dump: {backup_id}")
+    store.verify(backup_id)
     dump = Path(config.paths["backups"]) / backup_id / "database.dump"
-    if "database.dump" not in bundle.files:
-        raise ValueError(f"backup does not contain a PostgreSQL dump: {backup_id}")
     PostgreSQLBackup(target_database_url or config.database_url()).restore(dump)
     return backup_id
 
@@ -136,10 +142,11 @@ def restore_postgresql_backup(
 def restore_parquet_backup(*, config_path: Path, backup_id: str, destination: Path) -> int:
     config = load_platform_config(config_path)
     store = BackupStore(Path(config.paths["backups"]))
-    bundle = store.verify(backup_id)
+    bundle = store._read_bundle(backup_id)
+    if tuple(sorted(bundle.files)) != ("parquet.tar.gz",):
+        raise ValueError(f"backup does not contain only a Parquet archive: {backup_id}")
+    store.verify(backup_id)
     archive = Path(config.paths["backups"]) / backup_id / "parquet.tar.gz"
-    if "parquet.tar.gz" not in bundle.files:
-        raise ValueError(f"backup does not contain a Parquet archive: {backup_id}")
     return restore_directory_archive(archive, destination)
 
 
@@ -161,13 +168,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config = load_platform_config(args.config)
-    lock_target = Path(config.paths["backups"]) / "maintenance"
-    with acquire_file_update_lock(lock_target, label="backup maintenance"):
+    if args.mode == "verify":
+        _run_command(args)
+        return
+    kind = (
+        "postgresql" if args.mode.endswith("postgresql") or args.mode == "postgresql" else "parquet"
+    )
+    lock_target = Path(config.paths["backups"]) / f"maintenance-{kind}"
+    with acquire_file_update_lock(lock_target, label=f"{kind} backup maintenance"):
         discarded: tuple[str, ...] = ()
         removed: tuple[str, ...] = ()
         if args.mode in {"postgresql", "parquet"}:
-            discarded = BackupStore(lock_target.parent).discard_abandoned_builds()
-            logical_name = "database.dump" if args.mode == "postgresql" else "parquet.tar.gz"
+            store = BackupStore(lock_target.parent)
+            discarded = store.discard_abandoned_builds(kind=kind)
+            logical_name = "database.dump" if kind == "postgresql" else "parquet.tar.gz"
             removed = prune_backups(config_path=args.config, logical_name=logical_name)
         _run_command(args, discarded_temporary=discarded, removed_backups=removed)
 

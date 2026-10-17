@@ -63,6 +63,9 @@ class ResearchWorker:
         )
         if claimed is None:
             return {"reason_code": "research_queue_empty"}
+        if claimed.name == "agent_review":
+            # Metadata-only review preparation must not wait for a long dataset build.
+            return self._execute_handler(claimed, self.handlers[claimed.name], None)
         compute_lease = self._acquire_compute_lease(claimed, now=now)
         if self.heavy_compute is not None and compute_lease is None:
             self.queue.defer(

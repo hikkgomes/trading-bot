@@ -453,14 +453,15 @@ def test_backup_retention_keeps_recent_daily_and_last_verified_recovery_points(t
 
 def test_backup_retention_can_be_scoped_to_one_logical_file_type(tmp_path, monkeypatch):
     import datetime as dt
+    from unittest.mock import Mock
 
     from src.services.backups import BackupStore
 
     store = BackupStore(tmp_path / "backups")
     source = tmp_path / "source"
     bundles = (
-        ("db-old", "2026-01-01T00:00:00+00:00", "database.dump"),
-        ("db-latest", "2026-01-30T00:00:00+00:00", "database.dump"),
+        ("postgresql-old", "2026-01-01T00:00:00+00:00", "database.dump"),
+        ("postgresql-latest", "2026-01-30T00:00:00+00:00", "database.dump"),
         ("parquet-old", "2026-01-01T00:00:00+00:00", "parquet.tar.gz"),
         ("parquet-latest", "2026-01-30T00:00:00+00:00", "parquet.tar.gz"),
     )
@@ -474,6 +475,8 @@ def test_backup_retention_can_be_scoped_to_one_logical_file_type(tmp_path, monke
     (store.root / "parquet-latest/parquet.tar.gz").write_text("damaged")
     verified = []
     verify = store.verify
+    read_bundle = Mock(wraps=store._read_bundle)
+    monkeypatch.setattr(store, "_read_bundle", read_bundle)
 
     def track_verify(identity):
         verified.append(identity)
@@ -486,9 +489,66 @@ def test_backup_retention_can_be_scoped_to_one_logical_file_type(tmp_path, monke
         logical_name="database.dump",
     )
 
-    assert removed == ("db-old",)
-    assert verified == ["db-latest"]
+    assert removed == ("postgresql-old",)
+    assert verified == ["postgresql-latest"]
+    assert all(not call.args[0].startswith("parquet-") for call in read_bundle.call_args_list)
     assert (store.root / "parquet-old").is_dir()
+    assert (store.root / "parquet-latest").is_dir()
+
+    source.write_text("mixed bundle")
+    store.create(
+        backup_id="postgresql-mixed",
+        created_at="2026-01-31T00:00:00+00:00",
+        files={"database.dump": source, "parquet.tar.gz": source},
+    )
+    with pytest.raises(ValueError, match="backup kind does not match"):
+        store.prune(
+            older_than_timestamp=dt.datetime(2026, 1, 31, 12, tzinfo=dt.UTC).timestamp(),
+            logical_name="database.dump",
+        )
+    assert (store.root / "postgresql-mixed").is_dir()
+
+
+def test_scoped_backup_enumeration_skips_opposite_kind_removed_after_listing(tmp_path, monkeypatch):
+    import datetime as dt
+    import shutil
+
+    from src.services.backups import BackupStore
+
+    store = BackupStore(tmp_path / "backups")
+    source = tmp_path / "source"
+    for identity, timestamp, logical_name in (
+        ("postgresql-old", "2026-01-01T00:00:00+00:00", "database.dump"),
+        ("postgresql-latest", "2026-01-30T00:00:00+00:00", "database.dump"),
+        ("parquet-old", "2026-01-01T00:00:00+00:00", "parquet.tar.gz"),
+        ("parquet-latest", "2026-01-30T00:00:00+00:00", "parquet.tar.gz"),
+    ):
+        source.write_text(identity)
+        store.create(
+            backup_id=identity,
+            created_at=timestamp,
+            files={logical_name: source},
+        )
+
+    root_iterdir = Path.iterdir
+    removed_opposite_kind = store.root / "parquet-old"
+    monkeypatch.setattr(
+        Path,
+        "iterdir",
+        lambda path: iter(
+            (
+                list(root_iterdir(path)),
+                shutil.rmtree(removed_opposite_kind) if path == store.root else None,
+            )[0]
+        ),
+    )
+    removed = store.prune(
+        older_than_timestamp=dt.datetime(2026, 1, 31, 12, tzinfo=dt.UTC).timestamp(),
+        logical_name="database.dump",
+    )
+
+    assert removed == ("postgresql-old",)
+    assert not removed_opposite_kind.exists()
     assert (store.root / "parquet-latest").is_dir()
 
 
@@ -569,13 +629,16 @@ def test_backup_verification_ignores_unpublished_builds(tmp_path, monkeypatch):
     source.write_bytes(b"verified recovery data")
     store = BackupStore(root)
     store.create(
-        backup_id="published", created_at="2026-01-01T00:00:00+00:00", files={"evidence": source}
+        backup_id="parquet-published",
+        created_at="2026-01-01T00:00:00+00:00",
+        files={"parquet.tar.gz": source},
     )
     for name in (".parquet-build-pending", ".postgresql-build-pending", ".incomplete.tmp"):
         (root / name).mkdir()
         (root / name / "partial").write_bytes(b"incomplete")
     config = SimpleNamespace(paths={"backups": str(root)})
     monkeypatch.setattr(backup_service, "load_platform_config", lambda _: config)
+    monkeypatch.setattr(backup_service, "verify_directory_archive", lambda _: 1)
     assert backup_service.verify_backups(config_path=tmp_path / "config") == 1
 
 
@@ -586,11 +649,13 @@ def test_backup_restart_removes_only_unpublished_builds(tmp_path, monkeypatch):
     from src.services.backups import BackupStore
 
     root = tmp_path / "backups"
-    source = tmp_path / "evidence"
+    source = tmp_path / "database.dump"
     source.write_bytes(b"published recovery point")
     store = BackupStore(root)
     store.create(
-        backup_id="published", created_at="2026-10-15T00:00:00+00:00", files={"evidence": source}
+        backup_id="postgresql-published",
+        created_at="2026-10-15T00:00:00+00:00",
+        files={"database.dump": source},
     )
     abandoned = (
         ".parquet-build-interrupted",
@@ -609,11 +674,73 @@ def test_backup_restart_removes_only_unpublished_builds(tmp_path, monkeypatch):
     monkeypatch.setattr(backup_service, "create_database_backup", lambda **_: "created")
     backup_service.main(["--mode", "postgresql", "--config", str(tmp_path / "config")])
     prune.assert_called_once_with(config_path=tmp_path / "config", logical_name="database.dump")
-    assert all(not (root / name).exists() for name in abandoned)
+    assert all(
+        not (root / name).exists()
+        for name in (".postgresql-build-interrupted", ".postgresql-20261015T000000Z.tmp")
+    )
+    assert (root / ".parquet-build-interrupted").is_dir()
     assert all((root / name / "data").read_bytes() == b"evidence" for name in retained)
     assert (root / ".parquet-build-link").is_symlink()
     assert source.read_bytes() == b"published recovery point"
-    assert store.verify("published").files
+    assert store.verify("postgresql-published").files
+
+    monkeypatch.setattr(backup_service, "create_parquet_backup", lambda **_: "created-parquet")
+    backup_service.main(["--mode", "parquet", "--config", str(tmp_path / "config")])
+    assert prune.call_args_list[1].kwargs == {
+        "config_path": tmp_path / "config",
+        "logical_name": "parquet.tar.gz",
+    }
+    assert not (root / ".parquet-build-interrupted").exists()
+    assert (root / ".parquet-build-link").is_symlink()
+
+
+def test_postgresql_maintenance_overlaps_parquet_and_scopes_cleanup(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from unittest.mock import Mock
+
+    from src.data.locking import acquire_file_update_lock
+    from src.services import backup_service
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    parquet_active = root / ".parquet-build-running"
+    parquet_active.mkdir()
+    (parquet_active / "partial").write_bytes(b"active parquet writer")
+    postgres_abandoned = root / ".postgresql-build-abandoned"
+    postgres_abandoned.mkdir()
+    config = SimpleNamespace(paths={"backups": str(root)})
+    monkeypatch.setattr(backup_service, "load_platform_config", lambda _: config)
+    monkeypatch.setattr(backup_service, "prune_backups", lambda **_: ())
+    created = Event()
+    monkeypatch.setattr(
+        backup_service,
+        "create_database_backup",
+        Mock(side_effect=lambda **_: (created.set() or "created")),
+    )
+    arguments = ["--mode", "postgresql", "--config", str(tmp_path / "config")]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with acquire_file_update_lock(root / "maintenance-parquet", label="test parquet writer"):
+            future = executor.submit(backup_service.main, arguments)
+            future.result(timeout=5)
+            assert created.is_set()
+            assert parquet_active.is_dir()
+            assert not postgres_abandoned.exists()
+
+        postgres_active = root / ".postgresql-build-running"
+        postgres_active.mkdir()
+        (postgres_active / "partial").write_bytes(b"active database writer")
+        created.clear()
+        with acquire_file_update_lock(
+            root / "maintenance-postgresql", label="test database writer"
+        ):
+            future = executor.submit(backup_service.main, arguments)
+            assert not created.wait(timeout=0.1)
+            assert postgres_active.is_dir()
+        future.result(timeout=5)
+        assert created.is_set()
+        assert not postgres_active.exists()
 
 
 def test_backup_verification_rehearses_newest_database_and_writes_bound_receipt(

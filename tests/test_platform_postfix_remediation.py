@@ -1009,6 +1009,46 @@ def test_resource_deferral_does_not_consume_a_research_attempt(tmp_path: Path, m
             select(job.c.state, job.c.attempts).where(job.c.id == "heavy-job")
         ).one()
     assert (state, attempts) == ("pending", 0)
+    from src.services.agent_worker import DatabaseAgentJobHandlers
+
+    queue.register_worker(
+        worker_id="agent-coordinator",
+        node_id="linux-optiplex",
+        role="agent-coordinator",
+        capabilities=("agent_review",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="review-during-build",
+        name="agent_review",
+        payload={"product_id": "btc_accumulation"},
+        available_at=NOW,
+    )
+    monkeypatch.setattr("src.services.agent_worker.utc_now", lambda: NOW)
+    handlers = DatabaseAgentJobHandlers(
+        queue=queue,
+        store=SqlAgentStore(database.engine),
+        code_workflow=SimpleNamespace(),
+        maximum_runtime_seconds=60,
+    )
+    result = ResearchWorker(
+        runtime=runtime,
+        queue=queue,
+        worker_id="agent-coordinator",
+        handlers={"agent_review": handlers.agent_review},
+        heavy_compute=HeavyComputeLeaseStore(database.engine),
+    ).run_once(now=NOW)
+    assert result["review_id"]
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(job.c.state).where(job.c.id == "review-during-build")
+            ).scalar_one()
+            == "completed"
+        )
+        assert connection.execute(
+            select(heavy_compute_lease.c.owner, heavy_compute_lease.c.status)
+        ).one() == ("other-worker", "active")
     database.dispose()
 
 
