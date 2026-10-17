@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import sys
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -45,10 +46,60 @@ def timestamp(value: str | dt.datetime, *, field: str, preserve_subseconds: bool
 
 def json_value(value: Any, *, field: str) -> Any:
     try:
-        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return _copy_json_value(value, set())
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} must be JSON-safe") from exc
-    return json.loads(raw)
+
+
+def _copy_json_value(value: Any, ancestors: set[int]) -> Any:
+    """Detach a JSON tree without allocating its entire encoded text as well."""
+    if isinstance(value, dict | list | tuple):
+        return _copy_json_container(value, ancestors)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return str.__str__(value)
+    if isinstance(value, int):
+        integer = int.__int__(value)
+        if integer.bit_length() > 3 * sys.int_info.str_digits_check_threshold:
+            str(integer)  # Preserve the JSON encoder's integer digit limit.
+        return integer
+    if isinstance(value, float):
+        number = float.__float__(value)
+        if not math.isfinite(number):
+            raise ValueError("non-finite JSON number")
+        return number
+    raise TypeError(f"Cannot encode {type(value).__name__}")
+
+
+def _copy_json_container(value: Any, ancestors: set[int]) -> Any:
+    identity = id(value)
+    if identity in ancestors:
+        raise ValueError("Circular reference detected")
+    ancestors.add(identity)
+    try:
+        if isinstance(value, dict):
+            return {
+                _json_key(key): _copy_json_value(item, ancestors)
+                for key, item in sorted(value.items())
+            }
+        return [_copy_json_value(item, ancestors) for item in value]
+    finally:
+        ancestors.remove(identity)
+
+
+def _json_key(key: Any) -> str:
+    if isinstance(key, str):
+        return str.__str__(key)
+    if key is None:
+        return "null"
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, int):
+        return str(int.__int__(key))
+    if isinstance(key, float) and math.isfinite(key):
+        return repr(float.__float__(key))
+    raise TypeError("JSON object keys must be finite numbers, strings, booleans or null")
 
 
 def canonical_hash(value: Any) -> str:
@@ -56,10 +107,13 @@ def canonical_hash(value: Any) -> str:
         value = dataclasses.asdict(value)
     if isinstance(value, Enum):
         value = value.value
-    raw = json.dumps(
-        value, default=_json_default, sort_keys=True, separators=(",", ":"), allow_nan=False
+    encoder = json.JSONEncoder(
+        default=_json_default, sort_keys=True, separators=(",", ":"), allow_nan=False
     )
-    return f"sha256:{hashlib.sha256(raw.encode()).hexdigest()}"
+    digest = hashlib.sha256()
+    for chunk in encoder.iterencode(value):
+        digest.update(chunk.encode())
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _json_default(value: Any) -> Any:

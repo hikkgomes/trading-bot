@@ -18,7 +18,11 @@ from src.data.database import PlatformDatabase
 from src.domain._codec import canonical_hash
 from src.research.datasets import RESEARCH_BUNDLE_ROLES, CanonicalResearchDatasetBuilder
 from src.research.store import SqlResearchStore
-from src.services.agent_worker import DatabaseAgentJobHandlers, build_agent_review_context
+from src.services.agent_worker import (
+    DatabaseAgentJobHandlers,
+    adaptive_research_report,
+    build_agent_review_context,
+)
 from src.services.control_api import DatabaseControlPlane, build_control_server
 from src.services.health import DatabaseHeartbeatStore
 from src.services.scheduler import DatabaseJobQueue
@@ -711,6 +715,8 @@ def test_scheduled_review_producer_reader_and_retry_share_one_context_identity(
     bridge = OpenClawAgentBridge(store=store, queue=queue)
     request = bridge.review_request(first["review_id"])
     assert request["context_hash"] == first["context_hash"]
+    assert request["context"]["data_availability"]["hypothesis_inputs_ready"] is False
+    assert request["context"]["strategy_catalogue"]["families"] == []
     clock[0] = (dt.datetime.fromisoformat(NOW) + dt.timedelta(minutes=1)).isoformat()
     assert handlers.agent_review(claimed, lambda: None) == first
     assert len(store.records("review")) == 1
@@ -756,30 +762,266 @@ def test_scheduled_reviews_cover_both_products_without_duplicate_jobs(tmp_path, 
 def test_scheduled_agent_review_exposes_adaptive_failures_without_holdout_data() -> None:
     context = build_agent_review_context(
         {
+            "product_id": "active_income",
             "research": {
                 "funnel": {
                     "top_rejection_reasons": {"negative_return": 3},
                     "feature_family_concentration": {"time_series": 4},
                     "exact_duplicate_rate": 0.25,
                     "near_duplicate_rate": 0.10,
-                    "missing_stage_datasets": {"robustness": 1},
                     "candidates_generated": 8,
                     "candidates_evaluated": 5,
-                    "candidates_never_evaluated": ["candidate-1"],
+                    "candidates_never_evaluated_count": 3,
                     "theses_generated": 7,
                     "cumulative_trial_count": 11,
                     "candidates_rejected_by_stage": {"development": 3},
-                    "first_blocked_stage": {"development": 3},
-                    "jobs_dead_letter": 1,
                 }
-            }
+            },
         },
         created_at=NOW,
+        product_id="active_income",
     )
 
     assert context.values["failure_reasons"] == {"negative_return": 3}
     assert "holdout_outcomes" not in context.values
     assert "protected_holdout" not in str(context.values).lower()
+    assert context.values["data_availability"]["hypothesis_inputs_ready"] is False
+
+
+def test_review_context_uses_supported_product_catalogue_without_protected_payloads(tmp_path):
+    from sqlalchemy import delete, insert
+
+    from src.data.database import (
+        dataset_snapshot,
+        experiment,
+        experiment_run,
+        instrument,
+        strategy_definition,
+        strategy_version,
+        validation_stage,
+    )
+    from src.research.economic_series import ECONOMIC_ENGINE_VERSION
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'review-context.sqlite3'}")
+    database.create_schema()
+    scopes = {
+        "btc_accumulation": ("binance:spot:BTCUSDT",),
+        "active_income": (
+            "binance:futures:BTCUSDT:USDT",
+            "binance:futures:ETHUSDT:USDT",
+        ),
+    }
+    instrument_rows = [
+        {
+            "id": instrument_id,
+            "venue": "binance",
+            "market_type": "spot" if product_id == "btc_accumulation" else "futures",
+            "exchange_symbol": instrument_id.split(":")[2],
+            "base_asset": instrument_id.split(":")[2].removesuffix("USDT"),
+            "quote_asset": "USDT",
+            "settlement_asset": "USDT" if product_id == "active_income" else None,
+            "payload": {},
+        }
+        for product_id, instrument_ids in scopes.items()
+        for instrument_id in instrument_ids
+    ]
+    bundles = {}
+    for product_id, instrument_ids in scopes.items():
+        bundles[product_id] = CanonicalResearchDatasetBuilder(database.engine).build(
+            product_id,
+            intervals={
+                role: {
+                    "start": f"2026-08-{20 + index:02d}T00:00:00+00:00",
+                    "end": f"2026-08-{21 + index:02d}T00:00:00+00:00",
+                }
+                for index, role in enumerate(RESEARCH_BUNDLE_ROLES)
+            },
+            payload_by_role={
+                role: {
+                    "timeframe": "1h" if product_id == "btc_accumulation" else "15m",
+                    "bars": [{"close": 100.0}],
+                    "raw_marker": "PROTECTED_PAYLOAD_SENTINEL",
+                }
+                for role in RESEARCH_BUNDLE_ROLES
+            },
+            universe_snapshot_id=canonical_hash({"universe": product_id}),
+            feature_manifest_id=canonical_hash({"features": "review"}),
+            cost_model_id=canonical_hash({"costs": "review"}),
+            parameter_set_id=canonical_hash({"parameters": "review"}),
+            instrument_scope=instrument_ids,
+            availability_timestamp=NOW,
+            created_at=NOW,
+        )
+
+    definitions = [
+        {
+            "id": "review-active-definition",
+            "identity": "review-active-identity",
+            "product_id": "active_income",
+            "source_type": "generated_dsl",
+            "source_hash": canonical_hash({"definition": "active"}),
+            "definition": {
+                "family": "time_series",
+                "feature_graph": {"required_nodes": ["trend", "returns", "secret_feature"]},
+                "metadata": {"api_secret": "PRIVATE_FIELD_SENTINEL"},
+            },
+        },
+        {
+            "id": "review-btc-definition",
+            "identity": "review-btc-identity",
+            "product_id": "btc_accumulation",
+            "source_type": "generated_dsl",
+            "source_hash": canonical_hash({"definition": "btc"}),
+            "definition": {
+                "family": "time_series",
+                "feature_graph": {"required_nodes": ["secret_feature"]},
+                "metadata": {"api_secret": "PRIVATE_FIELD_SENTINEL"},
+            },
+        },
+    ]
+    versions = [
+        {
+            "id": f"{definition['id']}-version",
+            "definition_id": definition["id"],
+            "version": "review-v1",
+            "created_at": NOW,
+            "payload": {},
+        }
+        for definition in definitions
+    ]
+    candidate_rows = [
+        {
+            "id": f"review-{product_id}-candidate",
+            "strategy_version_id": (
+                "review-active-definition-version"
+                if product_id == "active_income"
+                else "review-btc-definition-version"
+            ),
+            "provider": "fixture",
+            "state": "submitted",
+            "submitted_at": NOW,
+            "dataset_snapshot_hashes": [],
+            "dataset_bundle_id": bundles[product_id].bundle_id,
+            "metadata": {"raw_price": "RAW_PRICE_SENTINEL"},
+        }
+        for product_id in scopes
+    ]
+    run_rows = [
+        {"id": f"review-{product_id}-{stage}-run", "created_at": NOW, "payload": {}}
+        for product_id, stages in {
+            "active_income": ("screening", "development"),
+            "btc_accumulation": ("protected_holdout",),
+        }.items()
+        for stage in stages
+    ]
+    stage_rows = []
+    for product_id, stages in {
+        "active_income": (("screening", True, None), ("development", False, "negative_return")),
+        "btc_accumulation": (("protected_holdout", False, "protected_result_secret"),),
+    }.items():
+        for stage, accepted, reason in stages:
+            stage_rows.append(
+                {
+                    "id": f"review-{product_id}-{stage}",
+                    "experiment_id": f"review-{product_id}-candidate",
+                    "stage": stage,
+                    "source_run_id": f"review-{product_id}-{stage}-run",
+                    "evaluated_at": NOW,
+                    "state": "evaluated",
+                    "accepted": accepted,
+                    "reason_code": reason,
+                    "evidence_hash": canonical_hash({"stage": stage}),
+                    "evaluation_identity": f"review-{product_id}-{stage}-identity",
+                    "engine_version": ECONOMIC_ENGINE_VERSION,
+                    "outcome_category": "accepted" if accepted else "rejected",
+                    "payload": {
+                        "raw_price": "RAW_PRICE_SENTINEL",
+                        "protected_result": "PROTECTED_RESULT_SENTINEL",
+                        "api_secret": "PRIVATE_FIELD_SENTINEL",
+                    },
+                }
+            )
+
+    with database.engine.begin() as connection:
+        connection.execute(insert(instrument), instrument_rows)
+        connection.execute(insert(strategy_definition), definitions)
+        connection.execute(insert(strategy_version), versions)
+        connection.execute(insert(experiment), candidate_rows)
+        connection.execute(insert(experiment_run), run_rows)
+        connection.execute(insert(validation_stage), stage_rows)
+
+    active_report = adaptive_research_report(database.engine, product_id="active_income", at=NOW)
+    btc_report = adaptive_research_report(database.engine, product_id="btc_accumulation", at=NOW)
+    active_context = build_agent_review_context(
+        active_report, created_at=NOW, product_id="active_income"
+    )
+    btc_context = build_agent_review_context(
+        btc_report, created_at=NOW, product_id="btc_accumulation"
+    )
+
+    active = active_context.values
+    assert active["product_id"] == "active_income"
+    assert active["data_availability"]["hypothesis_inputs_ready"] is True
+    assert active["data_availability"]["available_data"] == ["closed_ohlcv_bars"]
+    assert active["instrument_universe"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert active["instrument_universe"]["venue"] == "binance"
+    assert active["instrument_universe"]["market_type"] == "futures"
+    assert active["instrument_universe"]["settlement_asset"] == "USDT"
+    assert active["strategy_catalogue"]["evidence_type"] == "swing"
+    assert active["strategy_catalogue"]["families"] == ["mean_reversion", "time_series"]
+    assert active["feature_catalogue"]["supported_by_family"] == {
+        "mean_reversion": ["normalised_price_deviation", "oscillator", "range_state"],
+        "time_series": ["breakout", "realised_volatility", "returns", "trend"],
+    }
+    assert active["feature_catalogue"]["publicly_observed_by_stage"]["development"] == {
+        "time_series": ["returns", "trend"]
+    }
+    assert active["development_results"]["development_evaluated"] == 1
+    assert active["failure_reasons"] == {"negative_return": 1}
+
+    btc = btc_context.values
+    assert btc["product_id"] == "btc_accumulation"
+    assert btc["data_availability"]["hypothesis_inputs_ready"] is True
+    assert btc["instrument_universe"]["symbols"] == ["BTCUSDT"]
+    assert btc["instrument_universe"]["venue"] == "binance"
+    assert btc["instrument_universe"]["market_type"] == "spot"
+    assert btc["strategy_catalogue"]["evidence_type"] == "btc_allocation"
+    assert btc["strategy_catalogue"]["families"]
+    assert btc["feature_catalogue"]["supported_by_family"] == {
+        "mean_reversion": ["normalised_price_deviation", "oscillator", "range_state"],
+        "time_series": ["breakout", "realised_volatility", "returns", "trend"],
+    }
+    assert btc["development_results"]["development_evaluated"] == 0
+    assert btc["feature_catalogue"]["publicly_observed_by_stage"]["development"] == {}
+    mismatched = build_agent_review_context(
+        active_report, created_at=NOW, product_id="btc_accumulation"
+    )
+    assert "product_id" not in mismatched.values
+    assert mismatched.values["data_availability"]["hypothesis_inputs_ready"] is False
+    assert mismatched.values["strategy_catalogue"]["families"] == []
+    for context in (active, btc):
+        serialised = json.dumps(context)
+        for sentinel in (
+            "PRIVATE_FIELD_SENTINEL",
+            "RAW_PRICE_SENTINEL",
+            "PROTECTED_PAYLOAD_SENTINEL",
+            "PROTECTED_RESULT_SENTINEL",
+            "secret_feature",
+        ):
+            assert sentinel not in serialised
+    before_bundle = adaptive_research_report(
+        database.engine, product_id="active_income", at="2026-08-29T23:59:59+00:00"
+    )
+    assert before_bundle["research"]["product_inputs"]["hypothesis_inputs_ready"] is False
+    with database.engine.begin() as connection:
+        connection.execute(
+            delete(dataset_snapshot).where(
+                dataset_snapshot.c.id == bundles["btc_accumulation"].stage_snapshot_ids["screening"]
+            )
+        )
+    missing_stage = adaptive_research_report(database.engine, product_id="btc_accumulation", at=NOW)
+    assert missing_stage["research"]["product_inputs"]["hypothesis_inputs_ready"] is False
+    database.dispose()
 
 
 def test_native_research_profile_rejects_plugin_overrides(tmp_path, monkeypatch):

@@ -142,6 +142,101 @@ from src.services.scheduler import DatabaseJobQueue
 NOW = "2026-08-13T12:00:00+00:00"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"unicode": "£東京\ud800", "values": (-0.0, 1e-300, 1e300, True, None)},
+        {2: "second", 10: "tenth"},
+        {None: (1, 2)},
+        {False: 0, True: 1},
+        {-0.0: "zero", 1e-7: "small"},
+        {"kind": StrategySourceType.GENERATED_DSL},
+    ],
+)
+def test_json_normalisation_preserves_persisted_representation(value):
+    import hashlib
+    import json
+
+    from src.domain._codec import json_value
+
+    expected = json.loads(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    normalised = json_value(value, field="dataset")
+    assert normalised == expected
+    assert list(normalised) == list(expected)
+    encoded = json.dumps(expected, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert canonical_hash(normalised) == "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def test_json_normalisation_detaches_containers_and_rejects_unsafe_values():
+    from src.domain._codec import json_value
+
+    shared = [{"value": 1}]
+    result = json_value({"first": shared, "second": shared}, field="dataset")
+    shared[0]["value"] = 2
+    result["first"][0]["value"] = 3
+    assert result["second"] == [{"value": 1}]
+    import sys
+
+    limit = sys.get_int_max_str_digits()
+    if limit:
+        with pytest.raises(ValueError, match="dataset must be JSON-safe"):
+            json_value({"integer": 10**limit}, field="dataset")
+    cyclic = []
+    cyclic.append(cyclic)
+    for value in (float("nan"), float("inf"), Decimal("1"), {"a": 1, 2: 3}, {(1,): 2}, cyclic):
+        with pytest.raises(ValueError, match="dataset must be JSON-safe"):
+            json_value(value, field="dataset")
+
+
+def test_canonical_hash_preserves_enum_decimal_and_dataclass_encoding():
+    import hashlib
+    import json
+
+    from src.services.scheduler import ScheduleSpec
+
+    value = {
+        "schedule": ScheduleSpec("research", 15),
+        "kind": StrategySourceType.GENERATED_DSL,
+        "amount": Decimal("0.00000001"),
+    }
+    primitive = {
+        "schedule": {"name": "research", "interval_seconds": 15, "priority": 0},
+        "kind": StrategySourceType.GENERATED_DSL.value,
+        "amount": "1E-8",
+    }
+    encoded = json.dumps(primitive, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert canonical_hash(value) == "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+    assert canonical_hash(StrategySourceType.GENERATED_DSL) == canonical_hash(
+        StrategySourceType.GENERATED_DSL.value
+    )
+
+
+def test_dataset_json_copy_and_hash_avoid_full_encoded_temporary_buffers():
+    import hashlib
+    import json
+    import tracemalloc
+
+    from src.domain._codec import json_value
+
+    payload = {"rows": [{"price": 100.25, "symbol": "BTCUSDT", "source": "x" * 256}] * 10000}
+    tracemalloc.start()
+    legacy = json.loads(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    _, old_copy_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    tracemalloc.start()
+    copied = json_value(payload, field="dataset")
+    _, copy_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert copied == legacy and copy_peak < old_copy_peak * 0.7
+    encoded = json.dumps(copied, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    expected = "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+    tracemalloc.start()
+    assert canonical_hash(copied) == expected
+    _, hash_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert hash_peak < len(encoded) // 4
+
+
 def _test_thesis(*, budget: int = 20) -> ResearchThesis:
     return ResearchThesis(
         mechanism_category=MechanismCategory.BEHAVIOURAL,

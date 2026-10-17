@@ -289,7 +289,11 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tm
         try:
             from src.services.agent_worker import adaptive_research_report
 
-            report = adaptive_research_report(adaptive)
+            report = adaptive_research_report(
+                adaptive,
+                product_id=candidate.definition.product,
+                at=NOW,
+            )
             assert report["research"]["funnel"]["candidates_generated"] == 2
             restored = SqlResearchStore(adaptive).get_candidate(candidate.candidate_id)
             assert restored.candidate_id == candidate.candidate_id
@@ -767,20 +771,116 @@ def test_only_operator_can_approve_research_policy():
 )
 @pytest.mark.parametrize("phase", ["holdout", "forward"])
 def test_adaptive_roles_cannot_read_protected_data_or_legacy_holdout_metrics(phase):
+    from src.domain._codec import canonical_hash
+    from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+
     run_id = uuid.uuid4().hex
-    ids = {
-        role: f"visibility-{role}-{run_id}"
-        for role in ("development", "protected_holdout", "forward_observation")
+    roles = (
+        "screening",
+        "development",
+        "robustness",
+        "protected_holdout",
+        "forward_observation",
+    )
+    ids = {role: canonical_hash({"visibility": role, "run_id": run_id}) for role in roles}
+    scope = ["binance:futures:BTCUSDT:USDT"]
+    universe_id = canonical_hash({"universe": run_id})
+    feature_id = canonical_hash({"feature": run_id})
+    cost_id = canonical_hash({"cost": run_id})
+    parameter_id = canonical_hash({"parameters": run_id})
+    interval = {
+        "start": "2026-08-29T00:00:00+00:00",
+        "end": "2026-08-30T00:00:00+00:00",
     }
+    bundle_content = {
+        "schema": "platform.dataset_bundle/v1",
+        "product_id": "active_income",
+        "stage_snapshot_ids": {
+            "screening": ids["screening"],
+            "development": ids["development"],
+            "robustness": ids["robustness"],
+            "protected_holdout": ids["protected_holdout"],
+            "forward_observation": ids["forward_observation"],
+        },
+        "created_at": "2026-08-30T10:00:00+00:00",
+        "universe_snapshot_id": universe_id,
+        "feature_manifest_id": feature_id,
+        "cost_model_id": cost_id,
+        "parameter_set_id": parameter_id,
+        "engine_version": "privilege-test-engine/v1",
+        "instrument_scope": scope,
+        "lifecycle_state": "ready",
+        "source_partition_hashes": [],
+    }
+    bundle_id = canonical_hash(bundle_content)
+    bundle_hash = canonical_hash(bundle_content)
+    universe_payload = {"schema": "visibility-universe/v1", "run_id": run_id}
     engine = create_engine(os.environ["TRADING_PLATFORM_DATABASE_URL"])
     with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO universe(id, created_at, payload) "
+                "VALUES (:id, CURRENT_TIMESTAMP, CAST(:payload AS jsonb))"
+            ),
+            {"id": "visibility-universe-" + run_id, "payload": json.dumps({"dynamic": True})},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO universe_snapshot(id, universe_id, observed_at, content_hash, payload) "
+                "VALUES (:id, 'visibility-universe-' || :run_id, CURRENT_TIMESTAMP, :content_hash, CAST(:payload AS jsonb))"
+            ),
+            {
+                "id": universe_id,
+                "run_id": run_id,
+                "content_hash": canonical_hash(universe_payload),
+                "payload": json.dumps(universe_payload),
+            },
+        )
         for role, identity in ids.items():
+            data = {"rows": [123], "raw_marker": "RAW_STAGE_VALUE_SENTINEL"}
+            snapshot_payload = {
+                "snapshot_id": identity,
+                "product_id": "active_income",
+                "role": role,
+                "content_hash": canonical_hash(data),
+                "interval": interval,
+                "universe_snapshot_id": universe_id,
+                "availability_timestamp": "2026-08-30T10:00:00+00:00",
+                "feature_manifest_id": feature_id,
+                "cost_model_id": cost_id,
+                "parameter_set_id": parameter_id,
+                "engine_version": "privilege-test-engine/v1",
+                "instrument_scope": scope,
+                "payload": data,
+            }
+            if role == "screening":
+                snapshot_payload["synthetic"] = "true"
+                snapshot_payload["payload"]["diagnostic"] = "true"
+                snapshot_payload["payload"]["promotable"] = "false"
+            elif role == "development":
+                snapshot_payload["synthetic"] = True
+            elif role == "robustness":
+                snapshot_payload["payload"]["diagnostic"] = True
             connection.execute(
                 text(
-                    "INSERT INTO dataset_snapshot(id, created_at, payload) VALUES (:id, CURRENT_TIMESTAMP, jsonb_build_object('role', CAST(:role AS text), 'rows', jsonb_build_array(123)))"
+                    "INSERT INTO dataset_snapshot(id, created_at, payload) "
+                    "VALUES (:id, CURRENT_TIMESTAMP, CAST(:payload AS jsonb))"
                 ),
-                {"id": identity, "role": role},
+                {"id": identity, "payload": json.dumps(snapshot_payload)},
             )
+        connection.execute(
+            text(
+                "INSERT INTO dataset_bundle(id, product_id, created_at, content_hash, payload) "
+                "VALUES (:id, 'active_income', CURRENT_TIMESTAMP, :content_hash, CAST(:payload AS jsonb))"
+            ),
+            {
+                "id": bundle_id,
+                "content_hash": bundle_hash,
+                "payload": json.dumps(
+                    {"bundle_id": bundle_id, "content_hash": bundle_hash, **bundle_content}
+                ),
+            },
+        )
         connection.execute(
             text(
                 "INSERT INTO experiment_run(id, created_at, payload) VALUES (:id, CURRENT_TIMESTAMP, CAST(:payload AS jsonb))"
@@ -797,13 +897,77 @@ def test_adaptive_roles_cannot_read_protected_data_or_legacy_holdout_metrics(pha
             {"id": run_id, "payload": json.dumps({"run_id": run_id, "value": 123})},
         )
     parameters = {
+        "screening": ids["screening"],
         "development": ids["development"],
+        "robustness": ids["robustness"],
         "protected": ids["protected_holdout"],
         "forward": ids["forward_observation"],
     }
-    query = "SELECT id FROM dataset_snapshot WHERE id IN (:development, :protected, :forward) ORDER BY id"
-    assert _as_role("trading_research", query, parameters) == [(ids["development"],)]
-    assert len(_as_role("trading_runtime", query, parameters)) == 3
+    query = (
+        "SELECT * FROM dataset_snapshot_manifest WHERE snapshot_id IN "
+        "(:screening, :development, :robustness, :protected, :forward) ORDER BY role"
+    )
+    manifest_rows = _as_role("trading_research", query, parameters)
+    manifests_by_role = {row[2]: row for row in manifest_rows}
+    assert sorted(manifests_by_role) == sorted(roles)
+    assert all(row[1] == "active_income" for row in manifest_rows)
+    assert manifests_by_role["screening"][-1] is False
+    assert manifests_by_role["development"][-1] is True
+    assert manifests_by_role["robustness"][-1] is True
+    assert all(len(row) == 15 for row in manifest_rows)
+    assert "RAW_STAGE_VALUE_SENTINEL" not in repr(manifest_rows)
+    for role in ("trading_runtime", "trading_evaluator"):
+        assert len(_as_role(role, query, parameters)) == len(roles)
+    bundle_rows = _as_role(
+        "trading_research",
+        "SELECT id, payload FROM dataset_bundle WHERE id=:id",
+        {"id": bundle_id},
+    )
+    assert len(bundle_rows) == 1
+    assert bundle_rows[0][1]["stage_snapshot_ids"]["protected_holdout"] == ids["protected_holdout"]
+    assert (
+        _as_role(
+            "trading_research",
+            "SELECT payload FROM dataset_snapshot WHERE id=:id",
+            {"id": ids["protected_holdout"]},
+        )
+        == []
+    )
+    public_payload = _as_role(
+        "trading_research",
+        "SELECT payload FROM dataset_snapshot WHERE id=:id",
+        {"id": ids["development"]},
+    )
+    assert len(public_payload) == 1
+    assert public_payload[0][0]["payload"]["raw_marker"] == "RAW_STAGE_VALUE_SENTINEL"
+    adaptive = create_engine(
+        os.environ["TRADING_PLATFORM_DATABASE_URL"],
+        connect_args={"options": "-c role=trading_research"},
+    )
+    try:
+        resolved = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(adaptive)).resolve(
+            ids["development"], expected={"product_id": "active_income", "role": "development"}
+        )
+        assert resolved.payload["raw_marker"] == "RAW_STAGE_VALUE_SENTINEL"
+    finally:
+        adaptive.dispose()
+    with pytest.raises(DBAPIError):
+        _as_role(
+            "trading_research",
+            "DELETE FROM dataset_snapshot_manifest WHERE snapshot_id=:id",
+            {"id": ids["development"]},
+        )
+    table_query = (
+        "SELECT id FROM dataset_snapshot WHERE id IN "
+        "(:screening, :development, :robustness, :protected, :forward) ORDER BY id"
+    )
+    research_rows = _as_role("trading_research", table_query, parameters)
+    assert {row[0] for row in research_rows} == {
+        ids["screening"],
+        ids["development"],
+        ids["robustness"],
+    }
+    assert len(_as_role("trading_runtime", table_query, parameters)) == len(roles)
     assert (
         _as_role(
             "trading_research", "SELECT payload FROM experiment_run WHERE id=:id", {"id": run_id}

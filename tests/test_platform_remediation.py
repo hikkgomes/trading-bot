@@ -1779,8 +1779,177 @@ def test_latest_ready_bundle_excludes_synthetic_diagnostic_data(tmp_path) -> Non
         created_at=NOW,
     )
 
-    assert SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id) == bundle
-    assert SqlDatasetBundleRepository(database.engine).latest_ready("active_income", at=NOW) is None
+    repository = SqlDatasetBundleRepository(database.engine)
+    assert repository.get(bundle.bundle_id) == bundle
+    assert repository.latest_ready("active_income", at=NOW) is None
+
+    string_flags_bundle = builder.build(
+        "active_income",
+        intervals=intervals,
+        payload_by_role={
+            role: {
+                "bars": [2],
+                "synthetic": "true",
+                "diagnostic": "true",
+                "promotable": "false",
+            }
+            for role in CORE_RESEARCH_BUNDLE_ROLES
+        },
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("BTCUSDT",),
+        availability_timestamp=NOW,
+        created_at=NOW,
+    )
+    with database.engine.begin() as connection:
+        for snapshot_id in string_flags_bundle.stage_snapshot_ids.values():
+            payload = connection.execute(
+                select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+            ).scalar_one()
+            payload["synthetic"] = "true"
+            payload["diagnostic"] = "true"
+            payload["promotable"] = "false"
+            connection.execute(
+                update(dataset_snapshot)
+                .where(dataset_snapshot.c.id == snapshot_id)
+                .values(payload=payload)
+            )
+    assert repository.latest_ready("active_income", at=NOW) == string_flags_bundle
+
+
+def test_dataset_bundle_rejects_missing_and_mismatched_stage_manifests(tmp_path) -> None:
+    from sqlalchemy import insert
+
+    from src.data.database import dataset_bundle
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'invalid-manifests.sqlite3'}")
+    database.create_schema()
+    identity = "sha256:" + "f" * 64
+    intervals = {
+        role: {
+            "start": f"2026-08-{26 + index:02d}T00:00:00+00:00",
+            "end": f"2026-08-{27 + index:02d}T00:00:00+00:00",
+        }
+        for index, role in enumerate(CORE_RESEARCH_BUNDLE_ROLES)
+    }
+    bundle = CanonicalResearchDatasetBuilder(database.engine).build(
+        "active_income",
+        intervals=intervals,
+        payload_by_role={role: {"bars": [1]} for role in CORE_RESEARCH_BUNDLE_ROLES},
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("BTCUSDT",),
+        availability_timestamp=NOW,
+        created_at=NOW,
+    )
+
+    corrupt_contents = []
+    missing_stages = dict(bundle.stage_snapshot_ids)
+    missing_stages["development"] = "sha256:" + "0" * 64
+    corrupt_contents.append(missing_stages)
+    mismatched_stages = dict(bundle.stage_snapshot_ids)
+    mismatched_stages["development"], mismatched_stages["robustness"] = (
+        mismatched_stages["robustness"],
+        mismatched_stages["development"],
+    )
+    corrupt_contents.append(mismatched_stages)
+    corrupt_ids = []
+    for stage_ids in corrupt_contents:
+        content = {**bundle.content, "stage_snapshot_ids": stage_ids}
+        corrupt_id = canonical_hash(content)
+        content_hash = canonical_hash(content)
+        corrupt_ids.append(corrupt_id)
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(dataset_bundle).values(
+                    id=corrupt_id,
+                    product_id=bundle.product_id,
+                    created_at=NOW,
+                    content_hash=content_hash,
+                    payload={
+                        "bundle_id": corrupt_id,
+                        "content_hash": content_hash,
+                        **content,
+                    },
+                )
+            )
+
+    repository = SqlDatasetBundleRepository(database.engine)
+    with pytest.raises(DatasetResolutionError, match="stage snapshot is missing"):
+        repository.get(corrupt_ids[0])
+    with pytest.raises(DatasetResolutionError, match="stage snapshot is not canonical"):
+        repository.get(corrupt_ids[1])
+    database.dispose()
+
+
+def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path) -> None:
+    from src.data.database import universe, universe_snapshot
+    from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'snapshot-corruption.sqlite3'}")
+    database.create_schema()
+    identity = "sha256:" + "a" * 64
+    universe_payload = {"schema": "universe_snapshot/v1", "members": ["BTCUSDT"]}
+    with database.engine.begin() as connection:
+        connection.execute(
+            universe.insert().values(
+                id="snapshot-corruption-universe",
+                created_at=NOW,
+                payload={"dynamic": True},
+            )
+        )
+        connection.execute(
+            universe_snapshot.insert().values(
+                id=identity,
+                universe_id="snapshot-corruption-universe",
+                observed_at=NOW,
+                content_hash=canonical_hash(universe_payload),
+                payload=universe_payload,
+            )
+        )
+    intervals = {
+        role: {
+            "start": f"2026-08-{26 + index:02d}T00:00:00+00:00",
+            "end": f"2026-08-{27 + index:02d}T00:00:00+00:00",
+        }
+        for index, role in enumerate(CORE_RESEARCH_BUNDLE_ROLES)
+    }
+    bundle = CanonicalResearchDatasetBuilder(database.engine).build(
+        "active_income",
+        intervals=intervals,
+        payload_by_role={role: {"bars": [{"close": 100.0}]} for role in CORE_RESEARCH_BUNDLE_ROLES},
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("BTCUSDT",),
+        availability_timestamp=NOW,
+        created_at=NOW,
+    )
+    repository = SqlDatasetBundleRepository(database.engine)
+    assert repository.get(bundle.bundle_id) == bundle
+    snapshot_id = bundle.stage_snapshot_ids["development"]
+    with database.engine.begin() as connection:
+        payload = connection.execute(
+            select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+        ).scalar_one()
+        payload["payload"]["bars"][0]["close"] = 101.0
+        connection.execute(
+            update(dataset_snapshot)
+            .where(dataset_snapshot.c.id == snapshot_id)
+            .values(payload=payload)
+        )
+
+    assert repository.get(bundle.bundle_id) == bundle
+    with pytest.raises(DatasetResolutionError, match="content hash verification failed"):
+        CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine)).resolve(
+            snapshot_id, expected={}
+        )
+    database.dispose()
 
 
 @pytest.mark.parametrize("fixed_scope", [False, True])

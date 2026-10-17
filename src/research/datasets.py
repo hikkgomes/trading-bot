@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
-from sqlalchemy import insert, select, text
+from sqlalchemy import bindparam, case, func, insert, or_, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import dataset_bundle, dataset_snapshot, universe_snapshot
@@ -374,12 +374,187 @@ class DatasetBundle:
         return {"bundle_id": self.bundle_id, "content_hash": self.content_hash, **self.content}
 
 
-def _snapshot_source(payload):
-    return {
-        key: value
-        for key, value in payload.items()
-        if key not in {"snapshot_id", "availability_timestamp", "payload"}
+_SNAPSHOT_MANIFEST_FIELDS = (
+    "snapshot_id",
+    "product_id",
+    "role",
+    "content_hash",
+    "interval",
+    "universe_snapshot_id",
+    "availability_timestamp",
+    "feature_manifest_id",
+    "cost_model_id",
+    "parameter_set_id",
+    "engine_version",
+    "instrument_scope",
+    "model_artefact_id",
+    "event_data_segment_ids",
+)
+
+
+def _snapshot_source(payload, *, metadata_only: bool = False):
+    source = {
+        key: payload[key]
+        for key in _SNAPSHOT_MANIFEST_FIELDS
+        if key in payload and key not in {"snapshot_id", "availability_timestamp"}
     }
+    source["non_promotable"] = (
+        payload.get("non_promotable") is True
+        if metadata_only
+        else dataset_payload_is_non_promotable(payload)
+    )
+    return source
+
+
+def _load_snapshot_manifests(connection, snapshot_ids: tuple[str, ...]):
+    ids = tuple(dict.fromkeys(snapshot_ids))
+    if not ids:
+        return {}
+    if connection.dialect.name == "postgresql":
+        query = text(
+            "SELECT "
+            + ", ".join(f'"{field}"' for field in _SNAPSHOT_MANIFEST_FIELDS)
+            + ", non_promotable FROM public.dataset_snapshot_manifest "
+            "WHERE snapshot_id IN :snapshot_ids"
+        ).bindparams(bindparam("snapshot_ids", expanding=True))
+        rows = (
+            connection.execute(
+                query,
+                {"snapshot_ids": ids},
+            )
+            .mappings()
+            .all()
+        )
+    else:
+        payload = dataset_snapshot.c.payload
+        non_promotable = or_(
+            func.json_type(payload, "$") != "object",
+            func.json_type(payload, "$.synthetic") == "true",
+            func.json_type(payload, "$.diagnostic") == "true",
+            func.json_type(payload, "$.promotable") == "false",
+            func.json_type(payload, "$.payload.synthetic") == "true",
+            func.json_type(payload, "$.payload.diagnostic") == "true",
+            func.json_type(payload, "$.payload.promotable") == "false",
+        )
+        rows = (
+            connection.execute(
+                select(
+                    *(
+                        payload[field].as_string().label(field)
+                        if field
+                        in {
+                            "snapshot_id",
+                            "product_id",
+                            "role",
+                            "content_hash",
+                            "universe_snapshot_id",
+                            "availability_timestamp",
+                            "feature_manifest_id",
+                            "cost_model_id",
+                            "parameter_set_id",
+                            "engine_version",
+                            "model_artefact_id",
+                        }
+                        else payload[field].as_json().label(field)
+                        for field in _SNAPSHOT_MANIFEST_FIELDS
+                    ),
+                    case((non_promotable, True), else_=False).label("non_promotable"),
+                ).where(
+                    dataset_snapshot.c.id.in_(ids),
+                    dataset_snapshot.c.id == payload["snapshot_id"].as_string(),
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return {
+        str(row["snapshot_id"]): {
+            field: row[field]
+            for field in (*_SNAPSHOT_MANIFEST_FIELDS, "non_promotable")
+            if row[field] is not None
+        }
+        for row in rows
+        if row["snapshot_id"] is not None
+    }
+
+
+def _stage_manifest_is_valid(manifest, *, snapshot_id: str, role: str, product_id: str) -> bool:
+    if manifest is None:
+        return False
+    matches_identity = (
+        manifest.get("snapshot_id") == snapshot_id
+        and manifest.get("role") == role
+        and manifest.get("product_id") == product_id
+    )
+    if not matches_identity:
+        return False
+    try:
+        _identity(manifest.get("content_hash"), field=f"{role}.content_hash")
+    except DatasetResolutionError:
+        return False
+    return isinstance(manifest.get("non_promotable"), bool)
+
+
+def _verified_stage_manifests(connection, record):
+    stage_ids = record.get("stage_snapshot_ids")
+    if not isinstance(stage_ids, Mapping):
+        raise DatasetResolutionError("dataset bundle stage mapping is invalid")
+    for role, snapshot_id in stage_ids.items():
+        if not isinstance(role, str):
+            raise DatasetResolutionError("dataset bundle stage role is invalid")
+        _identity(snapshot_id, field=f"stage_snapshot_ids[{role}]")
+    manifests = _load_snapshot_manifests(connection, tuple(stage_ids.values()))
+    if len(manifests) != len(stage_ids):
+        raise DatasetResolutionError("dataset bundle stage snapshot is missing")
+    for role, snapshot_id in stage_ids.items():
+        snapshot_id = _identity(snapshot_id, field=f"stage_snapshot_ids[{role}]")
+        if not _stage_manifest_is_valid(
+            manifests.get(snapshot_id),
+            snapshot_id=snapshot_id,
+            role=role,
+            product_id=record["product_id"],
+        ):
+            raise DatasetResolutionError(
+                f"dataset bundle stage snapshot is not canonical: {role}:{snapshot_id}"
+            )
+    return manifests
+
+
+def _verified_bundle(connection, row):
+    bundle_id = _identity(str(row["id"]), field="bundle_id")
+    record = row["payload"]
+    if not isinstance(record, Mapping):
+        raise DatasetResolutionError("dataset bundle payload is invalid")
+    if (
+        record.get("schema") != "platform.dataset_bundle/v1"
+        or record.get("bundle_id") != bundle_id
+        or record.get("content_hash") != row["content_hash"]
+        or record.get("product_id") != row["product_id"]
+    ):
+        raise DatasetResolutionError("dataset bundle identity or metadata is invalid")
+    manifests = _verified_stage_manifests(connection, record)
+    try:
+        bundle = DatasetBundle(
+            bundle_id=bundle_id,
+            product_id=str(record["product_id"]),
+            stage_snapshot_ids=dict(record["stage_snapshot_ids"]),
+            created_at=str(record["created_at"]),
+            universe_snapshot_id=str(record["universe_snapshot_id"]),
+            feature_manifest_id=str(record["feature_manifest_id"]),
+            cost_model_id=str(record["cost_model_id"]),
+            parameter_set_id=str(record["parameter_set_id"]),
+            engine_version=str(record["engine_version"]),
+            instrument_scope=tuple(record["instrument_scope"]),
+            lifecycle_state=DatasetLifecycleState(str(record.get("lifecycle_state", "ready"))),
+            source_partition_hashes=tuple(record.get("source_partition_hashes", ())),
+            timeframe=record.get("timeframe"),
+            data_plan_id=record.get("data_plan_id"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetResolutionError("dataset bundle metadata is invalid") from exc
+    if bundle.bundle_id != bundle_id or bundle.content_hash != str(row["content_hash"]):
+        raise DatasetResolutionError("dataset bundle content hash is invalid")
+    return bundle, manifests
 
 
 def _bundle_timing(payloads: Mapping[str, Any]) -> dict[str, Any]:
@@ -572,7 +747,12 @@ class CanonicalResearchDatasetBuilder:
                 {"identity": "dataset-content:" + identity},
             )
         rows = connection.execute(
-            select(dataset_bundle.c.payload)
+            select(
+                dataset_bundle.c.id,
+                dataset_bundle.c.product_id,
+                dataset_bundle.c.content_hash,
+                dataset_bundle.c.payload,
+            )
             .where(
                 dataset_bundle.c.product_id == bundle.product_id,
                 dataset_bundle.c.created_at <= bundle.created_at,
@@ -580,20 +760,23 @@ class CanonicalResearchDatasetBuilder:
                 == bundle.universe_snapshot_id,
             )
             .order_by(dataset_bundle.c.created_at, dataset_bundle.c.id)
-        ).scalars()
+        ).mappings()
         for row in rows:
-            if {key: value for key, value in row.items() if key not in ignored} != source:
+            record = row["payload"]
+            if not isinstance(record, Mapping):
+                continue
+            if {key: value for key, value in record.items() if key not in ignored} != source:
+                continue
+            try:
+                reused, manifests = _verified_bundle(connection, row)
+            except (DatasetResolutionError, KeyError, TypeError, ValueError):
                 continue
             previous = {
-                item["role"]: _snapshot_source(item)
-                for item in connection.execute(
-                    select(dataset_snapshot.c.payload).where(
-                        dataset_snapshot.c.id.in_(row["stage_snapshot_ids"].values())
-                    )
-                ).scalars()
+                role: _snapshot_source(manifests[snapshot_id], metadata_only=True)
+                for role, snapshot_id in reused.stage_snapshot_ids.items()
             }
             if previous == expected:
-                return row["bundle_id"]
+                return reused.bundle_id
         return None
 
     def build_from_bars(
@@ -1201,94 +1384,49 @@ class SqlDatasetBundleRepository:
                 else True
             )
             rows = connection.execute(
-                select(dataset_bundle.c.id)
+                select(
+                    dataset_bundle.c.id,
+                    dataset_bundle.c.product_id,
+                    dataset_bundle.c.content_hash,
+                    dataset_bundle.c.payload,
+                )
                 .where(
                     dataset_bundle.c.product_id == product_id,
                     dataset_bundle.c.created_at <= at,
                     plan_filter,
                 )
                 .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
-            ).scalars()
-            for bundle_id in rows:
+            ).mappings()
+            for row in rows:
                 try:
-                    bundle = self.get(str(bundle_id))
-                except (DatasetResolutionError, KeyError):
+                    bundle, manifests = _verified_bundle(connection, row)
+                except (DatasetResolutionError, KeyError, TypeError, ValueError):
                     continue
-                if (
-                    bundle.lifecycle_state is DatasetLifecycleState.READY
-                    and self._bundle_is_promotable(bundle)
+                if bundle.lifecycle_state is DatasetLifecycleState.READY and all(
+                    manifests[snapshot_id]["non_promotable"] is False
+                    for snapshot_id in bundle.stage_snapshot_ids.values()
                 ):
                     return bundle
         return None
 
-    def _bundle_is_promotable(self, bundle: DatasetBundle) -> bool:
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(dataset_snapshot.c.payload).where(
-                    dataset_snapshot.c.id.in_(tuple(bundle.stage_snapshot_ids.values()))
-                )
-            ).scalars()
-            payloads = tuple(rows)
-        return (
-            bool(payloads)
-            and len(payloads) == len(bundle.stage_snapshot_ids)
-            and all(not dataset_payload_is_non_promotable(payload) for payload in payloads)
-        )
-
     def get(self, bundle_id: str) -> DatasetBundle:
         bundle_id = _identity(bundle_id, field="bundle_id")
         with self.engine.connect() as connection:
-            payload = (
+            row = (
                 connection.execute(
-                    select(dataset_bundle.c.payload, dataset_bundle.c.content_hash).where(
-                        dataset_bundle.c.id == bundle_id
-                    )
+                    select(
+                        dataset_bundle.c.id,
+                        dataset_bundle.c.product_id,
+                        dataset_bundle.c.content_hash,
+                        dataset_bundle.c.payload,
+                    ).where(dataset_bundle.c.id == bundle_id)
                 )
                 .mappings()
                 .first()
             )
-            if payload is None or not isinstance(payload["payload"], Mapping):
+            if row is None:
                 raise KeyError(f"dataset bundle does not exist: {bundle_id}")
-            record = dict(payload["payload"])
-            stage_ids = record.get("stage_snapshot_ids")
-            if not isinstance(stage_ids, Mapping):
-                raise DatasetResolutionError("dataset bundle stage mapping is invalid")
-            for role, snapshot_id in stage_ids.items():
-                snapshot_payload = connection.execute(
-                    select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
-                ).scalar_one_or_none()
-                if not isinstance(snapshot_payload, Mapping):
-                    raise DatasetResolutionError(
-                        f"dataset bundle stage snapshot is missing: {role}:{snapshot_id}"
-                    )
-                if (
-                    snapshot_payload.get("snapshot_id") != snapshot_id
-                    or snapshot_payload.get("role") != role
-                    or snapshot_payload.get("product_id") != record.get("product_id")
-                    or canonical_hash(snapshot_payload.get("payload"))
-                    != snapshot_payload.get("content_hash")
-                ):
-                    raise DatasetResolutionError(
-                        f"dataset bundle stage snapshot is not canonical: {role}:{snapshot_id}"
-                    )
-        bundle = DatasetBundle(
-            bundle_id=str(record.get("bundle_id") or bundle_id),
-            product_id=str(record["product_id"]),
-            stage_snapshot_ids=dict(record["stage_snapshot_ids"]),
-            created_at=str(record["created_at"]),
-            universe_snapshot_id=str(record["universe_snapshot_id"]),
-            feature_manifest_id=str(record["feature_manifest_id"]),
-            cost_model_id=str(record["cost_model_id"]),
-            parameter_set_id=str(record["parameter_set_id"]),
-            engine_version=str(record["engine_version"]),
-            instrument_scope=tuple(record["instrument_scope"]),
-            lifecycle_state=DatasetLifecycleState(str(record.get("lifecycle_state", "ready"))),
-            source_partition_hashes=tuple(record.get("source_partition_hashes", ())),
-            timeframe=record.get("timeframe"),
-            data_plan_id=record.get("data_plan_id"),
-        )
-        if bundle.bundle_id != bundle_id or bundle.content_hash != str(payload["content_hash"]):
-            raise DatasetResolutionError("dataset bundle content hash is invalid")
+            bundle, _manifests = _verified_bundle(connection, row)
         return bundle
 
 
