@@ -1004,6 +1004,24 @@ def test_adaptive_roles_cannot_read_protected_data_or_legacy_holdout_metrics(pha
         connect_args={"options": "-c role=trading_evaluator"},
     )
     try:
+        from src.services.scheduler import PlatformScheduler
+
+        scheduler = PlatformScheduler(engine=evaluator_reader, products={}, node_id="fixture")
+        snapshot_metadata = scheduler._candidate_snapshot((compressed_development,))[1]
+        assert snapshot_metadata is not None
+        assert snapshot_metadata["snapshot_id"] == compressed_development
+        assert "payload" not in snapshot_metadata
+        assert "raw_marker" not in snapshot_metadata
+        assert (
+            scheduler._candidate_snapshot((compressed_development,), required_payload="rows")[0]
+            == compressed_development
+        )
+        assert (
+            scheduler._candidate_snapshot(
+                (compressed_development,), required_payload="missing_key"
+            )[0]
+            is None
+        )
         compressed_resolved = CanonicalDatasetResolver(
             SqlCanonicalDatasetRepository(evaluator_reader)
         ).resolve(

@@ -1978,7 +1978,11 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
         "active_income",
         intervals=intervals,
         payload_by_role={
-            role: {"bars": [{"close": 100.0}], "event_replay": {"events": [1]}}
+            role: {
+                "bars": [{"close": 100.0}],
+                "event_replay": {"events": [1]},
+                "ml_rows": None,
+            }
             for role in CORE_RESEARCH_BUNDLE_ROLES
         },
         universe_snapshot_id=identity,
@@ -2001,6 +2005,7 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
     assert logical_snapshot["payload"] == {
         "bars": [{"close": 100.0}],
         "event_replay": {"events": [1]},
+        "ml_rows": None,
     }
     assert _decode_canonical_dataset_snapshot(stored) == logical_snapshot
     resolver = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
@@ -2008,6 +2013,7 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
     assert resolved.payload == {
         "bars": [{"close": 100.0}],
         "event_replay": {"events": [1]},
+        "ml_rows": None,
     }
     assert resolved.content_hash == canonical_hash(resolved.payload)
     scheduler = PlatformScheduler(engine=database.engine, products={}, node_id="fixture")
@@ -2015,7 +2021,38 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
         scheduler._candidate_snapshot((snapshot_id,), required_payload="event_replay")[0]
         == snapshot_id
     )
-    assert scheduler._candidate_snapshot((snapshot_id,), required_payload="ml_rows")[0] is None
+    assert scheduler._candidate_snapshot((snapshot_id,))[1] == {
+        "snapshot_id": snapshot_id,
+        "product_id": "active_income",
+        "role": "development",
+        "content_hash": resolved.content_hash,
+        "interval": dict(resolved.interval),
+        "universe_snapshot_id": resolved.universe_snapshot_id,
+        "availability_timestamp": resolved.availability_timestamp,
+        "feature_manifest_id": resolved.feature_manifest_hash,
+        "cost_model_id": resolved.cost_model_hash,
+        "parameter_set_id": resolved.parameter_set_hash,
+        "engine_version": resolved.engine_version,
+        "instrument_scope": list(resolved.instrument_scope),
+        "non_promotable": False,
+    }
+    metadata = scheduler._candidate_snapshot((snapshot_id,))[1]
+    assert metadata is not None
+    assert "payload" not in metadata
+    assert "bars" not in metadata
+    assert (
+        scheduler._candidate_snapshot((snapshot_id,), required_payload="ml_rows")[0] == snapshot_id
+    )
+    request = scheduler._research_request(
+        candidate_id="candidate-1",
+        snapshot_id=snapshot_id,
+        snapshot_payload=metadata,
+        requested_stage="development",
+        evaluated_at=NOW,
+    )
+    assert request["feature_manifest_id"] == resolved.feature_manifest_hash
+    assert request["cost_model_id"] == resolved.cost_model_hash
+    assert request["parameter_set_id"] == resolved.parameter_set_hash
     with database.engine.begin() as connection:
         connection.execute(
             dataset_snapshot.insert().values(
@@ -2024,7 +2061,7 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
                 payload={
                     "snapshot_id": "legacy-inline-snapshot",
                     "role": "development",
-                    "payload": {"event_replay": {"events": [1]}},
+                    "payload": {"event_replay": {"events": [1]}, "ml_rows": None},
                 },
             )
         )
@@ -2032,6 +2069,10 @@ def test_bundle_discovery_does_not_skip_payload_integrity_verification(tmp_path)
         scheduler._candidate_snapshot(("legacy-inline-snapshot",), required_payload="event_replay")[
             0
         ]
+        == "legacy-inline-snapshot"
+    )
+    assert (
+        scheduler._candidate_snapshot(("legacy-inline-snapshot",), required_payload="ml_rows")[0]
         == "legacy-inline-snapshot"
     )
 

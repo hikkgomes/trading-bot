@@ -35,6 +35,7 @@ from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.data_plan import product_data_plan
+from src.research.datasets import _load_snapshot_manifests
 from src.research.outcomes import OutcomeCategory, TrialDisposition
 from src.research.rounds import ResearchRoundCoordinator
 from src.research.scheduling import research_inputs
@@ -795,33 +796,87 @@ class PlatformScheduler:
         role: str | None = None,
         required_payload: str | None = None,
     ) -> tuple[str | None, Mapping[str, Any] | None]:
+        ordered_ids = tuple(dict.fromkeys(snapshot_ids))
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(dataset_snapshot.c.id, dataset_snapshot.c.payload).where(
-                    dataset_snapshot.c.id.in_(snapshot_ids)
+            manifests = _load_snapshot_manifests(connection, ordered_ids)
+            eligible_ids = tuple(
+                snapshot_id
+                for snapshot_id in ordered_ids
+                if snapshot_id in manifests
+                and (
+                    role is None or str(manifests[snapshot_id].get("role") or "unspecified") == role
                 )
-            ).mappings()
-            for row in rows:
-                payload = row["payload"]
-                if not isinstance(payload, Mapping):
-                    continue
-                if role is not None and str(payload.get("role") or "unspecified") != role:
-                    continue
-                data = payload.get("payload")
-                if required_payload is not None:
-                    if payload.get("payload_encoding") == "canonical-json-gzip/v1":
-                        available_keys = (
-                            data.get("payload_keys") if isinstance(data, Mapping) else None
-                        )
-                        if (
-                            not isinstance(available_keys, list | tuple)
-                            or required_payload not in available_keys
-                        ):
-                            continue
-                    elif not isinstance(data, Mapping) or required_payload not in data:
-                        continue
-                return str(row["id"]), payload
-        return None, None
+            )
+            if not eligible_ids:
+                return None, None
+            if required_payload is None:
+                selected_id = eligible_ids[0]
+                return selected_id, manifests[selected_id]
+
+            payload = dataset_snapshot.c.payload
+            if connection.dialect.name == "postgresql":
+                encoding = payload["payload_encoding"].as_string()
+                inline_data = payload["payload"]
+                compressed_keys = inline_data["payload_keys"]
+                has_compressed_key = and_(
+                    func.jsonb_typeof(compressed_keys) == "array",
+                    func.jsonb_exists(compressed_keys, required_payload),
+                )
+                has_inline_key = and_(
+                    func.jsonb_typeof(inline_data) == "object",
+                    func.jsonb_exists(inline_data, required_payload),
+                )
+                has_required_payload = or_(
+                    and_(encoding == "canonical-json-gzip/v1", has_compressed_key),
+                    and_(
+                        func.jsonb_exists(payload, "payload_encoding").is_(False),
+                        has_inline_key,
+                    ),
+                )
+            else:
+                inline_data = (
+                    func.json_each(payload, "$.payload")
+                    .table_valued("key")
+                    .alias("inline_payload_keys")
+                )
+                compressed_keys = (
+                    func.json_each(payload, "$.payload.payload_keys")
+                    .table_valued("value")
+                    .alias("compressed_payload_keys")
+                )
+                has_inline_key = (
+                    select(1)
+                    .select_from(inline_data)
+                    .where(inline_data.c.key == required_payload)
+                    .exists()
+                )
+                has_compressed_key = and_(
+                    func.json_type(payload, "$.payload.payload_keys") == "array",
+                    select(1)
+                    .select_from(compressed_keys)
+                    .where(compressed_keys.c.value == required_payload)
+                    .exists(),
+                )
+                has_required_payload = or_(
+                    and_(
+                        func.json_extract(payload, "$.payload_encoding")
+                        == "canonical-json-gzip/v1",
+                        has_compressed_key,
+                    ),
+                    and_(
+                        func.json_type(payload, "$.payload_encoding").is_(None),
+                        has_inline_key,
+                    ),
+                )
+            available = set(
+                connection.execute(
+                    select(dataset_snapshot.c.id).where(
+                        dataset_snapshot.c.id.in_(eligible_ids), has_required_payload
+                    )
+                ).scalars()
+            )
+            capable_id = next((item for item in eligible_ids if item in available), None)
+            return (capable_id, manifests[capable_id]) if capable_id is not None else (None, None)
 
     @staticmethod
     def _research_request(
