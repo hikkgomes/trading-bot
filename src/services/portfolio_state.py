@@ -7,7 +7,7 @@ import math
 from collections.abc import Callable, Mapping
 from typing import Any, cast
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, func, or_, select
 
 from src.accounting.nav import NavSnapshot, btc_nav, usdt_nav
 from src.accounting.spot_allocation import target_trade_quantity
@@ -350,21 +350,14 @@ class DatabasePortfolioSourceService:
         )
 
     def _position_terms(self, portfolio_id: str, at: str) -> dict[str, tuple[float, float]]:
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(position.c.payload)
-                .where(position.c.created_at <= at)
-                .order_by(position.c.created_at.desc(), position.c.id.desc())
-            ).scalars()
         result: dict[str, tuple[float, float]] = {}
-        seen: set[str] = set()
-        for payload in rows:
-            if not isinstance(payload, Mapping) or str(payload.get("portfolio_id")) != portfolio_id:
+        for row in self._latest_position_rows(portfolio_id, at):
+            payload = row["payload"]
+            if not isinstance(payload, Mapping):
                 continue
             instrument_id = str(payload.get("instrument_id") or "")
-            if not instrument_id or instrument_id in seen:
+            if not instrument_id:
                 continue
-            seen.add(instrument_id)
             quantity = float(payload.get("quantity", 0.0))
             if abs(quantity) <= 1e-12:
                 continue
@@ -425,37 +418,67 @@ class DatabasePortfolioSourceService:
                         account_snapshot.c.observed_at <= at,
                     )
                     .order_by(account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc())
+                    .limit(1)
                 ).mappings()
                 row = next(iter(account_rows), None)
                 if row is not None and isinstance(row["payload"], dict):
                     return dict(row["payload"]), str(row["observed_at"])
-            rows = connection.execute(
-                select(table.c.payload, table.c.created_at)
-                .where(table.c.created_at <= at)
-                .order_by(table.c.created_at.desc(), table.c.id.desc())
-            ).mappings()
-            for row in rows:
-                payload = row["payload"]
-                if isinstance(payload, dict) and str(payload.get("account_id")) == account_id:
-                    return dict(payload), str(row["created_at"])
+            row = (
+                connection.execute(
+                    select(table.c.payload, table.c.created_at)
+                    .where(
+                        table.c.created_at <= at,
+                        table.c.payload["account_id"].as_string() == account_id,
+                    )
+                    .order_by(table.c.created_at.desc(), table.c.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+            if (
+                row is not None
+                and isinstance(row["payload"], dict)
+                and str(row["payload"].get("account_id")) == account_id
+            ):
+                return dict(row["payload"]), str(row["created_at"])
         return None, None
 
-    def _positions(self, portfolio_id: str, at: str) -> tuple[dict[str, float], str | None]:
+    def _latest_position_rows(self, portfolio_id: str, at: str) -> tuple[Mapping[str, Any], ...]:
+        latest = (
+            select(
+                position.c.id.label("id"),
+                position.c.payload.label("payload"),
+                position.c.created_at.label("created_at"),
+                func.row_number()
+                .over(
+                    partition_by=position.c.payload["instrument_id"].as_string(),
+                    order_by=(position.c.created_at.desc(), position.c.id.desc()),
+                )
+                .label("position_rank"),
+            )
+            .where(
+                position.c.created_at <= at,
+                position.c.payload["portfolio_id"].as_string() == portfolio_id,
+            )
+            .subquery()
+        )
         with self.engine.connect() as connection:
             rows = connection.execute(
-                select(position.c.payload, position.c.created_at)
-                .where(position.c.created_at <= at)
-                .order_by(position.c.created_at.desc(), position.c.id.desc())
+                select(latest.c.id, latest.c.payload, latest.c.created_at)
+                .where(latest.c.position_rank == 1)
+                .order_by(latest.c.created_at.desc(), latest.c.id.desc())
             ).mappings()
+            return tuple(rows)
+
+    def _positions(self, portfolio_id: str, at: str) -> tuple[dict[str, float], str | None]:
         values: dict[str, float] = {}
         latest_at: str | None = None
-        for row in rows:
+        for row in self._latest_position_rows(portfolio_id, at):
             payload = row["payload"]
-            if not isinstance(payload, dict) or str(payload.get("portfolio_id")) != portfolio_id:
+            if not isinstance(payload, Mapping):
                 continue
             instrument_id = str(payload["instrument_id"])
-            if instrument_id in values:
-                continue
             values[instrument_id] = float(payload.get("quantity", 0.0))
             latest_at = latest_at or str(row["created_at"])
         return values, latest_at
@@ -463,33 +486,56 @@ class DatabasePortfolioSourceService:
     def _open_orders(
         self, portfolio_id: str, at: str
     ) -> tuple[tuple[dict[str, Any], ...], str | None]:
+        latest_events = (
+            select(
+                exchange_order.c.order_id.label("order_id"),
+                exchange_order.c.sequence.label("sequence"),
+                func.row_number()
+                .over(
+                    partition_by=exchange_order.c.order_id,
+                    order_by=exchange_order.c.sequence.desc(),
+                )
+                .label("order_rank"),
+            )
+            .select_from(
+                order_intent.join(exchange_order, order_intent.c.id == exchange_order.c.order_id)
+            )
+            .where(
+                exchange_order.c.created_at <= at,
+                order_intent.c.payload["portfolio_id"].as_string() == portfolio_id,
+            )
+            .subquery()
+        )
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(
-                    exchange_order.c.payload, exchange_order.c.status, exchange_order.c.created_at
+                    exchange_order.c.payload,
+                    exchange_order.c.status,
+                    exchange_order.c.created_at,
+                    func.max(exchange_order.c.created_at).over().label("latest_event_at"),
                 )
                 .select_from(
-                    order_intent.join(
-                        exchange_order, order_intent.c.id == exchange_order.c.order_id
+                    exchange_order.join(
+                        latest_events,
+                        and_(
+                            exchange_order.c.order_id == latest_events.c.order_id,
+                            exchange_order.c.sequence == latest_events.c.sequence,
+                        ),
                     )
                 )
-                .where(exchange_order.c.created_at <= at)
-                .where(order_intent.c.payload["portfolio_id"].as_string() == portfolio_id)
-                .order_by(exchange_order.c.order_id, exchange_order.c.sequence.desc())
+                .where(latest_events.c.order_rank == 1)
+                .order_by(exchange_order.c.order_id)
             ).mappings()
         terminal = {"cancelled", "rejected", "expired", "reconciled", "filled"}
         latest: dict[str, dict[str, Any]] = {}
-        seen: set[str] = set()
         latest_at: str | None = None
         for row in rows:
             payload = row["payload"].get("intent")
             if not isinstance(payload, dict) or str(payload.get("portfolio_id")) != portfolio_id:
                 raise ValueError("portfolio order journal has no matching intent")
             order_id = str(payload["order_id"])
-            if order_id in seen:
-                continue
-            seen.add(order_id)
-            latest_at = max(latest_at or "", str(row["created_at"]))
+            if row["latest_event_at"] is not None:
+                latest_at = str(row["latest_event_at"])
             if str(row["status"]) not in terminal:
                 latest[order_id] = {**payload, "status": str(row["status"])}
         return tuple(latest[key] for key in sorted(latest)), latest_at

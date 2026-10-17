@@ -175,6 +175,183 @@ def test_portfolio_source_readers_fail_closed_without_complete_market_or_health(
     assert health_at is None
 
 
+def test_portfolio_source_account_snapshots_are_scoped_and_honour_cutoffs(tmp_path) -> None:
+    from src.data.database import account_snapshot, balance_snapshot
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'account-source-cutoff.sqlite3'}")
+    database.create_schema()
+    direct_rows = (
+        ("account-a-tie-a", "account-a", "2026-08-24T00:00:00+00:00", 1.0),
+        ("account-a-tie-z", "account-a", "2026-08-24T00:00:00+00:00", 2.0),
+        ("account-b-newer", "account-b", "2026-08-24T00:01:00+00:00", 90.0),
+        ("account-a-future", "account-a", "2026-08-24T00:02:00+00:00", 3.0),
+    )
+    fallback_rows = (
+        ("fallback-a-tie-a", "fallback-a", "2026-08-24T00:00:00+00:00", 4.0),
+        ("fallback-a-tie-z", "fallback-a", "2026-08-24T00:00:00+00:00", 5.0),
+        ("fallback-b-newer", "fallback-b", "2026-08-24T00:01:00+00:00", 90.0),
+        ("fallback-a-future", "fallback-a", "2026-08-24T00:02:00+00:00", 6.0),
+    )
+    with database.engine.begin() as connection:
+        for identity, account_id, observed_at, cash in direct_rows:
+            connection.execute(
+                account_snapshot.insert().values(
+                    id=identity,
+                    account_id=account_id,
+                    observed_at=observed_at,
+                    source="test",
+                    content_hash=f"hash-{identity}",
+                    payload={"account_id": account_id, "balances": {"USDT": cash}},
+                )
+            )
+        for identity, account_id, created_at, cash in fallback_rows:
+            connection.execute(
+                balance_snapshot.insert().values(
+                    id=identity,
+                    created_at=created_at,
+                    payload={"account_id": account_id, "balances": {"USDT": cash}},
+                )
+            )
+
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=SqlRiskSnapshotStore(database.engine),
+        products={},
+        accounts={},
+    )
+    direct, direct_at = source._latest_payload(
+        balance_snapshot, "account-a", "2026-08-24T00:01:30+00:00"
+    )
+    fallback, fallback_at = source._latest_payload(
+        balance_snapshot, "fallback-a", "2026-08-24T00:01:30+00:00"
+    )
+    future, future_at = source._latest_payload(
+        balance_snapshot, "fallback-a", "2026-08-24T00:02:00+00:00"
+    )
+
+    assert direct == {"account_id": "account-a", "balances": {"USDT": 2.0}}
+    assert direct_at == "2026-08-24T00:00:00+00:00"
+    assert fallback == {"account_id": "fallback-a", "balances": {"USDT": 5.0}}
+    assert fallback_at == "2026-08-24T00:00:00+00:00"
+    assert future == {"account_id": "fallback-a", "balances": {"USDT": 6.0}}
+    assert future_at == "2026-08-24T00:02:00+00:00"
+    database.dispose()
+
+
+def test_portfolio_position_and_order_reads_select_latest_as_of_state(tmp_path) -> None:
+    from src.data.database import exchange_order, order_intent, position
+
+    database = PlatformDatabase(
+        f"sqlite+pysqlite:///{tmp_path / 'portfolio-history-cutoff.sqlite3'}"
+    )
+    database.create_schema()
+    position_rows = (
+        ("btc-a", "2026-08-24T00:00:00+00:00", "portfolio-a", "BTCUSDT", 1.0, 100.0),
+        ("btc-z", "2026-08-24T00:00:00+00:00", "portfolio-a", "BTCUSDT", 2.0, 101.0),
+        ("eth-open", "2026-08-24T00:01:00+00:00", "portfolio-a", "ETHUSDT", 0.5, 50.0),
+        ("btc-other", "2026-08-24T00:02:00+00:00", "portfolio-b", "BTCUSDT", 90.0, 1.0),
+        ("btc-flat", "2026-08-24T00:03:00+00:00", "portfolio-a", "BTCUSDT", 0.0, 101.0),
+        ("btc-reopen", "2026-08-24T00:05:00+00:00", "portfolio-a", "BTCUSDT", 3.0, 110.0),
+    )
+    with database.engine.begin() as connection:
+        for (
+            identity,
+            created_at,
+            portfolio_id,
+            instrument_id,
+            quantity,
+            entry_price,
+        ) in position_rows:
+            connection.execute(
+                position.insert().values(
+                    id=identity,
+                    created_at=created_at,
+                    payload={
+                        "portfolio_id": portfolio_id,
+                        "instrument_id": instrument_id,
+                        "quantity": quantity,
+                        "average_entry_price": entry_price,
+                    },
+                )
+            )
+        for order_id, portfolio_id in (
+            ("order-open", "portfolio-a"),
+            ("order-terminal", "portfolio-a"),
+            ("order-checkpoint", "portfolio-a"),
+            ("order-other", "portfolio-b"),
+        ):
+            connection.execute(
+                order_intent.insert().values(
+                    id=order_id,
+                    created_at="2026-08-24T00:00:00+00:00",
+                    payload={"order_id": order_id, "portfolio_id": portfolio_id},
+                )
+            )
+        order_rows = (
+            ("order-open", 0, "2026-08-24T00:00:00+00:00", "acknowledged"),
+            ("order-open", 1, "2026-08-24T00:04:00+00:00", "filled"),
+            ("order-terminal", 0, "2026-08-24T00:00:00+00:00", "acknowledged"),
+            ("order-terminal", 1, "2026-08-24T00:02:00+00:00", "cancelled"),
+            ("order-checkpoint", 0, "2026-08-24T00:03:00+00:00", "acknowledged"),
+            ("order-checkpoint", 1, "2026-08-24T00:01:00+00:00", "cancelled"),
+            ("order-other", 0, "2026-08-24T00:04:00+00:00", "acknowledged"),
+        )
+        for order_id, sequence, created_at, status in order_rows:
+            connection.execute(
+                exchange_order.insert().values(
+                    id=f"{order_id}:{sequence}",
+                    order_id=order_id,
+                    sequence=sequence,
+                    created_at=created_at,
+                    status=status,
+                    payload={
+                        "event_type": status,
+                        "intent": {
+                            "order_id": order_id,
+                            "portfolio_id": (
+                                "portfolio-b" if order_id == "order-other" else "portfolio-a"
+                            ),
+                            "instrument_id": "BTCUSDT",
+                            "remaining_quantity": 1.0,
+                        },
+                    },
+                )
+            )
+
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=SqlRiskSnapshotStore(database.engine),
+        products={},
+        accounts={},
+    )
+    before_close, before_close_at = source._positions("portfolio-a", "2026-08-24T00:01:30+00:00")
+    after_close, after_close_at = source._positions("portfolio-a", "2026-08-24T00:03:30+00:00")
+    open_before_terminal, open_before_terminal_at = source._open_orders(
+        "portfolio-a", "2026-08-24T00:01:00+00:00"
+    )
+    open_after_terminal, open_after_terminal_at = source._open_orders(
+        "portfolio-a", "2026-08-24T00:03:00+00:00"
+    )
+    latest_orders, latest_orders_at = source._open_orders(
+        "portfolio-a", "2026-08-24T00:04:00+00:00"
+    )
+
+    assert before_close == {"BTCUSDT": 2.0, "ETHUSDT": 0.5}
+    assert before_close_at == "2026-08-24T00:01:00+00:00"
+    assert after_close == {"BTCUSDT": 0.0, "ETHUSDT": 0.5}
+    assert after_close_at == "2026-08-24T00:03:00+00:00"
+    assert source._position_terms("portfolio-a", "2026-08-24T00:03:30+00:00") == {
+        "ETHUSDT": (0.5, 50.0)
+    }
+    assert [row["order_id"] for row in open_before_terminal] == ["order-open", "order-terminal"]
+    assert open_before_terminal_at == "2026-08-24T00:01:00+00:00"
+    assert [row["order_id"] for row in open_after_terminal] == ["order-open"]
+    assert open_after_terminal_at == "2026-08-24T00:02:00+00:00"
+    assert latest_orders == ()
+    assert latest_orders_at == "2026-08-24T00:04:00+00:00"
+    database.dispose()
+
+
 def test_portfolio_health_source_can_scope_diagnostic_heartbeats(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'scoped-health.sqlite3'}")
     database.create_schema()
