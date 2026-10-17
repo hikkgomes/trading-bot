@@ -80,7 +80,8 @@ class PostgreSQLTools:
 
 
 _POSTGRESQL_TOOL_NAMES = ("initdb", "pg_ctl", "pg_restore", "postgres", "psql", "createdb")
-_RESTORE_TIMEOUT_SECONDS = 30 * 60
+# The retained event database must also restore on the server's shared spinning disk.
+_RESTORE_TIMEOUT_SECONDS = 90 * 60
 _RESTORE_ROLES = ("trading_runtime", "trading_research", "trading_evaluator")
 
 
