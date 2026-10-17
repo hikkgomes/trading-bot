@@ -55,6 +55,60 @@ def test_service_drains_completed_jobs_and_polls_live_inputs_without_cycle_barri
     assert stopping.wait.call_args_list == [call(0.01), call(1.0)]
 
 
+def test_dedicated_data_writer_build_does_not_import_supervisor_or_research_stack(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    script = """
+import importlib.abc
+import sys
+from pathlib import Path
+
+class BlockHeavyImports(importlib.abc.MetaPathFinder):
+    blocked = ("src.services.supervisor", "src.research.ml", "scipy", "numba", "joblib")
+
+    def find_spec(self, fullname, path=None, target=None):
+        if any(fullname == name or fullname.startswith(name + ".") for name in self.blocked):
+            raise ImportError("blocked startup dependency: " + fullname)
+        return None
+
+sys.meta_path.insert(0, BlockHeavyImports())
+sys.path.insert(0, sys.argv[1])
+
+from src.data.database import PlatformDatabase
+from src.services.process import _build_work
+
+class Config:
+    paths = {"parquet": str(Path(sys.argv[2]) / "parquet")}
+
+database = PlatformDatabase(f"sqlite+pysqlite:///{Path(sys.argv[2]) / 'writer.sqlite3'}")
+database.create_schema()
+configuration = {
+    "products": {"products": [{"product_id": "active_income", "account_id": "futures"}]},
+    "accounts": {"accounts": [{"account_id": "futures", "market": "usdt_futures"}]},
+}
+work = _build_work(
+    "data-writer",
+    database=database,
+    config=Config(),
+    configuration=configuration,
+    node_id="fixture",
+    alerts=None,
+)
+assert set(work) == {"data-writer"}
+assert type(work["data-writer"]).__name__ == "DatabaseMarketDataWriter"
+assert "src.services.supervisor" not in sys.modules
+work["data-writer"].stop()
+database.dispose()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(root), str(tmp_path)],
+        cwd=root,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_fast_work_keeps_heartbeat_writes_bounded_but_publishes_health_changes(tmp_path):
     from src.data.database import PlatformDatabase
     from src.services.config import load_platform_config
@@ -87,6 +141,10 @@ def test_fast_work_keeps_heartbeat_writes_bounded_but_publishes_health_changes(t
     )
     assert store.latest()[0].healthy is True
     assert store.latest()[0].observed_at == "2026-10-15T00:00:03+00:00"
+    runtime.run_once(
+        lambda: {"reason_code": "market_event_written"}, observed_at="2026-10-15T00:00:18+00:00"
+    )
+    assert store.latest()[0].observed_at == "2026-10-15T00:00:18+00:00"
     database.dispose()
 
 

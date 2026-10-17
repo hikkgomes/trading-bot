@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from src.domain._codec import canonical_hash
+from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.outcomes import OutcomeCategory
 
@@ -35,6 +36,11 @@ def evaluation_identity(payload: Mapping[str, Any]) -> str | None:
             "candidate_id": receipt["candidate_id"],
             "datasets": sorted(receipt["dataset_snapshot_ids"]),
             "engine_version": receipt["executor_version"],
+            **(
+                {"financial_risk_contract": receipt["financial_risk_contract"]}
+                if receipt.get("financial_risk_contract")
+                else {}
+            ),
         }
     )
 
@@ -49,6 +55,12 @@ def measured_progress(
         for row, identity in zip(runs, identities, strict=True)
         if identity is not None
         and row["payload"]["receipt"]["executor_version"] == ECONOMIC_ENGINE_VERSION
+        and (
+            row["payload"].get("evidence", {}).get("evaluation_context", {}).get("product_id")
+            != "active_income"
+            or row["payload"]["receipt"].get("financial_risk_contract")
+            == FUTURES_ACCOUNTING_RISK_CONTRACT
+        )
     ]
     deferrals = Counter(
         str(row.get("error") or "unspecified")

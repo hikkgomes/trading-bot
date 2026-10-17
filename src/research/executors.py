@@ -19,6 +19,11 @@ from typing import Any, TypeAlias, cast
 from src.accounting.spot_allocation import target_trade_quantity
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
+from src.research.accounting import (
+    FUTURES_ACCOUNTING_RISK_CONTRACT,
+    combine_futures_financial_feasibility_statuses,
+    futures_financial_feasibility_status,
+)
 from src.research.controls import control_identity, derive_control_signals
 from src.research.coordinator import Candidate, CandidateEvaluationView
 from src.research.economic_series import (
@@ -118,6 +123,7 @@ _COMMON_STAGE_FIELDS = frozenset(
         "cost_adjusted_return",
         "return_ledger",
         "product_accounting",
+        "financial_risk_contract",
         "objective_status",
         "objective_unit",
         "objective_value",
@@ -606,6 +612,11 @@ def _common_measured_evidence(candidate: Candidate, values: Mapping[str, Any]) -
             "terminal_liquidation_cost": values["return_report"].terminal_liquidation_cost,
         },
         "product_accounting": accounting,
+        **(
+            {"financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT}
+            if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+            else {}
+        ),
         "objective_unit": accounting.get("objective_unit") if accounting else None,
         "objective_value": accounting.get("objective_value") if accounting else None,
         "benchmark_value": accounting.get("benchmark_value") if accounting else None,
@@ -809,9 +820,9 @@ def _robustness_evidence(
     )
     _bind_parameter_control(controls, parameter_stability, analysis_returns)
     delay = _temporal_stress(candidate, context, signals, net_return, delay=True)
-    cost = _stress_report(context, signals, returns, fee=2, slippage=2)
-    adverse_fill = _stress_report(context, signals, returns, slippage=2)
-    funding = _stress_report(context, signals, returns, funding=2)
+    cost, cost_feasibility = _stress_report(context, signals, returns, fee=2, slippage=2)
+    adverse_fill, adverse_fill_feasibility = _stress_report(context, signals, returns, slippage=2)
+    funding, funding_feasibility = _stress_report(context, signals, returns, funding=2)
     missing_data = _temporal_stress(candidate, context, signals, net_return, delay=False)
     walk_forward = _purged_walk_forward(analysis_returns, context, candidate)
     bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
@@ -831,21 +842,33 @@ def _robustness_evidence(
         "purged": int(walk_forward.get("purged_rows", 0)) > 0,
         "embargo": int(walk_forward.get("embargo_rows", 0)),
         "cost_stress": {
-            "passed": _stress_passes(cost.net_pnl, net_return, context),
+            **_stress_feasibility_check(
+                context,
+                cost_feasibility,
+                _stress_passes(cost.net_pnl, net_return, context),
+            ),
             "multiplier": 2.0,
             "cost_adjusted_return": cost.net_pnl,
             "degradation_fraction": _degradation(net_return, cost.net_pnl),
         },
         "delay_stress": delay,
         "adverse_fill_stress": {
-            "passed": _stress_passes(adverse_fill.net_pnl, net_return, context),
+            **_stress_feasibility_check(
+                context,
+                adverse_fill_feasibility,
+                _stress_passes(adverse_fill.net_pnl, net_return, context),
+            ),
             "multiplier": 2.0,
             "cost_adjusted_return": adverse_fill.net_pnl,
             "degradation_fraction": _degradation(net_return, adverse_fill.net_pnl),
         },
         "missing_data_stress": missing_data,
         "funding_stress": {
-            "passed": _stress_passes(funding.net_pnl, net_return, context),
+            **_stress_feasibility_check(
+                context,
+                funding_feasibility,
+                _stress_passes(funding.net_pnl, net_return, context),
+            ),
             "multiplier": 2.0,
             "cost_adjusted_return": funding.net_pnl,
             "degradation_fraction": _degradation(net_return, funding.net_pnl),
@@ -903,6 +926,21 @@ def _robustness_evidence(
         },
         "negative_control_results": controls,
     }
+    if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT:
+        financial_checks = {
+            "cost": evidence["cost_stress"].get("financial_feasibility", "unavailable"),
+            "adverse_fill": evidence["adverse_fill_stress"].get(
+                "financial_feasibility", "unavailable"
+            ),
+            "funding": evidence["funding_stress"].get("financial_feasibility", "unavailable"),
+            "delay": delay.get("financial_feasibility", "unavailable"),
+            "missing_data": missing_data.get("financial_feasibility", "unavailable"),
+            "parameter_stability": parameter_stability.get("financial_feasibility", "unavailable"),
+        }
+        evidence["financial_stress_feasibility"] = {
+            "status": combine_futures_financial_feasibility_statuses(financial_checks.values()),
+            "checks": financial_checks,
+        }
     return evidence, dsr
 
 
@@ -953,6 +991,11 @@ def _measured_result(
             behaviour_hash=(
                 str(enriched["behaviour_hash"])
                 if enriched.get("behaviour_hash") is not None
+                else None
+            ),
+            financial_risk_contract=(
+                FUTURES_ACCOUNTING_RISK_CONTRACT
+                if enriched.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
                 else None
             ),
         ),
@@ -1116,6 +1159,7 @@ def _futures_product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | 
 def _futures_accounting_payload(report: Any) -> dict[str, Any]:
     return {
         "schema": "platform.futures_accounting/v1",
+        "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
         "nav_series": futures_nav_series(report),
         "objective_unit": report.objective_unit,
         "initial_value": report.initial_equity,
@@ -1547,12 +1591,13 @@ def _temporal_stress(candidate, context, signals, baseline, *, delay):
     if delay and fractions:
         prepared["btc_target_fractions"] = [0.0, *fractions[:-1]]
     try:
-        returns = _decision_returns(prepared, values, actions=actions)
+        returns, financial_status = _decision_measurement(prepared, values, actions=actions)
     except (DataUnavailableError, PositionTimingUnavailable) as exc:
         return {"status": "unavailable", "reason": str(exc)}
     net = math.prod(1.0 + value for value in returns) - 1.0
+    pnl_passed = bool(returns) and _stress_passes(net, baseline, context)
     return {
-        "passed": bool(returns) and _stress_passes(net, baseline, context),
+        **_stress_feasibility_check(context, financial_status, pnl_passed),
         "scenario": "entry_decision_delay" if delay else "decision_feed_outage_with_backfill",
         "delay_bars": 1 if delay else 0,
         "unavailable_decision_indices": list(unavailable),
@@ -1608,8 +1653,41 @@ def _stress_report(context, signals, returns, *, fee=1, slippage=1, funding=1):
     stressed = cost_stress_context(context, fee=fee, slippage=slippage, funding=funding)
     accounting = _product_accounting(stressed)
     if accounting is not None:
-        return account_return_series(accounting)
-    return _position_return_report(stressed, signals, returns)
+        report = account_return_series(accounting)
+        financial_status = (
+            futures_financial_feasibility_status(accounting)
+            if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+            else None
+        )
+        del accounting
+        return report, financial_status
+    report = _position_return_report(stressed, signals, returns)
+    financial_status = (
+        "unavailable"
+        if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+        else None
+    )
+    return report, financial_status
+
+
+def _stress_feasibility_check(context, financial_status, pnl_passed: bool) -> dict[str, Any]:
+    result = {"passed": pnl_passed}
+    if context.get("financial_risk_contract") != FUTURES_ACCOUNTING_RISK_CONTRACT:
+        return result
+    if not isinstance(financial_status, str) or financial_status not in {
+        "pass",
+        "fail",
+        "unavailable",
+    }:
+        financial_status = "unavailable"
+    status = combine_futures_financial_feasibility_statuses(
+        (financial_status, "pass" if pnl_passed else "fail")
+    )
+    return {
+        "passed": status == "pass",
+        "status": status,
+        "financial_feasibility": financial_status,
+    }
 
 
 def _position_return_report(context, signals, returns):
@@ -1761,25 +1839,32 @@ def _tunable_parameter_names(candidate: Candidate, context: Mapping[str, Any]) -
     return ()
 
 
-def _declared_parameter_neighbours(context: Mapping[str, Any]) -> dict[str, list[float]]:
+def _declared_parameter_neighbours(context: Mapping[str, Any]) -> dict[str, Any]:
     raw = context.get("parameter_neighbour_returns", context.get("neighbour_returns", {}))
     if not isinstance(raw, Mapping):
         return {}
-    return {
-        str(name): numeric for name, values in raw.items() if (numeric := _numeric_series(values))
-    }
+    neighbours = {}
+    for name, values in raw.items():
+        numeric = _numeric_series(values)
+        if numeric:
+            neighbours[str(name)] = (
+                {"returns": numeric, "financial_feasibility": "unavailable"}
+                if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+                else numeric
+            )
+    return neighbours
 
 
 def _generated_parameter_neighbours(
     candidate: Candidate,
     context: Mapping[str, Any],
     parameters: Mapping[str, Any],
-) -> dict[str, list[float]]:
+) -> dict[str, Any]:
     frame = context.get("market_frame")
     strategy_name = candidate.definition.signal_model.get("registered_strategy")
     if frame is None or not isinstance(strategy_name, str):
         return _generated_dsl_parameter_neighbours(candidate, context, parameters)
-    neighbours: dict[str, list[float]] = {}
+    neighbours: dict[str, Any] = {}
     try:
         for name, value in parameters.items():
             if isinstance(value, bool) or not isinstance(value, int | float):
@@ -1797,8 +1882,13 @@ def _generated_parameter_neighbours(
                     position_model=candidate.definition.position_model,
                 )
                 path = varied_behaviour.decision_path(frame, context.get("warmup_market_frame", ()))
-                neighbours[f"{name}:{direction:+d}"] = _decision_returns(
+                returns, financial_status = _decision_measurement(
                     context, list(path.decisions), actions=[item.__dict__ for item in path.actions]
+                )
+                neighbours[f"{name}:{direction:+d}"] = (
+                    {"returns": returns, "financial_feasibility": financial_status}
+                    if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+                    else returns
                 )
     except (ExecutorError, KeyError, TypeError, ValueError, StrategyBehaviourError):
         return {}
@@ -1809,7 +1899,7 @@ def _generated_dsl_parameter_neighbours(
     candidate: Candidate,
     context: Mapping[str, Any],
     parameters: Mapping[str, Any],
-) -> dict[str, list[float]]:
+) -> dict[str, Any]:
     rows = context.get("feature_rows")
     rule = candidate.definition.signal_model.get("rule")
     if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
@@ -1820,15 +1910,20 @@ def _generated_dsl_parameter_neighbours(
         return {}
     threshold = float(parameters.get("threshold", rule.get("threshold", 0.0)))
     step = max(abs(threshold) * 0.1, 1e-8)
-    neighbours: dict[str, list[float]] = {}
+    neighbours: dict[str, Any] = {}
     for direction in (-1, 1):
         varied_rule = {**dict(rule), "threshold": threshold + direction * step}
         signals = _dsl_signals(rows, varied_rule)
-        neighbours[f"threshold:{direction:+d}"] = _decision_returns(context, list(signals))
+        returns, financial_status = _decision_measurement(context, list(signals))
+        neighbours[f"threshold:{direction:+d}"] = (
+            {"returns": returns, "financial_feasibility": financial_status}
+            if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+            else returns
+        )
     return neighbours
 
 
-def _decision_returns(context, signals, *, actions=None) -> list[float]:
+def _decision_measurement(context, signals, *, actions=None):
     prepared = {**context, "signals": signals}
     for key in ("futures_events", "trade_events", "btc_trade_events", "marks", "btc_marks"):
         if prepared.pop(key, None) is not None and _frame_rows(context) is None:
@@ -1853,14 +1948,24 @@ def _decision_returns(context, signals, *, actions=None) -> list[float]:
         prepared["position_actions"] = actions
     accounting = _product_accounting(prepared)
     if accounting is not None:
-        return list(account_return_series(accounting).net_returns)
+        report = account_return_series(accounting)
+        returns = list(report.net_returns)
+        financial_status = (
+            futures_financial_feasibility_status(accounting)
+            if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+            else None
+        )
+        del accounting, report
+        return returns, financial_status
     report = _position_return_report(context, signals, _market_price_returns(context, len(signals)))
-    return list(report.net_returns)
+    return list(report.net_returns), None
 
 
-def _parameter_neighbours(
-    candidate: Candidate, context: Mapping[str, Any]
-) -> dict[str, list[float]]:
+def _decision_returns(context, signals, *, actions=None) -> list[float]:
+    return _decision_measurement(context, signals, actions=actions)[0]
+
+
+def _parameter_neighbours(candidate: Candidate, context: Mapping[str, Any]) -> dict[str, Any]:
     neighbours = _declared_parameter_neighbours(context)
     if neighbours:
         return neighbours
@@ -1874,42 +1979,60 @@ def _parameter_stability_results(
     candidate: Candidate,
     context: Mapping[str, Any],
     base_returns: list[float],
-    neighbours: Mapping[str, list[float]],
+    neighbours: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     results = []
     base_total = math.prod(1 + value for value in base_returns) - 1
     snapshots = list(context.get("dataset_snapshot_ids", ()))
     for name, values in sorted(neighbours.items()):
-        comparable = values
+        if isinstance(values, Mapping):
+            raw_comparable = values.get("returns")
+            financial_status = values.get("financial_feasibility")
+        else:
+            raw_comparable = values
+            financial_status = None
+        if not isinstance(raw_comparable, list | tuple):
+            raise ExecutorError("parameter comparison has invalid measured returns")
+        comparable = [float(value) for value in raw_comparable]
         if len(comparable) != len(base_returns):
             raise ExecutorError("parameter comparison has unequal calendar observations")
-        results.append(
-            {
-                "name": name,
-                "run_id": canonical_hash(
-                    {
-                        "kind": "parameter_neighbour_backtest/v1",
-                        "candidate_id": candidate.candidate_id,
-                        "dataset_snapshot_ids": snapshots,
-                        "neighbour": name,
-                        "returns": comparable,
-                    }
-                ),
-                "observations": len(comparable),
-                "return": math.prod(1 + value for value in comparable) - 1,
-                "passed": len(comparable) == len(base_returns)
-                and math.prod(1 + value for value in comparable) - 1 >= base_total * 0.5,
-                "window_returns": _window_returns(comparable, _evaluation_window_count(context)),
-                "input_hash": canonical_hash(
-                    {
-                        "candidate_id": candidate.candidate_id,
-                        "dataset_snapshot_ids": snapshots,
-                        "neighbour": name,
-                        "returns": comparable,
-                    }
-                ),
-            }
+        financial_risk_required = (
+            context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
         )
+        if not isinstance(financial_status, str) or financial_status not in {
+            "pass",
+            "fail",
+            "unavailable",
+        }:
+            financial_status = "unavailable" if financial_risk_required else None
+        statistical_passed = (
+            len(comparable) == len(base_returns)
+            and math.prod(1 + value for value in comparable) - 1 >= base_total * 0.5
+        )
+        neighbor_passed = statistical_passed and (
+            not financial_risk_required or financial_status == "pass"
+        )
+        identity: dict[str, Any] = {
+            "candidate_id": candidate.candidate_id,
+            "dataset_snapshot_ids": snapshots,
+            "neighbour": name,
+            "returns": comparable,
+        }
+        if financial_risk_required:
+            identity["financial_feasibility"] = financial_status
+        result = {
+            "name": name,
+            "run_id": canonical_hash({"kind": "parameter_neighbour_backtest/v1", **identity}),
+            "observations": len(comparable),
+            "return": math.prod(1 + value for value in comparable) - 1,
+            "passed": neighbor_passed,
+            "window_returns": _window_returns(comparable, _evaluation_window_count(context)),
+            "input_hash": canonical_hash(identity),
+        }
+        if financial_risk_required:
+            result["financial_feasibility"] = financial_status
+            result["statistical_passed"] = statistical_passed
+        results.append(result)
     return results
 
 
@@ -1918,7 +2041,7 @@ def _parameter_stability(
 ) -> dict[str, Any]:
     tunable = _tunable_parameter_names(candidate, context)
     if not tunable:
-        return {
+        result = {
             "status": "not_applicable",
             "passed": True,
             "reason": "no_tunable_parameters",
@@ -1926,6 +2049,9 @@ def _parameter_stability(
             "results": [],
             "base_window_returns": _window_returns(base_returns, _evaluation_window_count(context)),
         }
+        if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT:
+            result["financial_feasibility"] = "not_applicable"
+        return result
     neighbours = _parameter_neighbours(candidate, context)
     results = _parameter_stability_results(candidate, context, base_returns, neighbours)
     base_total = math.prod(1 + value for value in base_returns) - 1
@@ -1939,16 +2065,32 @@ def _parameter_stability(
         else None
     )
     cliff_detected = degradation is not None and degradation > allowed_degradation
-    passed_count = sum(1 for item in results if item["passed"])
-    passed = (
+    passed_count = sum(
+        1 for item in results if item.get("statistical_passed", item["passed"]) is True
+    )
+    metric_passed = (
         bool(base_returns)
         and bool(results)
         and not cliff_detected
         and passed_count >= (len(results) + 1) // 2
         and (median_return or 0.0) >= base_total * (1.0 - allowed_degradation)
     )
-    return {
-        "status": "unavailable" if not results else "pass" if passed else "fail",
+    if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT:
+        financial_status = combine_futures_financial_feasibility_statuses(
+            item.get("financial_feasibility", "unavailable") for item in results
+        )
+        status = (
+            "fail"
+            if financial_status == "fail" or (results and not metric_passed)
+            else "unavailable"
+            if financial_status == "unavailable" or not results
+            else "pass"
+        )
+    else:
+        status = "unavailable" if not results else "pass" if metric_passed else "fail"
+    passed = status == "pass"
+    result = {
+        "status": status,
         "passed": passed,
         "neighbours_tested": len(results),
         "results": results,
@@ -1961,6 +2103,9 @@ def _parameter_stability(
         "cliff_detected": cliff_detected,
         "base_window_returns": _window_returns(base_returns, _evaluation_window_count(context)),
     }
+    if context.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT:
+        result["financial_feasibility"] = financial_status
+    return result
 
 
 def _bind_parameter_control(controls, stability, returns) -> None:
@@ -3332,6 +3477,7 @@ def execution_receipt(
     evidence_policy_hash: str | None = None,
     behaviour_hash: str | None = None,
     evaluation_input: Mapping[str, Any] | None = None,
+    financial_risk_contract: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "candidate_id": candidate.candidate_id,
@@ -3342,6 +3488,8 @@ def execution_receipt(
         payload["evidence_policy_hash"] = evidence_policy_hash
     if behaviour_hash is not None:
         payload["behaviour_hash"] = behaviour_hash
+    if financial_risk_contract is not None:
+        payload["financial_risk_contract"] = str(financial_risk_contract)
     if evaluation_input is not None:
         payload["evaluation_input"] = dict(evaluation_input)
         payload["evaluation_input_id"] = canonical_hash(evaluation_input)

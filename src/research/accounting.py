@@ -18,6 +18,8 @@ from typing import Any
 from src.accounting.spot_allocation import target_trade_quantity
 from src.domain._codec import canonical_hash, timestamp
 
+FUTURES_ACCOUNTING_RISK_CONTRACT = "futures-financial-feasibility/v1"
+
 
 class ProductAccountingError(ValueError):
     """A product accounting input is missing, invalid, or inconsistent."""
@@ -764,6 +766,70 @@ class FuturesAccountingReport:
     @property
     def cost_adjusted_return(self) -> float:
         return self.net_pnl
+
+
+def futures_financial_feasibility_status(accounting: object) -> str:
+    """Validate configured capacity and liquidation results from futures accounting."""
+
+    if accounting is None:
+        return "unavailable"
+    if not isinstance(accounting, Mapping):
+        return "fail"
+    if accounting.get("status") == "unavailable":
+        return "unavailable"
+    return _measured_futures_financial_feasibility_status(accounting)
+
+
+def _measured_futures_financial_feasibility_status(accounting: Mapping[str, Any]) -> str:
+    if (
+        accounting.get("schema") != "platform.futures_accounting/v1"
+        or accounting.get("financial_risk_contract") != FUTURES_ACCOUNTING_RISK_CONTRACT
+    ):
+        return "fail"
+    required = (
+        "capacity_violations",
+        "capacity_passed",
+        "liquidation",
+        "max_leverage",
+        "max_margin_fraction",
+    )
+    if any(name not in accounting or accounting[name] is None for name in required):
+        return "unavailable"
+    violations = accounting["capacity_violations"]
+    if isinstance(violations, bool) or not isinstance(violations, int) or violations < 0:
+        return "fail"
+    if (
+        violations > 0
+        or accounting["capacity_passed"] is False
+        or accounting["liquidation"] is True
+    ):
+        return "fail"
+    if accounting["capacity_passed"] is not True or accounting["liquidation"] is not False:
+        return "unavailable"
+    if any(
+        not _finite_nonnegative_ratio(accounting[name])
+        for name in ("max_leverage", "max_margin_fraction")
+    ):
+        return "fail"
+    return "pass"
+
+
+def _finite_nonnegative_ratio(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def combine_futures_financial_feasibility_statuses(statuses: Iterable[str]) -> str:
+    measured = tuple(statuses)
+    if any(status == "fail" for status in measured):
+        return "fail"
+    if not measured or any(status not in {"pass", "not_applicable"} for status in measured):
+        return "unavailable"
+    return "pass"
 
 
 @dataclass(frozen=True)

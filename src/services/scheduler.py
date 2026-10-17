@@ -33,13 +33,13 @@ from src.data.database import (
 )
 from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.data_plan import product_data_plan
 from src.research.datasets import _load_snapshot_manifests
 from src.research.outcomes import OutcomeCategory, TrialDisposition
 from src.research.rounds import ResearchRoundCoordinator
 from src.research.scheduling import research_inputs
-from src.research.store import SqlResearchStore
 from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
 from src.services.job_schemas import JobSchemaError, validate_job_payload
 
@@ -423,6 +423,8 @@ class PlatformScheduler:
     def _candidate_evaluation_jobs(
         self, product_id: str, now: str, due_at: str
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        from src.research.store import SqlResearchStore
+
         jobs: list[tuple[str, str, dict[str, Any]]] = []
         product_candidates = tuple(
             candidate
@@ -711,6 +713,8 @@ class PlatformScheduler:
     def _research_jobs(
         self, schedule_name: str, product_id: str, now: str, due_at: str
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        from src.research.store import SqlResearchStore
+
         required_payload, job_name = {
             "bounded_backtest": ("bar_steps", "bounded_backtest"),
             "event_replay": ("event_replay", "event_replay"),
@@ -894,7 +898,11 @@ class PlatformScheduler:
             "feature_manifest_id": str(snapshot_payload.get("feature_manifest_id") or ""),
             "cost_model_id": str(snapshot_payload.get("cost_model_id") or ""),
             "parameter_set_id": str(snapshot_payload.get("parameter_set_id") or ""),
-            "evaluator_version": "platform-scheduler/v1",
+            "evaluator_version": (
+                "platform-scheduler/v1:" + FUTURES_ACCOUNTING_RISK_CONTRACT
+                if snapshot_payload.get("product_id") == "active_income"
+                else "platform-scheduler/v1"
+            ),
             "requested_stage": requested_stage,
             "evaluated_at": str(snapshot_payload.get("availability_timestamp") or evaluated_at),
             "producer_identity": "platform-scheduler",

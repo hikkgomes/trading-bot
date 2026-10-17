@@ -981,7 +981,9 @@ def _forward_services(database, configuration, queue, clock, root, monkeypatch):
             },
             created_at=historical.availability_timestamp,
         )
-    writer = supervisor._data_writer_cycle(**common, root=root / "market")
+    from src.services.data_writer import data_writer_cycle
+
+    writer = data_writer_cycle(**common, root=root / "market", clock=lambda: clock[0])
     feature = supervisor._feature_cycle(
         database=database,
         node_id="fixture",

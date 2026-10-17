@@ -18,6 +18,11 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import experiment, holdout_claim, holdout_outcome
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.research.accounting import (
+    FUTURES_ACCOUNTING_RISK_CONTRACT,
+    combine_futures_financial_feasibility_statuses,
+    futures_financial_feasibility_status,
+)
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.datasets import CanonicalDatasetResolver
 from src.research.evidence import (
@@ -36,6 +41,7 @@ from src.research.evidence import (
     semantic_parity_passes,
 )
 from src.research.executors import (
+    DataUnavailableError,
     ExecutionResult,
     ExecutorError,
     ProviderExecutorRegistry,
@@ -740,11 +746,56 @@ class EvidencePolicy:
                     )
                     else EvidenceStatus.FAIL
                 )
+        financial_risk_contract = evidence.get("financial_risk_contract")
+        if product_id == "active_income" or (
+            financial_risk_contract == FUTURES_ACCOUNTING_RISK_CONTRACT
+        ):
+            statuses["financial_feasibility"] = _financial_feasibility_evidence_status(
+                futures_financial_feasibility_status(evidence.get("product_accounting"))
+            )
+            if stage == "robustness":
+                statuses["financial_stress_feasibility"] = _financial_stress_evidence_status(
+                    evidence.get("financial_stress_feasibility")
+                )
         return statuses
 
 
 def _passed_mapping(value: object) -> bool:
     return isinstance(value, Mapping) and value.get("passed") is True
+
+
+def _financial_feasibility_evidence_status(value: str) -> EvidenceStatus:
+    return {
+        "pass": EvidenceStatus.PASS,
+        "fail": EvidenceStatus.FAIL,
+        "unavailable": EvidenceStatus.UNAVAILABLE,
+    }.get(value, EvidenceStatus.FAIL)
+
+
+def _financial_stress_evidence_status(value: object) -> EvidenceStatus:
+    if not isinstance(value, Mapping):
+        return EvidenceStatus.UNAVAILABLE
+    checks = value.get("checks")
+    expected_checks = {
+        "cost",
+        "adverse_fill",
+        "funding",
+        "delay",
+        "missing_data",
+        "parameter_stability",
+    }
+    if not isinstance(checks, Mapping) or set(checks) != expected_checks:
+        return EvidenceStatus.UNAVAILABLE
+    for name, check_status in checks.items():
+        valid_statuses = {"pass", "fail", "unavailable"}
+        if name == "parameter_stability":
+            valid_statuses.add("not_applicable")
+        if not isinstance(check_status, str) or check_status not in valid_statuses:
+            return EvidenceStatus.UNAVAILABLE
+    status = combine_futures_financial_feasibility_statuses(checks.values())
+    if value.get("status") != status:
+        return EvidenceStatus.FAIL
+    return _financial_feasibility_evidence_status(status)
 
 
 def _is_not_applicable(value: object) -> bool:
@@ -1258,6 +1309,7 @@ class ProtectedHoldoutWorker:
                 or outcome_payload.get("passed") is not accepted
             ):
                 raise EvaluationContractError("persisted protected outcome is inconsistent")
+            _require_protected_financial_risk_contract(self.product_id, outcome_payload)
             return (
                 claim_id,
                 str(existing_outcome["id"]),
@@ -1300,6 +1352,7 @@ class ProtectedHoldoutWorker:
             raise EvaluationContractError("protected evaluator returned no sealed outcome")
         if sealed.get("passed") is not accepted:
             raise EvaluationContractError("protected sealed outcome does not match its decision")
+        _require_protected_financial_risk_contract(self.product_id, sealed)
         outcome_id = self.repository.record_outcome(
             claim_id=claim_id,
             evaluated_at=evaluated_at,
@@ -1309,6 +1362,24 @@ class ProtectedHoldoutWorker:
         # Keep protected metrics and dataset identities in the sealed database
         # row. The adaptive caller receives only a non-row-level summary.
         return claim_id, outcome_id, accepted, {"passed": accepted, "outcome_id": outcome_id}
+
+
+def _sealed_financial_risk_contract_matches(sealed: Mapping[str, Any]) -> bool:
+    receipt = sealed.get("execution_receipt")
+    return (
+        sealed.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+        and isinstance(receipt, Mapping)
+        and receipt.get("financial_risk_contract") == FUTURES_ACCOUNTING_RISK_CONTRACT
+    )
+
+
+def _require_protected_financial_risk_contract(
+    product_id: str | None, sealed: Mapping[str, Any]
+) -> None:
+    if product_id == "active_income" and not _sealed_financial_risk_contract_matches(sealed):
+        raise DataUnavailableError(
+            "protected outcome does not bind the current financial risk contract"
+        )
 
 
 def _candidate_applicability(candidate, context: Mapping[str, Any]) -> EvidenceApplicability:
@@ -1502,6 +1573,11 @@ class CanonicalResearchEvaluator:
             "candidate_id": request.candidate_id,
             "strategy_version_id": definition.strategy_version_id,
             "product_id": definition.product,
+            **(
+                {"financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT}
+                if definition.product == "active_income"
+                else {}
+            ),
             "strategy_family": family,
             "strategy_horizon": horizon,
             "evidence_type": evidence_type,

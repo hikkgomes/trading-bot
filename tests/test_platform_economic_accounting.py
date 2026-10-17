@@ -2,13 +2,21 @@ import pytest
 
 from src.accounting.capital import btc_capital_baseline
 from src.data.database import PlatformDatabase
+from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
-from src.research.accounting import BtcResearchAccounting, FuturesResearchAccounting
+from src.research.accounting import (
+    FUTURES_ACCOUNTING_RISK_CONTRACT,
+    BtcResearchAccounting,
+    FuturesResearchAccounting,
+    futures_financial_feasibility_status,
+)
 from src.research.economic_series import account_return_series, btc_nav_series, futures_nav_series
 from src.research.executors import (
     _append_semantic_futures_events,
+    _stress_feasibility_check,
     _stress_report,
     execute_generated_dsl,
+    execution_receipt,
 )
 from src.research.position_execution import PositionTimingUnavailable, managed_futures_events
 from src.research.providers import provider_candidate
@@ -243,7 +251,7 @@ def test_btc_cost_stress_uses_affordable_btc_nav_instead_of_signed_price_returns
             {"timestamp": f"2026-09-07T0{index}:00:00+00:00", "close": 100} for index in range(2)
         ],
     }
-    report = _stress_report(context, [1, 1], [0], fee=2)
+    report, _ = _stress_report(context, [1, 1], [0], fee=2)
     assert report.net_pnl == pytest.approx(100 / 102 - 1)
     assert context["fee_bps"] == 100
 
@@ -326,10 +334,203 @@ def test_funding_stress_replays_native_payments_once_at_actual_quantity():
         "market_frame": rows,
         "bars": rows,
     }
-    report = _stress_report(context, [1, 1], [0], funding=2)
+    report, _ = _stress_report(context, [1, 1], [0], funding=2)
     assert report.funding_pnl == pytest.approx(-2 / 1000)
     assert report.net_pnl == pytest.approx(-2 / 1000)
     assert rows[1]["funding_events"][0]["funding_rate"] == 0.01
+
+
+def test_financial_feasibility_requires_measured_risk_flags_and_bounded_ratios():
+    from src.research.evaluation import EvidencePolicy, EvidenceStatus
+
+    accounting = {
+        "schema": "platform.futures_accounting/v1",
+        "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+        "capacity_violations": 0,
+        "capacity_passed": True,
+        "liquidation": False,
+        "max_leverage": 1.5,
+        "max_margin_fraction": 0.75,
+    }
+    assert futures_financial_feasibility_status(accounting) == "pass"
+    assert futures_financial_feasibility_status(None) == "unavailable"
+    assert futures_financial_feasibility_status({**accounting, "max_leverage": None}) == (
+        "unavailable"
+    )
+    for breached in (
+        {**accounting, "capacity_violations": 1, "capacity_passed": False},
+        {**accounting, "liquidation": True},
+        {**accounting, "max_margin_fraction": float("inf")},
+        {**accounting, "max_leverage": float("nan")},
+        {**accounting, "max_leverage": -0.01},
+    ):
+        assert futures_financial_feasibility_status(breached) == "fail"
+
+    policy = EvidencePolicy()
+    for stage in ("screening", "development", "robustness", "protected", "forward"):
+        statuses = policy.statuses(
+            stage,
+            {
+                "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+                "product_accounting": accounting,
+            },
+            (),
+        )
+        assert statuses["financial_feasibility"] is EvidenceStatus.PASS
+        missing = policy.statuses(
+            stage,
+            {"financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT},
+            (),
+        )
+        assert missing["financial_feasibility"] is EvidenceStatus.UNAVAILABLE
+
+    checks = {
+        name: "pass"
+        for name in (
+            "cost",
+            "adverse_fill",
+            "funding",
+            "delay",
+            "missing_data",
+            "parameter_stability",
+        )
+    }
+    robustness = policy.statuses(
+        "robustness",
+        {
+            "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+            "product_accounting": accounting,
+            "financial_stress_feasibility": {"status": "pass", "checks": checks},
+        },
+        (),
+    )
+    assert robustness["financial_stress_feasibility"] is EvidenceStatus.PASS
+    incomplete = policy.statuses(
+        "robustness",
+        {
+            "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+            "product_accounting": accounting,
+            "financial_stress_feasibility": {
+                "status": "pass",
+                "checks": {name: status for name, status in checks.items() if name != "funding"},
+            },
+        },
+        (),
+    )
+    assert incomplete["financial_stress_feasibility"] is EvidenceStatus.UNAVAILABLE
+    invalid_not_applicable = policy.statuses(
+        "robustness",
+        {
+            "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+            "product_accounting": accounting,
+            "financial_stress_feasibility": {
+                "status": "pass",
+                "checks": {**checks, "funding": "not_applicable"},
+            },
+        },
+        (),
+    )
+    assert invalid_not_applicable["financial_stress_feasibility"] is EvidenceStatus.UNAVAILABLE
+    breached_checks = {**checks, "funding": "fail"}
+    breached = policy.statuses(
+        "robustness",
+        {
+            "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+            "product_accounting": accounting,
+            "financial_stress_feasibility": {"status": "fail", "checks": breached_checks},
+        },
+        (),
+    )
+    assert breached["financial_stress_feasibility"] is EvidenceStatus.FAIL
+
+
+def test_profitable_funding_stress_fails_when_intermediate_margin_breaches_capacity():
+    events = [
+        {
+            "type": "fill",
+            "side": "buy",
+            "quantity": 2,
+            "price": 100,
+            "timestamp": "2026-09-07T00:00:00+00:00",
+        },
+        {
+            "type": "funding",
+            "mark_price": 100,
+            "funding_rate": 0.1,
+            "timestamp": "2026-09-07T00:01:00+00:00",
+        },
+        {
+            "type": "mark",
+            "mark_price": 200,
+            "timestamp": "2026-09-07T00:02:00+00:00",
+        },
+    ]
+    context = {
+        "product_id": "active_income",
+        "financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT,
+        "initial_cash": 100,
+        "leverage": 2,
+        "max_margin_fraction": 1,
+        "futures_events": events,
+        "fee_bps": 0,
+        "slippage_bps": 0,
+    }
+    stressed, financial_status = _stress_report(context, [1, 1, 1], [0], funding=2)
+
+    assert stressed.net_pnl > 0
+    assert financial_status == "fail"
+    assert _stress_feasibility_check(context, financial_status, pnl_passed=True) == {
+        "passed": False,
+        "status": "fail",
+        "financial_feasibility": "fail",
+    }
+
+
+def test_execution_receipt_hash_binds_active_income_risk_contract_only():
+    snapshot = "sha256:" + "a" * 64
+    candidate = provider_candidate(
+        identity="active-income-risk-contract",
+        version="1",
+        family="trend",
+        product="active_income",
+        thesis_id="sha256:" + "b" * 64,
+        lineage_id="sha256:" + "c" * 64,
+        provider="test",
+        source_type=StrategySourceType.REGISTERED_PYTHON,
+        source_payload={"strategy": "fixture"},
+        dataset_snapshot_hashes=(snapshot,),
+        submitted_at="2026-09-07T00:00:00+00:00",
+    )
+    receipt = execution_receipt(
+        candidate=candidate,
+        dataset_snapshot_ids=(snapshot,),
+        executor_version="economic-engine/v5",
+        financial_risk_contract=FUTURES_ACCOUNTING_RISK_CONTRACT,
+    )
+    payload = {key: value for key, value in receipt.items() if key != "input_hash"}
+    assert receipt["financial_risk_contract"] == FUTURES_ACCOUNTING_RISK_CONTRACT
+    assert receipt["input_hash"] == canonical_hash(payload)
+
+    btc_candidate = provider_candidate(
+        identity="btc-risk-contract-unchanged",
+        version="1",
+        family="trend",
+        product="btc_accumulation",
+        thesis_id="sha256:" + "d" * 64,
+        lineage_id="sha256:" + "e" * 64,
+        provider="test",
+        source_type=StrategySourceType.REGISTERED_PYTHON,
+        universe={"type": "fixed", "symbols": ["BTCUSDT"]},
+        source_payload={"strategy": "fixture"},
+        dataset_snapshot_hashes=(snapshot,),
+        submitted_at="2026-09-07T00:00:00+00:00",
+    )
+    btc_receipt = execution_receipt(
+        candidate=btc_candidate,
+        dataset_snapshot_ids=(snapshot,),
+        executor_version="economic-engine/v5",
+    )
+    assert "financial_risk_contract" not in btc_receipt
 
 
 def test_dsl_decisions_reach_fee_inclusive_btc_accounting():

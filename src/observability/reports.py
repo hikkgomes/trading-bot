@@ -73,6 +73,7 @@ from src.data.database import (
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.observability.decision_trace import DecisionTraceStage
 from src.observability.queue_progress import queue_progress
+from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.outcomes import terminal_trial_disposition
 
@@ -1030,6 +1031,12 @@ class DatabasePlatformReport:
             experiment_run.c.payload["receipt"]["dataset_snapshot_ids"].as_json().label("datasets"),
             experiment_run.c.payload["receipt"]["executor_version"].as_string().label("executor"),
             experiment_run.c.payload["receipt"]["input_hash"].as_string().label("input_hash"),
+            experiment_run.c.payload["receipt"]["financial_risk_contract"]
+            .as_string()
+            .label("financial_risk_contract"),
+            experiment_run.c.payload["evidence"]["evaluation_context"]["product_id"]
+            .as_string()
+            .label("product_id"),
         ).where(~is_diagnostic)
         for row in self._iter_rows(statement):
             candidate_id = row["candidate_id"]
@@ -1045,10 +1052,18 @@ class DatabasePlatformReport:
                     "candidate_id": candidate_id,
                     "datasets": sorted(datasets),
                     "engine_version": executor,
+                    **(
+                        {"financial_risk_contract": row["financial_risk_contract"]}
+                        if row["financial_risk_contract"]
+                        else {}
+                    ),
                 }
             )
             measured.add(identity)
-            if executor == ECONOMIC_ENGINE_VERSION:
+            if executor == ECONOMIC_ENGINE_VERSION and (
+                row["product_id"] != "active_income"
+                or row["financial_risk_contract"] == FUTURES_ACCOUNTING_RISK_CONTRACT
+            ):
                 current_count += 1
                 current.add(identity)
         return {

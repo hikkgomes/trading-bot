@@ -8,14 +8,14 @@ import math
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import Executor, Future
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import requests
 from sqlalchemy import select
 
-from src.data.database import market_input_sources
+from src.data.database import PlatformDatabase, market_input_sources
 from src.data.feature_graph import FeatureGraphRegistry, FeatureNodeType
 from src.data.parquet_store import (
     DurableMarketBatchSpool,
@@ -906,6 +906,64 @@ def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
     if values.get("visible_depth_quote", 0.0) < 0:
         return None
     return values
+
+
+def data_writer_cycle(
+    *,
+    database: PlatformDatabase,
+    node_id: str,
+    root: Path,
+    configuration: Mapping[str, Mapping[str, Any]],
+    clock: Callable[[], str] | None = None,
+) -> DatabaseMarketDataWriter:
+    """Build the dedicated writer without importing the all-service supervisor."""
+
+    from src.services.runtime import utc_now
+
+    worker_clock = clock or utc_now
+    queue = DatabaseJobQueue(database.engine)
+    worker_id = f"{node_id}:data-writer"
+    queue.register_worker(
+        worker_id=worker_id,
+        node_id=node_id,
+        role="data-writer",
+        capabilities=(
+            "market_event_write",
+            "market_event_batch_write",
+            "market_data_gap_recovery",
+            "historical_bootstrap",
+        ),
+        observed_at=worker_clock(),
+    )
+    products = {
+        str(product["product_id"]): dict(product)
+        for product in configuration["products"]["products"]
+    }
+    accounts = {
+        str(account["account_id"]): dict(account)
+        for account in configuration["accounts"]["accounts"]
+    }
+    products_by_market: dict[str, list[str]] = {}
+    for product_id, product in products.items():
+        account = accounts[str(product["account_id"])]
+        market = {"spot": "spot", "usdt_futures": "futures"}.get(str(account["market"]))
+        if market is None:
+            raise ValueError(f"unsupported account market for {product_id}")
+        products_by_market.setdefault(market, []).append(product_id)
+    return DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id=worker_id,
+        root=root,
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market=products_by_market,
+        historical_bootstrap_service=HistoricalBootstrapService(
+            engine=database.engine,
+            root=root,
+        ),
+        historical_executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="history"),
+        clock=worker_clock,
+        lease_seconds=300,
+    )
 
 
 def _market_number(raw_data: Mapping[str, Any], *names: str) -> float | None:

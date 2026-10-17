@@ -13,17 +13,25 @@ from src.data.database import (
     PlatformDatabase,
     dataset_snapshot,
     holdout_claim,
+    holdout_outcome,
     selection_cohort,
     selection_cohort_open,
     strategy_definition,
     strategy_version,
 )
 from src.domain._codec import canonical_hash
+from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
 from src.research.canonical import CanonicalEvidenceError, SqlHoldoutRepository
 from src.research.cohorts import prepare_cohort
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
+from src.research.evaluation import (
+    CanonicalResearchEvaluator,
+    EvaluationRequest,
+    ProtectedHoldoutWorker,
+)
 from src.research.executors import DataUnavailableError
 from src.research.selection import FrozenCohort, selection_adjusted_block_bootstrap
+from src.research.store import SqlResearchStore
 
 
 def _approval_calibration_fixture(configuration):
@@ -371,6 +379,180 @@ def test_holdout_retry_reuses_claim_after_restart_without_reopening_changed_inpu
     with database.engine.connect() as connection:
         rows = connection.execute(select(holdout_claim)).mappings().all()
     assert len(rows) == 1 and rows[0]["payload"]["claimed_at"] == now
+    database.dispose()
+
+
+def test_active_income_context_binds_risk_contract_while_btc_context_does_not(tmp_path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-context.sqlite3'}")
+    database.create_schema()
+    snapshot = canonical_hash({"fixture": "context"})
+    request = EvaluationRequest(
+        candidate_id=canonical_hash({"candidate": "fixture"}),
+        evaluation_policy_id="policy-v1",
+        dataset_snapshot_ids=(snapshot,),
+        requested_stage="development",
+        evaluated_at="2026-09-07T00:00:00+00:00",
+        dataset_roles={snapshot: "development"},
+    )
+    evaluator = CanonicalResearchEvaluator(SqlResearchStore(database.engine))
+    shared = {
+        "request": request,
+        "family": "trend",
+        "horizon": "1h",
+        "evidence_type": "swing",
+        "stage_snapshot_ids": (snapshot,),
+        "thesis_id": canonical_hash({"thesis": "missing"}),
+    }
+    active_income = evaluator._evaluation_context(
+        definition=SimpleNamespace(
+            strategy_version_id="active-v1",
+            product="active_income",
+            source_hash=canonical_hash({"source": "active"}),
+        ),
+        **shared,
+    )
+    btc_accumulation = evaluator._evaluation_context(
+        definition=SimpleNamespace(
+            strategy_version_id="btc-v1",
+            product="btc_accumulation",
+            source_hash=canonical_hash({"source": "btc"}),
+        ),
+        **shared,
+    )
+
+    assert active_income["financial_risk_contract"] == FUTURES_ACCOUNTING_RISK_CONTRACT
+    assert "financial_risk_contract" not in btc_accumulation
+    database.dispose()
+
+
+def test_protected_holdout_reuse_requires_risk_contract_in_outcome_and_receipt(tmp_path):
+    contract = FUTURES_ACCOUNTING_RISK_CONTRACT
+    variants = (
+        {"passed": True, "execution_receipt": {}},
+        {"passed": True, "financial_risk_contract": contract, "execution_receipt": {}},
+        {
+            "passed": True,
+            "execution_receipt": {"financial_risk_contract": contract},
+        },
+        {
+            "passed": True,
+            "financial_risk_contract": contract,
+            "execution_receipt": {"financial_risk_contract": contract},
+        },
+    )
+    now = "2026-09-07T00:00:00+00:00"
+    for index, sealed in enumerate(variants):
+        database = PlatformDatabase(
+            f"sqlite+pysqlite:///{tmp_path / f'protected-risk-{index}.sqlite3'}"
+        )
+        database.create_schema()
+        snapshot = canonical_hash({"fixture": f"protected-{index}"})
+        source = canonical_hash({"fixture": f"source-{index}"})
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(strategy_definition).values(
+                    id=source,
+                    identity=f"fixture-{index}",
+                    product_id="active_income",
+                    source_type="registered_python",
+                    source_hash=source,
+                    definition={},
+                )
+            )
+            connection.execute(
+                insert(strategy_version).values(
+                    id=f"fixture-v{index}",
+                    definition_id=source,
+                    version="1",
+                    created_at=now,
+                    payload={},
+                )
+            )
+            connection.execute(
+                insert(dataset_snapshot).values(id=snapshot, created_at=now, payload={})
+            )
+        request = {
+            "strategy_version_id": f"fixture-v{index}",
+            "data_snapshot_id": snapshot,
+            "cohort_id": "frozen-cohort",
+            "source_hashes": {"code": source},
+        }
+        repository = SqlHoldoutRepository(database.engine)
+        claim_id = repository.claim(**request, claimed_at=now)
+        repository.record_outcome(
+            claim_id=claim_id,
+            evaluated_at=now,
+            accepted=True,
+            outcome=sealed,
+        )
+        worker = ProtectedHoldoutWorker(
+            database.engine,
+            lambda _claim: pytest.fail("an immutable protected outcome must not be rerun"),
+            product_id="active_income",
+        )
+        if index < 3:
+            with pytest.raises(DataUnavailableError, match="does not bind"):
+                worker.claim_and_evaluate(
+                    strategy_version_id=request["strategy_version_id"],
+                    dataset_snapshot_id=snapshot,
+                    cohort_id=request["cohort_id"],
+                    source_hashes=request["source_hashes"],
+                    evaluated_at=now,
+                )
+        else:
+            result = worker.claim_and_evaluate(
+                strategy_version_id=request["strategy_version_id"],
+                dataset_snapshot_id=snapshot,
+                cohort_id=request["cohort_id"],
+                source_hashes=request["source_hashes"],
+                evaluated_at=now,
+            )
+            assert result[2] is True
+        database.dispose()
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'protected-risk-new.sqlite3'}")
+    database.create_schema()
+    snapshot = canonical_hash({"fixture": "protected-new"})
+    source = canonical_hash({"fixture": "source-new"})
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(strategy_definition).values(
+                id=source,
+                identity="fixture-new",
+                product_id="active_income",
+                source_type="registered_python",
+                source_hash=source,
+                definition={},
+            )
+        )
+        connection.execute(
+            insert(strategy_version).values(
+                id="fixture-new-v1",
+                definition_id=source,
+                version="1",
+                created_at=now,
+                payload={},
+            )
+        )
+        connection.execute(insert(dataset_snapshot).values(id=snapshot, created_at=now, payload={}))
+    worker = ProtectedHoldoutWorker(
+        database.engine,
+        lambda _claim: (
+            True,
+            {"sealed_result": {"passed": True, "financial_risk_contract": contract}},
+        ),
+        product_id="active_income",
+    )
+    with pytest.raises(DataUnavailableError, match="does not bind"):
+        worker.claim_and_evaluate(
+            strategy_version_id="fixture-new-v1",
+            dataset_snapshot_id=snapshot,
+            cohort_id="frozen-cohort",
+            source_hashes={"code": source},
+            evaluated_at=now,
+        )
+    with database.engine.connect() as connection:
+        assert connection.execute(select(holdout_outcome)).first() is None
     database.dispose()
 
 

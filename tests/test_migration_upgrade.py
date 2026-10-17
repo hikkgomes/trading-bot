@@ -248,3 +248,100 @@ def test_all_provider_upgrade_retains_counts_closed_epochs_and_exposure():
         with admin.connect() as connection:
             connection.execute(text(f"DROP DATABASE {name} WITH (FORCE)"))
         admin.dispose()
+
+
+def test_futures_financial_upgrade_preserves_trials_and_protected_exposure():
+    url = os.environ.get("TRADING_PLATFORM_DATABASE_URL", "")
+    if not url.startswith("postgresql"):
+        pytest.skip("requires isolated PostgreSQL migration rehearsal")
+    base = make_url(url)
+    name = "financial_upgrade_" + uuid.uuid4().hex[:16]
+    admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    database = PlatformDatabase(base.set(database=name).render_as_string(hide_password=False))
+    with admin.connect() as connection:
+        connection.execute(text(f"CREATE DATABASE {name}"))
+    try:
+        database.migrate(target="platform_v2_0050")
+        with database.engine.begin() as connection:
+            for identity, product, epoch_state in (
+                ("open", "active_income", "active"),
+                ("closed", "active_income", "closed_for_selection"),
+                ("exposed", "active_income", "active"),
+                ("btc", "btc_accumulation", "active"),
+            ):
+                statements = """
+                    INSERT INTO dataset_bundle VALUES (:id,:product,NOW(),:id,'{}');
+                    INSERT INTO strategy_definition VALUES (:id,:id,:product,'fixture',:id,'{}');
+                    INSERT INTO strategy_version VALUES (:id,:id,'1',NOW(),'{}');
+                    INSERT INTO experiment
+                        (id,strategy_version_id,provider,state,submitted_at,dataset_snapshot_hashes,dataset_bundle_id,metadata)
+                        VALUES (:id,:id,'fixture','screening',NOW(),'[]',:id,'{}');
+                    INSERT INTO research_epoch
+                        VALUES (:id,:product,:id,:state,2,10,3,NOW(),'{}');
+                    INSERT INTO experiment_run VALUES (:id,NOW(),jsonb_build_object('candidate_id',CAST(:id AS varchar)));
+                    INSERT INTO validation_stage
+                        (id,experiment_id,stage,source_run_id,evaluated_at,state,accepted,
+                         evidence_hash,evaluation_identity,engine_version,outcome_category,payload)
+                        VALUES (:id,:id,'screening',:id,NOW(),'accepted',true,:id,:id,
+                            'economic-engine/v5','accepted','{}');
+                    INSERT INTO job
+                        (id,name,state,priority,available_at,attempts,max_attempts,
+                         producer_identity,content_hash,payload)
+                        VALUES (:id,'evaluate_candidate','pending',0,NOW(),0,3,'fixture',:id,
+                            jsonb_build_object('candidate_id',CAST(:id AS varchar)));
+                """
+                for statement in statements.strip().split(";"):
+                    if statement.strip():
+                        connection.execute(
+                            text(statement),
+                            {"id": identity, "product": product, "state": epoch_state},
+                        )
+            connection.execute(
+                text("""
+                INSERT INTO holdout_claim VALUES ('claim',NOW(),
+                    '{"strategy_version_id":"exposed","data_snapshot_id":"keep-consumed"}');
+            """)
+            )
+            before_epochs = connection.execute(
+                text("SELECT * FROM research_epoch ORDER BY id")
+            ).all()
+            before_claims = connection.execute(text("SELECT * FROM holdout_claim")).all()
+            before_stages = connection.execute(
+                text("SELECT * FROM validation_stage ORDER BY id")
+            ).all()
+        database.migrate()
+        with database.engine.connect() as connection:
+            assert dict(connection.execute(text("SELECT id,state FROM experiment")).all()) == {
+                "open": "queued",
+                "closed": "blocked_data",
+                "exposed": "blocked_data",
+                "btc": "screening",
+            }
+            assert dict(connection.execute(text("SELECT id,state FROM job")).all()) == {
+                "open": "quarantined",
+                "closed": "quarantined",
+                "exposed": "quarantined",
+                "btc": "pending",
+            }
+            assert set(
+                connection.execute(text("SELECT id FROM evidence_invalidation")).scalars()
+            ) == {
+                "stage:open",
+                "stage:closed",
+                "stage:exposed",
+            }
+            assert (
+                connection.execute(text("SELECT * FROM research_epoch ORDER BY id")).all()
+                == before_epochs
+            )
+            assert connection.execute(text("SELECT * FROM holdout_claim")).all() == before_claims
+            assert (
+                connection.execute(text("SELECT * FROM validation_stage ORDER BY id")).all()
+                == before_stages
+            )
+            assert connection.execute(text("SELECT count(*) FROM job_quarantine")).scalar_one() == 3
+    finally:
+        database.dispose()
+        with admin.connect() as connection:
+            connection.execute(text(f"DROP DATABASE {name} WITH (FORCE)"))
+        admin.dispose()

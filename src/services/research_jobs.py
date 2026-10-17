@@ -6,12 +6,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 
-from src.data.database import job, paper_eligibility_event, validation_stage
+from src.data.database import evidence_invalidation, job, paper_eligibility_event, validation_stage
 from src.data.parquet_store import PartitionedBacktestStore
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
+from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
 from src.research.artefacts import StrategyArtefact
 from src.research.backtest.bar_engine import BarPortfolioEngine, BarStep
 from src.research.backtest.event_engine import (
@@ -1244,6 +1245,11 @@ class DatabaseResearchJobHandlers:
                     **self._product_accounting_context(candidate.definition.product),
                     "product_id": candidate.definition.product,
                     "requested_stage": "protected",
+                    **(
+                        {"financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT}
+                        if candidate.definition.product == "active_income"
+                        else {}
+                    ),
                     "evaluated_at": request.evaluated_at,
                     "evidence_policy_hash": self.evidence_policy.policy_hash,
                     "minimum_bootstrap_observations": (
@@ -1316,6 +1322,11 @@ class DatabaseResearchJobHandlers:
                     )
             sealed = {
                 "passed": accepted,
+                **(
+                    {"financial_risk_contract": FUTURES_ACCOUNTING_RISK_CONTRACT}
+                    if candidate.definition.product == "active_income"
+                    else {}
+                ),
                 "evidence_hash": canonical_hash(measured),
                 "metrics": dict(execution.metrics),
                 "execution_receipt": dict(execution.receipt),
@@ -1587,6 +1598,11 @@ class DatabaseResearchJobHandlers:
                 .where(
                     validation_stage.c.experiment_id == candidate.candidate_id,
                     validation_stage.c.accepted.is_(True),
+                    ~exists(
+                        select(evidence_invalidation.c.id).where(
+                            evidence_invalidation.c.id == "stage:" + validation_stage.c.id
+                        )
+                    ),
                     validation_stage.c.stage.in_(
                         ("screening", "development", "robustness", "protected")
                     ),

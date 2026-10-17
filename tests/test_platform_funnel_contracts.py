@@ -220,3 +220,156 @@ def test_resource_wait_survives_restart_without_spending_retry(tmp_path):
     assert funnel["unique_measured_evaluations"] == 0
     assert funnel["candidates_evaluated"] == 0
     database.dispose()
+
+
+def test_financial_contract_revalidation_has_distinct_immutable_measurement(tmp_path):
+    from test_platform_candidate_lifecycle import _bundle, _candidate
+
+    from src.data.database import evidence_invalidation, experiment_run
+    from src.observability.research_progress import evaluation_identity
+    from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
+    from src.research.canonical import SqlValidationRepository
+    from src.research.executors import execution_receipt
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'revalidation.sqlite3'}")
+    database.create_schema()
+    candidate = _candidate(database, _bundle(database))
+    repository = SqlValidationRepository(database.engine)
+    receipts = [
+        execution_receipt(
+            candidate=candidate,
+            dataset_snapshot_ids=candidate.dataset_snapshot_hashes,
+            executor_version=ECONOMIC_ENGINE_VERSION,
+            financial_risk_contract=contract,
+        )
+        for contract in (None, FUTURES_ACCOUNTING_RISK_CONTRACT)
+    ]
+    identities = []
+    for index, receipt in enumerate(receipts):
+        run = {"candidate_id": candidate.candidate_id, "run_name": "screening", "receipt": receipt}
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(experiment_run).values(id=str(index), created_at=NOW, payload=run)
+            )
+        stage_id = repository.append_stage(
+            experiment_id=candidate.candidate_id,
+            stage="screening",
+            source_run_id=str(index),
+            evaluated_at=NOW,
+            accepted=True,
+            reason_code=None,
+            evidence={
+                "evaluation_context": {
+                    "financial_risk_contract": receipt.get("financial_risk_contract")
+                }
+            },
+        )
+        identities.append(evaluation_identity(run))
+        if index == 0:
+            with database.engine.begin() as connection:
+                connection.execute(
+                    insert(evidence_invalidation).values(
+                        id="stage:" + stage_id,
+                        created_at=NOW,
+                        payload={"kind": "validation_stage", "source_id": stage_id},
+                    )
+                )
+    with database.engine.connect() as connection:
+        stored = connection.execute(select(validation_stage.c.evaluation_identity)).scalars().all()
+    assert len(stored) == 2 and set(stored) == set(identities)
+    assert len(set(identities)) == 2
+    assert receipts[0]["input_hash"] != receipts[1]["input_hash"]
+    assert len(repository.stages(candidate.candidate_id)) == 1
+    database.dispose()
+
+
+@pytest.mark.parametrize(
+    "seal_contract,receipt_contract",
+    [(None, None), ("current", None), (None, "current"), ("current", "current")],
+)
+def test_paper_eligibility_requires_contract_inside_sealed_holdout(
+    tmp_path, seal_contract, receipt_contract
+):
+    from test_platform_candidate_lifecycle import _bundle, _candidate
+
+    from src.data.database import experiment_run, holdout_claim, paper_eligibility_event
+    from src.research.accounting import FUTURES_ACCOUNTING_RISK_CONTRACT
+    from src.research.canonical import SqlValidationRepository
+    from src.research.paper_eligibility import publish_paper_eligibility
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'paper-contract.sqlite3'}")
+    database.create_schema()
+    bundle = _bundle(database)
+    candidate = _candidate(database, bundle)
+    contract = FUTURES_ACCOUNTING_RISK_CONTRACT
+    stage_ids = []
+    for stage in ("screening", "development", "robustness", "protected"):
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(experiment_run).values(
+                    id=stage,
+                    created_at=NOW,
+                    payload={
+                        "candidate_id": candidate.candidate_id,
+                        "receipt": {
+                            "executor_version": ECONOMIC_ENGINE_VERSION,
+                            "dataset_snapshot_ids": [stage],
+                            "financial_risk_contract": contract,
+                        },
+                    },
+                )
+            )
+        stage_ids.append(
+            SqlValidationRepository(database.engine).append_stage(
+                experiment_id=candidate.candidate_id,
+                stage=stage,
+                source_run_id=stage,
+                evaluated_at=NOW,
+                accepted=True,
+                reason_code=None,
+                evidence={"evaluation_context": {"financial_risk_contract": contract}},
+            )
+        )
+    sealed = {
+        "financial_risk_contract": contract if seal_contract else None,
+        "execution_receipt": {"financial_risk_contract": contract if receipt_contract else None},
+    }
+    artefact = {
+        "artefact_hash": "paper",
+        "product_id": "active_income",
+        "created_at": LATER,
+        "engine_version": ECONOMIC_ENGINE_VERSION,
+        "strategy_version_id": candidate.definition.strategy_version_id,
+        "dataset_snapshot_hashes": [bundle.stage_snapshot_ids["protected_holdout"]],
+        "metadata": {"promotable": True, "candidate_id": candidate.candidate_id},
+        "authoritative_evidence": {"validation_stage_ids": stage_ids, "holdout_claim_id": "claim"},
+    }
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(holdout_claim).values(
+                id="claim",
+                created_at=NOW,
+                payload={
+                    "strategy_version_id": candidate.definition.strategy_version_id,
+                    "data_snapshot_id": bundle.stage_snapshot_ids["protected_holdout"],
+                },
+            )
+        )
+        connection.execute(
+            insert(holdout_outcome).values(
+                id="outcome",
+                holdout_claim_id="claim",
+                evaluated_at=NOW,
+                accepted=True,
+                outcome_hash=canonical_hash(sealed),
+                payload=sealed,
+            )
+        )
+        if seal_contract and receipt_contract:
+            publish_paper_eligibility(connection, artefact, created_at=LATER)
+            assert connection.execute(select(paper_eligibility_event.c.id)).scalar_one() == "paper"
+        else:
+            with pytest.raises(ValueError, match="financial feasibility"):
+                publish_paper_eligibility(connection, artefact, created_at=LATER)
+            assert connection.execute(select(paper_eligibility_event.c.id)).first() is None
+    database.dispose()

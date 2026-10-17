@@ -57,6 +57,11 @@ def _stage_measurement_identity(
                 "datasets": sorted(datasets),
                 "engine_version": engine,
                 "stage": stage,
+                **(
+                    {"financial_risk_contract": receipt["financial_risk_contract"]}
+                    if receipt.get("financial_risk_contract")
+                    else {}
+                ),
             }
         )
     return {

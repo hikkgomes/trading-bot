@@ -52,7 +52,6 @@ def _build_trading_work(
     from src.services.supervisor import (
         _account_reconciliation_cycle,
         _accounting_cycle,
-        _data_writer_cycle,
         _execution_cycle,
         _feature_cycle,
         _market_gateway_cycle,
@@ -81,12 +80,6 @@ def _build_trading_work(
             configuration=configuration,
             config_root=Path("config"),
             maximum_seconds=15.0,
-        ),
-        "data-writer": lambda: _data_writer_cycle(
-            database=database,
-            node_id=node_id,
-            root=Path(config.paths["parquet"]),
-            configuration=configuration,
         ),
         "feature-service": lambda: _feature_cycle(
             database=database,
@@ -243,9 +236,19 @@ def _build_work(
     node_id: str,
     alerts: Any,
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
+    if process_name == "data-writer":
+        from src.services.data_writer import data_writer_cycle
+
+        return {
+            "data-writer": data_writer_cycle(
+                database=database,
+                node_id=node_id,
+                root=Path(config.paths["parquet"]),
+                configuration=configuration,
+            )
+        }
     if process_name in {
         "market-gateway",
-        "data-writer",
         "trading-runtime",
         "scheduler-operations",
     }:

@@ -8,7 +8,6 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +51,7 @@ from src.services.config import (
     load_split_configuration,
 )
 from src.services.control_api import DatabaseControlPlane, build_control_server
-from src.services.data_writer import DatabaseMarketDataWriter
+from src.services.data_writer import data_writer_cycle
 from src.services.emergency import DatabaseEmergencyFlattenWorker
 from src.services.feature_worker import DatabaseFeatureWorker
 from src.services.financial_followup import FinancialFollowupWorker
@@ -62,7 +61,6 @@ from src.services.forward_observation import (
 )
 from src.services.health import DatabaseHeartbeatStore, publish_external_heartbeat
 from src.services.heavy_compute import HeavyComputeLeaseStore
-from src.services.historical_bootstrap import HistoricalBootstrapService
 from src.services.live_execution import ApprovedLiveExecution
 from src.services.market_gateway import DatabaseMarketGateway, UserStreamAccount
 from src.services.order_execution import (
@@ -724,54 +722,6 @@ def _risk_cycle(
     return lambda: worker.run_once(now=utc_now())
 
 
-def _data_writer_cycle(
-    *,
-    database: PlatformDatabase,
-    node_id: str,
-    root: Path,
-    configuration: Mapping[str, Mapping[str, Any]],
-) -> Callable[[], dict[str, Any]]:
-    queue = DatabaseJobQueue(database.engine)
-    worker_id = f"{node_id}:data-writer"
-    queue.register_worker(
-        worker_id=worker_id,
-        node_id=node_id,
-        role="data-writer",
-        capabilities=(
-            "market_event_write",
-            "market_event_batch_write",
-            "market_data_gap_recovery",
-            "historical_bootstrap",
-        ),
-        observed_at=utc_now(),
-    )
-    products = _by_id(configuration["products"], collection="products", identity="product_id")
-    accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
-    products_by_market: dict[str, list[str]] = {}
-    for product_id, product in products.items():
-        account = accounts[str(product["account_id"])]
-        market = {"spot": "spot", "usdt_futures": "futures"}.get(str(account["market"]))
-        if market is None:
-            raise ValueError(f"unsupported account market for {product_id}")
-        products_by_market.setdefault(market, []).append(product_id)
-    worker = DatabaseMarketDataWriter(
-        queue=queue,
-        worker_id=worker_id,
-        root=root,
-        snapshot_store=SqlRiskSnapshotStore(database.engine),
-        product_ids_by_market=products_by_market,
-        historical_bootstrap_service=HistoricalBootstrapService(
-            engine=database.engine,
-            root=root,
-        ),
-        historical_executor=ThreadPoolExecutor(max_workers=1, thread_name_prefix="history"),
-        clock=utc_now,
-        lease_seconds=300,
-    )
-
-    return worker
-
-
 def _market_gateway_cycle(
     *,
     database: PlatformDatabase,
@@ -1413,6 +1363,7 @@ def _initialise_service(
         node_id=args.node,
         service_name=args.service,
         heartbeat_store=heartbeat_store,
+        heartbeat_interval_seconds=float(config.metrics.get("heartbeat_seconds", 15)),
     )
     return {
         "config": config,
@@ -1475,11 +1426,12 @@ def _service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Calla
             alerts=alerts,
             queued=not args.once,
         ),
-        "data-writer": lambda: _data_writer_cycle(
+        "data-writer": lambda: data_writer_cycle(
             database=database,
             node_id=args.node,
             root=Path(config.paths["parquet"]),
             configuration=split,
+            clock=utc_now,
         ),
         "promotion-engine": lambda: _promotion_cycle(
             database=database, node_id=args.node, configuration=split
