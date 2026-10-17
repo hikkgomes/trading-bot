@@ -126,6 +126,18 @@ def test_all_provider_upgrade_retains_counts_closed_epochs_and_exposure():
         database.migrate()
         database.assert_migrated()
         with database.engine.connect() as connection:
+            queue_options = connection.execute(
+                text(
+                    "SELECT relname, reloptions FROM pg_class "
+                    "WHERE oid IN ('public.job'::regclass, 'public.job_attempt'::regclass)"
+                )
+            ).all()
+            assert {row.relname for row in queue_options} == {"job", "job_attempt"}
+            for row in queue_options:
+                assert set(row.reloptions) >= {
+                    "autovacuum_vacuum_scale_factor=0.02",
+                    "autovacuum_analyze_scale_factor=0.02",
+                }
             epochs = {
                 row["dataset_bundle_id"]: row
                 for row in connection.execute(select(research_epoch)).mappings()

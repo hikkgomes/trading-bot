@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
+import stat
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -79,12 +81,107 @@ REPORT_STREAM_BATCH_SIZE = 1000
 REPORT_BUILD_BUDGET_SECONDS = 120
 REPORT_STATEMENT_TIMEOUT_MILLISECONDS = 20_000
 REPORT_LOCK_TIMEOUT_MILLISECONDS = 5_000
+REPORT_SNAPSHOT_MAX_AGE_SECONDS = 900
+REPORT_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 _DATASET_PLAN_FIELDS = {
     "screening": "screening_snapshot_ids",
     "development": "development_snapshot_ids",
     "robustness": "robustness_snapshot_ids",
     "protected_holdout": "protected_holdout_snapshot_id",
 }
+
+
+def _report_snapshot_result(
+    status: str,
+    *,
+    report: Mapping[str, Any] | None = None,
+    generated_at: str | None = None,
+    age_seconds: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "snapshot_status": status,
+        "available": status in {"fresh", "stale"},
+        "fresh": status == "fresh",
+        "generated_at": generated_at,
+        "age_seconds": age_seconds,
+        "max_age_seconds": REPORT_SNAPSHOT_MAX_AGE_SECONDS,
+        "report": report,
+    }
+
+
+def _read_bounded_report_file(path: Path) -> bytes:
+    if path.parent.is_symlink() or path.is_symlink():
+        raise ValueError("report snapshot path cannot be a symlink")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > REPORT_SNAPSHOT_MAX_BYTES:
+            raise ValueError("report snapshot file is invalid or too large")
+        content = source.read(REPORT_SNAPSHOT_MAX_BYTES + 1)
+    if len(content) > REPORT_SNAPSHOT_MAX_BYTES:
+        raise ValueError("report snapshot file is too large")
+    return content
+
+
+def _valid_report_snapshot(report: Any) -> bool:
+    return (
+        isinstance(report, Mapping)
+        and report.get("schema") == "platform.operator_report/v1"
+        and all(
+            isinstance(report.get(section), Mapping)
+            for section in ("trading", "research", "products", "operations")
+        )
+    )
+
+
+def _reject_nonfinite_json(token: str) -> None:
+    raise ValueError(f"report snapshot contains non-finite JSON number: {token}")
+
+
+def read_persisted_platform_report(
+    root: Path | None, *, now: str | dt.datetime | None = None
+) -> dict[str, Any]:
+    """Read the bounded operator-report snapshot without querying the report tables."""
+    if root is None:
+        return _report_snapshot_result("missing")
+    report_root = Path(root)
+    if report_root.is_symlink():
+        return _report_snapshot_result("invalid")
+    try:
+        content = _read_bounded_report_file(report_root / "latest.json")
+    except FileNotFoundError:
+        return _report_snapshot_result("missing")
+    except (OSError, ValueError):
+        return _report_snapshot_result("invalid")
+    try:
+        report = json.loads(content.decode("utf-8"), parse_constant=_reject_nonfinite_json)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return _report_snapshot_result("invalid")
+    if not _valid_report_snapshot(report):
+        return _report_snapshot_result("invalid")
+    try:
+        generated_at = timestamp(report.get("generated_at"), field="generated_at")
+        current_at = timestamp(now or dt.datetime.now(dt.UTC), field="now")
+    except (TypeError, ValueError):
+        return _report_snapshot_result("invalid")
+    age_seconds = (
+        dt.datetime.fromisoformat(current_at) - dt.datetime.fromisoformat(generated_at)
+    ).total_seconds()
+    if age_seconds < 0:
+        return _report_snapshot_result("invalid")
+    status = "fresh" if age_seconds <= REPORT_SNAPSHOT_MAX_AGE_SECONDS else "stale"
+    return _report_snapshot_result(
+        status,
+        report=report,
+        generated_at=generated_at,
+        age_seconds=age_seconds,
+    )
 
 
 def _chunks(values: list[Any], size: int):

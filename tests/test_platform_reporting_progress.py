@@ -1046,3 +1046,219 @@ def test_report_storage_inventory_is_bounded_and_metrics_name_its_scope(tmp_path
     assert (
         'platform_storage_spool_inventory_truncated{scope="bounded_inventory_sample"} 1' in rendered
     )
+
+
+def test_control_cli_status_uses_the_report_worker_root(tmp_path, monkeypatch, capsys) -> None:
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from src.observability.reports import DatabasePlatformReport
+    from src.services import control_cli
+    from src.services.runtime import utc_now
+
+    database_path = tmp_path / "control-cli.sqlite3"
+    database_url = f"sqlite+pysqlite:///{database_path}"
+    database = PlatformDatabase(database_url)
+    database.create_schema()
+    data_root = tmp_path / "data"
+    parquet_path = data_root / "parquet"
+    report_root = data_root / "runtime" / "reports"
+    assert (
+        DatabaseReportWorker(engine=database.engine, root=report_root).run_once(now=utc_now())[
+            "reason_code"
+        ]
+        == "operator_report_written"
+    )
+    database.dispose()
+    config = SimpleNamespace(
+        paths={"parquet": str(parquet_path)},
+        database_url=lambda: database_url,
+    )
+    monkeypatch.setattr(control_cli, "load_platform_config", lambda _path: config)
+    monkeypatch.setattr(control_cli, "load_split_configuration", lambda _root: {})
+    build = Mock(side_effect=AssertionError("CLI status must read the published report"))
+    monkeypatch.setattr(DatabasePlatformReport, "build", build)
+
+    assert (
+        control_cli.run(
+            SimpleNamespace(config=tmp_path / "config" / "platform.json", command="status")
+        )
+        == 0
+    )
+    response = json.loads(capsys.readouterr().out)
+    assert response["report_snapshot"]["snapshot_status"] == "fresh"
+    assert response["schema"] == "platform.control_status/v1"
+    build.assert_not_called()
+
+
+def test_persisted_report_reader_rejects_bad_and_oversized_snapshots(tmp_path, monkeypatch) -> None:
+    import json
+    import os
+    import threading
+
+    from src.observability import reports
+
+    root = tmp_path / "runtime" / "reports"
+    root.mkdir(parents=True)
+    latest = root / "latest.json"
+    valid = {
+        "schema": "platform.operator_report/v1",
+        "generated_at": NOW,
+        "trading": {},
+        "research": {},
+        "products": {},
+        "operations": {},
+    }
+    valid_json = json.dumps(valid)
+    latest.write_text(valid_json)
+    fresh = reports.read_persisted_platform_report(root, now=NOW)
+    assert fresh["snapshot_status"] == "fresh"
+    assert fresh["fresh"] is True
+    assert fresh["age_seconds"] == 0
+    stale = reports.read_persisted_platform_report(root, now="2026-08-31T10:15:01+00:00")
+    assert stale["snapshot_status"] == "stale"
+    assert stale["fresh"] is False
+    assert stale["age_seconds"] == 901
+
+    latest.write_text("not json")
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    latest.write_text(json.dumps({**valid, "schema": "unexpected"}))
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    latest.write_text(json.dumps({**valid, "generated_at": "invalid"}))
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    for nonfinite in ("NaN", "Infinity", "-Infinity"):
+        latest.write_text(
+            valid_json.replace('"trading": {}', f'"trading": {{"value": {nonfinite}}}')
+        )
+        assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    latest.write_text(
+        valid_json.replace('"trading": {}', '"trading": ' + "[" * 2_000 + "0" + "]" * 2_000)
+    )
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    latest.write_text(
+        valid_json.replace('"trading": {}', '"trading": {"value": ' + "9" * 5_000 + "}")
+    )
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+
+    latest.unlink()
+    latest.symlink_to(tmp_path / "missing-target.json")
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    latest.unlink()
+    os.mkfifo(latest)
+    fifo_result = []
+    fifo_reader = threading.Thread(
+        target=lambda: fifo_result.append(reports.read_persisted_platform_report(root, now=NOW)),
+        daemon=True,
+    )
+    fifo_reader.start()
+    fifo_reader.join(timeout=1)
+    assert not fifo_reader.is_alive()
+    assert fifo_result[0]["snapshot_status"] == "invalid"
+    latest.unlink()
+    monkeypatch.setattr(reports, "REPORT_SNAPSHOT_MAX_BYTES", 128)
+    latest.write_bytes(b" " * 129)
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "invalid"
+    latest.unlink()
+    assert reports.read_persisted_platform_report(root, now=NOW)["snapshot_status"] == "missing"
+
+
+def test_control_and_metrics_read_published_report_without_rebuilding(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+    from unittest.mock import Mock
+
+    from src.observability.metrics import DatabaseMetricsProvider
+    from src.observability.reports import (
+        DatabasePlatformReport,
+        read_persisted_platform_report,
+    )
+    from src.services.control_api import DatabaseControlPlane
+    from src.services.health import DatabaseHeartbeatStore
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'persisted-report.sqlite3'}")
+    database.create_schema()
+    report_root = tmp_path / "runtime" / "reports"
+    assert (
+        DatabaseReportWorker(engine=database.engine, root=report_root).run_once(now=NOW)[
+            "reason_code"
+        ]
+        == "operator_report_written"
+    )
+    heartbeat_store = DatabaseHeartbeatStore(database.engine)
+    heartbeat_store.record(
+        service_name="control-api",
+        node_id="fixture",
+        observed_at=NOW,
+        healthy=True,
+        payload={"reason_code": "serving"},
+    )
+    control = DatabaseControlPlane(database.engine, heartbeat_store, report_root=report_root)
+    control.set_paused(
+        target="active_income",
+        paused=True,
+        reason_code="operator_review",
+        requested_by="fixture",
+        changed_at=NOW,
+    )
+    build = Mock(side_effect=AssertionError("status and metrics must use the published report"))
+    monkeypatch.setattr(DatabasePlatformReport, "build", build)
+
+    status = control.status(now=NOW)
+    assert status["report_snapshot"]["snapshot_status"] == "fresh"
+    assert status["controls"][0]["target"] == "active_income"
+    assert status["operations"]["heartbeats"] == [
+        {
+            "service_name": "control-api",
+            "node_id": "fixture",
+            "observed_at": NOW,
+            "healthy": True,
+            "payload": {"reason_code": "serving"},
+        }
+    ]
+    response = control.report(now=NOW)
+    assert response["report_snapshot"]["fresh"] is True
+    assert response["report"]["schema"] == "platform.operator_report/v1"
+    stale_status = control.status(now="2026-08-31T10:15:01+00:00")
+    assert stale_status["report_snapshot"]["snapshot_status"] == "stale"
+    assert stale_status["report_snapshot"]["fresh"] is False
+    assert (
+        control.report(now="2026-08-31T10:15:01+00:00")["report_snapshot"]["snapshot_status"]
+        == "stale"
+    )
+    missing_control = DatabaseControlPlane(database.engine, heartbeat_store)
+    assert missing_control.report(now=NOW)["report"] is None
+    assert missing_control.status(now=NOW)["report_snapshot"]["snapshot_status"] == "missing"
+
+    fresh_metrics = DatabaseMetricsProvider(
+        lambda: read_persisted_platform_report(report_root, now=NOW)
+    ).render()
+    assert "platform_report_available 1" in fresh_metrics
+    assert "platform_report_fresh 1" in fresh_metrics
+    assert "platform_report_age_seconds 0" in fresh_metrics
+    malformed_report = dict(response["report"])
+    malformed_report["research"] = {"funnel": []}
+    (report_root / "latest.json").write_text(json.dumps(malformed_report))
+    malformed_metrics = DatabaseMetricsProvider(
+        lambda: read_persisted_platform_report(report_root, now=NOW)
+    ).render()
+    assert "platform_report_available 0" in malformed_metrics
+    assert "platform_report_fresh 0" in malformed_metrics
+    assert 'platform_report_snapshot_status{status="invalid"} 1' in malformed_metrics
+    assert "platform_candidates_generated" not in malformed_metrics
+    (report_root / "latest.json").write_text(json.dumps(response["report"]))
+    stale_metrics = DatabaseMetricsProvider(
+        lambda: read_persisted_platform_report(report_root, now="2026-08-31T10:15:01+00:00")
+    ).render()
+    assert "platform_report_available 1" in stale_metrics
+    assert "platform_report_fresh 0" in stale_metrics
+    assert "platform_report_age_seconds 901" in stale_metrics
+    missing_metrics = DatabaseMetricsProvider(
+        lambda: read_persisted_platform_report(None, now=NOW)
+    ).render()
+    assert "platform_report_available 0" in missing_metrics
+    assert "platform_report_fresh 0" in missing_metrics
+    assert 'platform_report_snapshot_status{status="missing"} 1' in missing_metrics
+    build.assert_not_called()
+    database.dispose()

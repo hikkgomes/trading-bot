@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import insert, select
@@ -17,7 +18,7 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import control_event
 from src.domain._codec import json_value, non_empty, timestamp, to_primitive
-from src.observability.reports import DatabasePlatformReport
+from src.observability.reports import read_persisted_platform_report
 from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.health import DatabaseHeartbeatStore
 from src.services.scheduler import DatabaseJobQueue
@@ -51,11 +52,13 @@ class DatabaseControlPlane:
         *,
         configuration: dict[str, dict[str, Any]] | None = None,
         alerts: SqlAlertService | None = None,
+        report_root: Path | None = None,
     ):
         self.engine = engine
         self.heartbeat_store = heartbeat_store
         self.configuration = json_value(configuration or {}, field="control configuration")
         self.alerts = alerts
+        self.report_root = Path(report_root) if report_root is not None else None
 
     def set_paused(
         self,
@@ -268,12 +271,28 @@ class DatabaseControlPlane:
             return False
         return self.is_paused(service) or self.is_paused(f"service:{service}")
 
-    def status(self) -> dict[str, Any]:
-        report = DatabasePlatformReport(self.engine).build()
+    def status(self, *, now: str | None = None) -> dict[str, Any]:
+        snapshot = read_persisted_platform_report(self.report_root, now=now)
+        report = snapshot.get("report")
+        response = dict(report) if isinstance(report, Mapping) else {}
+        operations = response.get("operations")
+        operations = dict(operations) if isinstance(operations, Mapping) else {}
+        operations["heartbeats"] = [
+            {
+                "service_name": heartbeat.service_name,
+                "node_id": heartbeat.node_id,
+                "observed_at": heartbeat.observed_at,
+                "healthy": heartbeat.healthy,
+                "payload": dict(heartbeat.payload),
+            }
+            for heartbeat in self.heartbeat_store.latest()
+        ]
+        response["operations"] = operations
         return {
-            **report,
+            **response,
             "schema": "platform.control_status/v1",
             "controls": [state.__dict__ for state in self.states()],
+            "report_snapshot": {key: value for key, value in snapshot.items() if key != "report"},
         }
 
     def configuration_view(self) -> dict[str, Any]:
@@ -282,10 +301,12 @@ class DatabaseControlPlane:
             "configuration": _redact_configuration(self.configuration),
         }
 
-    def report(self) -> dict[str, Any]:
+    def report(self, *, now: str | None = None) -> dict[str, Any]:
+        snapshot = read_persisted_platform_report(self.report_root, now=now)
         return {
             "schema": "platform.report/v1",
-            "report": DatabasePlatformReport(self.engine).build(),
+            "report": snapshot.get("report"),
+            "report_snapshot": {key: value for key, value in snapshot.items() if key != "report"},
         }
 
     def agent_reviews(self) -> dict[str, Any]:

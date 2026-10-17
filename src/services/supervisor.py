@@ -32,7 +32,7 @@ from src.execution.recovery import SqlRecoveryStore
 from src.execution.stops import SqlStopStore, StopManager
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.observability.metrics import DatabaseMetricsProvider, build_metrics_server
-from src.observability.reports import DatabasePlatformReport
+from src.observability.reports import read_persisted_platform_report
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
@@ -111,6 +111,10 @@ def _parse_bind(value: str) -> tuple[str, int]:
     if not 1 <= port <= 65_535:
         raise ValueError("control API port must be in [1, 65535]")
     return host, port
+
+
+def _operator_report_root(config: Any) -> Path:
+    return Path(config.paths["parquet"]).parent / "runtime" / "reports"
 
 
 def _idle_cycle(service_name: str) -> dict[str, Any]:
@@ -1011,7 +1015,7 @@ def _report_cycle(
         )
     worker = DatabaseReportWorker(
         engine=database.engine,
-        root=Path(config.paths["parquet"]).parent / "runtime" / "reports",
+        root=_operator_report_root(config),
         queue=queue,
         worker_id=worker_id,
         alerts=alerts,
@@ -1402,6 +1406,7 @@ def _initialise_service(
         heartbeat_store,
         configuration={str(key): dict(value) for key, value in split.items()},
         alerts=alerts,
+        report_root=_operator_report_root(config),
     )
     runtime = ServiceRuntime(
         config=config,
@@ -1574,17 +1579,14 @@ def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> 
             context["heartbeat_store"],
             configuration=context["split"],
             alerts=context["alerts"],
+            report_root=_operator_report_root(config),
         ),
         bearer_token=bearer_token,
         agent_transport_key=bytes.fromhex(agent_key) if agent_key else None,
         node_id=args.node,
     )
-    metrics_provider = DatabaseMetricsProvider(
-        lambda: DatabasePlatformReport(
-            database.engine,
-            storage_root=Path(config.paths["parquet"]),
-        ).build()
-    )
+    report_root = _operator_report_root(config)
+    metrics_provider = DatabaseMetricsProvider(lambda: read_persisted_platform_report(report_root))
     try:
         metrics_server = build_metrics_server(
             bind=_parse_bind(str(config.metrics.get("bind", "127.0.0.1:9108"))),

@@ -67,12 +67,43 @@ class DatabaseMetricsProvider:
     def render(self) -> str:
         registry = MetricsRegistry()
         try:
-            report = self.report_builder()
-            self._record_report(registry, report)
+            result = self.report_builder()
+            if "snapshot_status" in result:
+                status = str(result.get("snapshot_status") or "invalid")
+                report = result.get("report")
+                available = (
+                    status in {"fresh", "stale"}
+                    and result.get("available") is True
+                    and isinstance(report, Mapping)
+                )
+                fresh = available and result.get("fresh") is True and status == "fresh"
+                age = result.get("age_seconds")
+                age_seconds = (
+                    float(age)
+                    if isinstance(age, int | float)
+                    and not isinstance(age, bool)
+                    and math.isfinite(float(age))
+                    else -1.0
+                )
+            else:
+                status = "unverified"
+                report = result
+                available = isinstance(report, Mapping)
+                fresh = False
+                age_seconds = -1.0
+            if available and isinstance(report, Mapping):
+                self._record_report(registry, report)
         except Exception:
-            registry.set_gauge("platform_report_available", 0.0)
-        else:
-            registry.set_gauge("platform_report_available", 1.0)
+            registry = MetricsRegistry()
+            status = "invalid"
+            report = None
+            available = False
+            fresh = False
+            age_seconds = -1.0
+        registry.set_gauge("platform_report_available", float(available))
+        registry.set_gauge("platform_report_fresh", float(fresh))
+        registry.set_gauge("platform_report_age_seconds", age_seconds)
+        registry.set_gauge("platform_report_snapshot_status", 1.0, status=status)
         return registry.render()
 
     @staticmethod

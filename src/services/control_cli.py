@@ -22,6 +22,7 @@ def run(args: argparse.Namespace) -> int:
             database.engine,
             DatabaseHeartbeatStore(database.engine),
             configuration=configuration,
+            report_root=Path(config.paths["parquet"]).parent / "runtime" / "reports",
         )
         result = _execute(control, args)
         print(json.dumps(result, sort_keys=True, default=str))
