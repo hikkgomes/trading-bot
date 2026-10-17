@@ -199,12 +199,16 @@ def test_resource_wait_survives_restart_without_spending_retry(tmp_path):
     claimed = queue.claim(worker_id="research", now=NOW, lease_seconds=10)
     assert claimed is not None
     queue.defer(claimed, available_at=LATER, reason="heavy_compute_slot_unavailable")
+    deferred_claim = claimed
     database.dispose()
 
     database = PlatformDatabase(url)
     queue = DatabaseJobQueue(database.engine)
     claimed = queue.claim(worker_id="research", now=LATER, lease_seconds=10)
     assert claimed is not None and claimed.attempt == 1
+    assert claimed.lease_token != deferred_claim.lease_token
+    with pytest.raises(ValueError, match="no longer owns"):
+        queue.complete(deferred_claim, completed_at=LATER)
     queue.complete(claimed, completed_at=LATER)
     with database.engine.connect() as connection:
         statuses = connection.execute(select(job_attempt.c.status)).scalars().all()

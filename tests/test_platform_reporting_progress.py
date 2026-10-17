@@ -1,22 +1,42 @@
 from __future__ import annotations
 
-from sqlalchemy import insert
+import datetime as dt
+from decimal import Decimal
 
+import pytest
+from sqlalchemy import insert, select
+
+from src.accounting.ledger import LedgerEntry
 from src.data.database import (
     PlatformDatabase,
     account_snapshot,
+    accounting_entry,
+    alert,
+    alpha_forecast,
+    decision_trace,
+    experiment,
+    experiment_run,
+    holdout_claim,
+    holdout_outcome,
     instrument,
     job,
     job_attempt,
+    nav_snapshot,
     platform_schedule,
     promotion_event,
     reconciliation_event,
     risk_snapshot,
+    strategy_definition,
+    strategy_version,
     universe,
     universe_member,
     universe_snapshot,
+    validation_stage,
 )
+from src.domain._codec import canonical_hash
+from src.observability.decision_trace import DecisionTrace, DecisionTraceStage
 from src.observability.reports import DatabasePlatformReport
+from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.services.alerting import SqlAlertService
 from src.services.report_worker import DatabaseReportWorker
 from src.services.scheduler import DatabaseJobQueue
@@ -56,6 +76,362 @@ def test_report_counts_real_queue_states_and_terminal_attempts(tmp_path) -> None
     assert funnel["jobs_dead_letter"] == 1
     assert funnel["jobs_failed_attempts"] == 1
     assert funnel["jobs_terminal_failures"][0]["job_id"] == "poison"
+    database.dispose()
+
+
+def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'bounded-report.sqlite3'}")
+    database.create_schema()
+    count = 1001
+    start = dt.datetime.fromisoformat(NOW)
+    observed_at = [(start + dt.timedelta(seconds=index)).isoformat() for index in range(count)]
+    experiments = []
+    runs = []
+    stages = []
+    forecasts = []
+    claims = []
+    outcomes = []
+    alerts = []
+    active_income_entries = []
+    btc_entries = []
+    navs = []
+    traces = []
+    previous_hash = "0" * 64
+    fee = Decimal("0.000000001")
+    for index, timestamp in enumerate(observed_at):
+        candidate_id = f"candidate-{index:04d}"
+        run_id = f"run-{index:04d}"
+        experiments.append(
+            {
+                "id": candidate_id,
+                "strategy_version_id": "report-version",
+                "provider": "fixture",
+                "state": "screening",
+                "submitted_at": timestamp,
+                "dataset_snapshot_hashes": [],
+                "dataset_bundle_id": None,
+                "metadata": {},
+            }
+        )
+        runs.append({"id": run_id, "created_at": timestamp, "payload": {}})
+        stages.append(
+            {
+                "id": f"stage-{index:04d}",
+                "experiment_id": candidate_id,
+                "stage": "screening",
+                "source_run_id": run_id,
+                "evaluated_at": timestamp,
+                "state": "accepted",
+                "accepted": True,
+                "reason_code": None,
+                "evidence_hash": f"sha256:{index:064x}",
+                "evaluation_identity": None,
+                "engine_version": ECONOMIC_ENGINE_VERSION,
+                "outcome_category": "accepted",
+                "payload": {
+                    "signal_frequency": 0.001,
+                    "candidate_correlation": 0.25,
+                },
+            }
+        )
+        trace = DecisionTrace.start(
+            event_id=f"blocked-{index:04d}",
+            instrument_id="BTCUSDT",
+            evaluated_at=timestamp,
+        ).block(DecisionTraceStage.DATA_AVAILABLE, reason_code="market_data_stale")
+        trace_payload = trace.to_dict()
+        traces.append(
+            {
+                "id": canonical_hash(trace_payload),
+                "event_id": trace.event_id,
+                "instrument_id": trace.instrument_id,
+                "evaluated_at": trace.evaluated_at,
+                "first_blocked_stage": trace.first_blocked_stage,
+                "payload": trace_payload,
+            }
+        )
+        forecasts.append(
+            {"id": f"forecast-{index:04d}", "created_at": timestamp, "payload": {"index": index}}
+        )
+        claim_id = f"claim-{index:04d}"
+        claims.append({"id": claim_id, "created_at": timestamp, "payload": {"index": index}})
+        outcomes.append(
+            {
+                "id": f"holdout-{index:04d}",
+                "holdout_claim_id": claim_id,
+                "evaluated_at": timestamp,
+                "accepted": True,
+                "outcome_hash": f"holdout-hash-{index:04d}",
+                "payload": {"index": index},
+            }
+        )
+        alerts.append(
+            {
+                "id": f"alert-{index:04d}",
+                "created_at": timestamp,
+                "payload": {"event_type": "notice"},
+            }
+        )
+        active_income_entries.append(
+            {
+                "id": f"active-entry-{index:04d}",
+                "product_id": "active_income",
+                "sequence": index,
+                "created_at": timestamp,
+                "entry_hash": f"active-hash-{index:04d}",
+                "payload": {
+                    "product_id": "active_income",
+                    "metadata": {"kind": "realised_pnl", "pnl_effect": "-0.000000001"},
+                },
+            }
+        )
+        btc_postings = (
+            {"assets:btc": Decimal("1"), "equity:capital": Decimal("-1")}
+            if index == 0
+            else {"expense:fees": fee, "assets:btc": -fee}
+        )
+        btc_metadata = (
+            {"kind": "capital", "pnl_effect": "0"}
+            if index == 0
+            else {"kind": "fee", "pnl_effect": str(-fee)}
+        )
+        entry = LedgerEntry(
+            entry_id=f"btc-entry-{index:04d}",
+            product_id="btc_accumulation",
+            accounting_asset="BTC",
+            occurred_at=timestamp,
+            postings=btc_postings,
+            metadata=btc_metadata,
+            previous_hash=previous_hash,
+        )
+        previous_hash = entry.entry_hash
+        btc_entries.append(
+            {
+                "id": entry.entry_id,
+                "product_id": entry.product_id,
+                "sequence": index,
+                "created_at": timestamp,
+                "entry_hash": entry.entry_hash,
+                "payload": entry.to_dict(),
+            }
+        )
+        navs.append(
+            {
+                "id": f"nav-{index:04d}",
+                "created_at": timestamp,
+                "payload": {
+                    "product_id": "btc_accumulation",
+                    "accounting_asset": "BTC",
+                    "nav": 1.0 if index == 0 else 0.9,
+                    "observed_at": timestamp,
+                    "components": {
+                        "btc_balance": 0.8,
+                        "stablecoin_balance": 20_000,
+                        "stablecoin_per_btc": 100_000 + index,
+                        "regime": "trend",
+                    },
+                    "passive_benchmark_nav": 1.0,
+                },
+            }
+        )
+
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(strategy_definition).values(
+                id="report-definition",
+                identity="report-definition",
+                product_id="active_income",
+                source_type="fixture",
+                source_hash="report-source",
+                definition={},
+            )
+        )
+        connection.execute(
+            insert(strategy_version).values(
+                id="report-version",
+                definition_id="report-definition",
+                version="1",
+                created_at=NOW,
+                payload={},
+            )
+        )
+        connection.execute(insert(experiment), experiments)
+        connection.execute(insert(experiment_run), runs)
+        connection.execute(insert(validation_stage), stages)
+        connection.execute(insert(decision_trace), traces)
+        connection.execute(insert(alpha_forecast), forecasts)
+        connection.execute(insert(holdout_claim), claims)
+        connection.execute(insert(holdout_outcome), outcomes)
+        connection.execute(insert(alert), alerts)
+        connection.execute(insert(accounting_entry), active_income_entries)
+        connection.execute(insert(accounting_entry), btc_entries)
+        connection.execute(insert(nav_snapshot), navs)
+
+    report = DatabasePlatformReport(database.engine).build(now=observed_at[-1])
+    research = report["research"]
+    funnel = research["funnel"]
+    active_income = report["products"]["active_income"]
+    btc = report["products"]["btc_accumulation"]
+
+    assert len(report["trading"]["alpha_forecasts"]) == 1000
+    assert report["trading"]["detail_counts"]["alpha_forecasts"] == count
+    assert len(research["candidate_queue"]) == 1000
+    assert research["detail_counts"]["candidate_queue"] == count
+    assert len(research["validation_stages"]) == 1000
+    assert research["detail_counts"]["validation_stages"] == count
+    assert len(research["holdout_outcomes"]) == 1000
+    assert research["detail_counts"]["holdout_outcomes"] == count
+    assert funnel["candidates_generated"] == count
+    assert funnel["candidates_evaluated"] == count
+    assert funnel["candidates_compiled"] == count
+    assert funnel["candidate_age_by_state"]["screening"]["count"] == count
+    assert funnel["signal_frequency_count"] == count
+    assert len(funnel["signal_frequency_distribution"]) == 1000
+    assert funnel["candidate_correlation_count"] == count
+    assert funnel["protected_holdout_count"] == count
+    assert len(report["operations"]["alerts"]) == 1000
+    assert report["operations"]["detail_counts"]["alerts"] == count
+    assert report["operations"]["decision_funnel_blocked"] == {
+        "data_available:market_data_stale": count
+    }
+    assert active_income["accounting_entry_count"] == count
+    assert active_income["realised_pnl"] == pytest.approx(-0.000001001)
+    assert btc["nav_snapshot_count"] == count
+    assert btc["accounting_entry_count"] == count
+    assert btc["btc_performance"]["btc_nav"] == pytest.approx(0.9)
+    assert btc["btc_performance"]["btc_drawdown_fraction"] == pytest.approx(0.1)
+    assert btc["btc_performance"]["fees_paid_btc"] == "0.000001000"
+    database.dispose()
+
+
+def test_queued_report_failure_is_recorded_and_retried_after_delay(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'report-failure.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="reporter",
+        node_id="node",
+        role="report-worker",
+        capabilities=("reporting",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="report-failure",
+        name="reporting",
+        payload={},
+        available_at=NOW,
+        max_attempts=2,
+    )
+    worker = DatabaseReportWorker(
+        engine=database.engine,
+        root=tmp_path / "reports",
+        queue=queue,
+        worker_id="reporter",
+    )
+
+    def fail_build(**_kwargs):
+        raise RuntimeError("database temporarily unavailable")
+
+    worker.report.build = fail_build
+    result = worker.run_once(now=NOW)
+    with database.engine.connect() as connection:
+        saved_job = connection.execute(
+            select(job.c.state, job.c.available_at, job.c.attempts).where(
+                job.c.id == "report-failure"
+            )
+        ).one()
+        saved_attempt = connection.execute(
+            select(job_attempt.c.status, job_attempt.c.completed_at, job_attempt.c.error).where(
+                job_attempt.c.job_id == "report-failure"
+            )
+        ).one()
+
+    completed_at = dt.datetime.fromisoformat(result["completed_at"])
+    available_at = dt.datetime.fromisoformat(saved_job.available_at)
+    assert result["reason_code"] == "operator_report_failed"
+    assert saved_attempt.status == "failed"
+    assert "RuntimeError" in saved_attempt.error
+    assert saved_attempt.completed_at == result["completed_at"]
+    assert saved_job.state == "pending"
+    assert saved_job.attempts == 1
+    assert (available_at - completed_at).total_seconds() == 300
+    assert completed_at > dt.datetime.fromisoformat(NOW)
+    database.dispose()
+
+
+def test_report_build_deadline_cancels_and_resets_connection_scope(tmp_path, monkeypatch) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'report-deadline.sqlite3'}")
+    database.create_schema()
+    report = DatabasePlatformReport(database.engine)
+    monkeypatch.setattr("src.observability.reports.REPORT_BUILD_BUDGET_SECONDS", -1)
+
+    with pytest.raises(TimeoutError, match="120-second build budget"):
+        report.build(now=NOW)
+
+    monkeypatch.setattr("src.observability.reports.REPORT_BUILD_BUDGET_SECONDS", 120)
+    assert report.build(now=NOW)["schema"] == "platform.operator_report/v1"
+    database.dispose()
+
+
+def test_queued_report_renews_lease_and_stops_before_publish_when_lost(
+    tmp_path, monkeypatch
+) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'report-lease.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="reporter",
+        node_id="node",
+        role="report-worker",
+        capabilities=("reporting",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="report-renewal",
+        name="reporting",
+        payload={},
+        available_at=NOW,
+    )
+    worker = DatabaseReportWorker(
+        engine=database.engine,
+        root=tmp_path / "reports",
+        queue=queue,
+        worker_id="reporter",
+    )
+    heartbeat = queue.heartbeat
+    heartbeat_times = []
+
+    def count_heartbeats(claimed, **kwargs):
+        heartbeat_times.append(kwargs["now"])
+        return heartbeat(claimed, **kwargs)
+
+    monkeypatch.setattr(queue, "heartbeat", count_heartbeats)
+    completed = worker.run_once(now=NOW)
+    assert completed["reason_code"] == "operator_report_written"
+    assert len(heartbeat_times) > 1
+
+    queue.enqueue(
+        job_id="report-lost-lease",
+        name="reporting",
+        payload={},
+        available_at=NOW,
+    )
+    lost_worker = DatabaseReportWorker(
+        engine=database.engine,
+        root=tmp_path / "lost-reports",
+        queue=queue,
+        worker_id="reporter",
+    )
+
+    def reject_heartbeat(_claimed, **_kwargs):
+        raise RuntimeError("report lease was lost")
+
+    monkeypatch.setattr(queue, "heartbeat", reject_heartbeat)
+    cancelled = lost_worker.run_once(now=NOW)
+
+    assert cancelled["reason_code"] == "operator_report_failed"
+    assert cancelled["error_type"] == "RuntimeError"
+    assert not (tmp_path / "lost-reports" / "latest.json").exists()
     database.dispose()
 
 

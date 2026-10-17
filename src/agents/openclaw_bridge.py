@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
-
-from sqlalchemy import select
+from typing import TYPE_CHECKING, Any
 
 from src.agents.context import AgentContext
 from src.agents.proposals import AgentAction, AgentProposal, AgentRole
-from src.agents.store import SqlAgentStore
 from src.agents.thesis import AgentThesisError, parse_openclaw_thesis
 from src.agents.transport import verify_review_response
-from src.data.database import agent_review
 from src.domain._codec import canonical_hash, timestamp
-from src.services.scheduler import DatabaseJobQueue
+
+if TYPE_CHECKING:
+    from src.agents.store import SqlAgentStore
+    from src.services.scheduler import DatabaseJobQueue
 
 CODE_ACTIONS = frozenset(
     {
@@ -111,6 +110,10 @@ class OpenClawAgentBridge:
 
     def review_request(self, review_id: str) -> dict[str, Any]:
         """Read one durable scheduled review request for the external agent."""
+
+        from sqlalchemy import select
+
+        from src.data.database import agent_review
 
         with self.queue.engine.connect() as connection:
             rows = (

@@ -323,12 +323,31 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tm
                 name="bounded_backtest",
                 payload={"fixture": True},
                 available_at=NOW,
+                max_attempts=1,
             )
             assert not public_queue.enqueue_if_absent(
                 job_id="public-work",
                 name="bounded_backtest",
                 payload={"fixture": True},
                 available_at=NOW,
+                max_attempts=1,
+            )
+            claimed = public_queue.claim(
+                worker_id="research", now=NOW, lease_seconds=60, names=("bounded_backtest",)
+            )
+            assert claimed is not None
+            public_queue.fail(claimed, completed_at=NOW, error="temporary", retry_at=NOW)
+            with pytest.raises(DBAPIError, match="permission denied"):
+                public_queue.requeue("public-work", available_at=NOW, reason="repaired")
+            assert DatabaseJobQueue(database.engine).requeue(
+                "public-work", available_at=NOW, reason="repaired"
+            )
+            assert not public_queue.enqueue_if_absent(
+                job_id="public-work",
+                name="bounded_backtest",
+                payload={"fixture": True},
+                available_at=NOW,
+                max_attempts=1,
             )
             claimed = public_queue.claim(
                 worker_id="research", now=NOW, lease_seconds=60, names=("bounded_backtest",)
@@ -467,7 +486,7 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tm
     os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
     reason="requires PostgreSQL role fixture",
 )
-def test_every_platform_role_has_only_its_declared_authority() -> None:
+def test_every_platform_role_has_only_its_declared_authority(tmp_path) -> None:
     run_id = uuid.uuid4().hex
     research_job_id = f"role-test-research-job-{run_id}"
     agent_proposal_id = f"role-test-agent-proposal-{run_id}"
@@ -581,6 +600,52 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
             )
         cleanup.dispose()
     _as_role("trading_research", "SELECT id FROM instrument LIMIT 1")
+    public_funding = {
+        "kind": "historical_funding",
+        "source": "binance_public_funding_rate",
+        "product_id": run_id,
+        "instrument_id": "binance:futures:BTCUSDT:USDT",
+        "symbol": "BTCUSDT",
+        "funding_time": observed_at,
+        "funding_rate": 0.001,
+        "mark_price": 100,
+        "account_id": "must-not-leak",
+    }
+    for suffix, payload in (
+        ("public", public_funding),
+        ("private", {**public_funding, "kind": "funding", "amount": "-10"}),
+    ):
+        _as_role(
+            "trading_runtime",
+            "INSERT INTO funding_entry(id,created_at,payload) "
+            "VALUES (:id,:created,CAST(:payload AS jsonb))",
+            {"id": f"{run_id}-{suffix}", "created": observed_at, "payload": json.dumps(payload)},
+        )
+    from src.research.dataset_service import DatabaseDatasetBundleService
+
+    for role in ("trading_research", "trading_evaluator"):
+        rows = _as_role(
+            role,
+            "SELECT payload FROM public_funding_history WHERE payload->>'product_id'=:id",
+            {"id": run_id},
+        )
+        assert len(rows) == 1 and "account_id" not in rows[0][0]
+        with pytest.raises(DBAPIError):
+            _as_role(role, "SELECT payload FROM funding_entry LIMIT 1")
+        with pytest.raises(DBAPIError):
+            _as_role(role, "UPDATE public_funding_history SET payload='{}'::jsonb")
+        research_engine = create_engine(
+            os.environ["TRADING_PLATFORM_DATABASE_URL"],
+            connect_args={"options": f"-c role={role}"},
+        )
+        try:
+            events = DatabaseDatasetBundleService(research_engine, tmp_path)._funding_events(
+                run_id, observed_at
+            )
+            settlements = list(events[public_funding["instrument_id"]].values())
+            assert len(settlements) == 1 and settlements[0]["funding_rate"] == 0.001
+        finally:
+            research_engine.dispose()
     with pytest.raises(DBAPIError):
         _as_role("trading_research", "SELECT id FROM balance_snapshot LIMIT 1")
     with pytest.raises(DBAPIError):

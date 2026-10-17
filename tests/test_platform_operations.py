@@ -331,7 +331,14 @@ else:
     assert result.returncode != 0
     if scenario == "quiet_user":
         assert any(call[0] == "stop" for call in recorded)
-        assert "current unit did not stop" in result.stderr
+        assert "Refusing platform upgrade" in result.stderr
+        assert not any(call[0] == "enable" for call in recorded)
+        stopped_units = next(call[1:] for call in recorded if call[0] == "stop")
+        assert {
+            "trading-platform-backup@postgresql.service",
+            "trading-platform-backup@parquet.service",
+            "trading-platform-backup@verify.service",
+        }.issubset(stopped_units)
     else:
         assert not any(
             call[0] in {"stop", "disable", "enable", "daemon-reload"} for call in recorded
@@ -444,6 +451,99 @@ def test_backup_retention_keeps_recent_daily_and_last_verified_recovery_points(t
     assert (store.root / "parquet-only").is_dir()
 
 
+def test_backup_retention_can_be_scoped_to_one_logical_file_type(tmp_path, monkeypatch):
+    import datetime as dt
+
+    from src.services.backups import BackupStore
+
+    store = BackupStore(tmp_path / "backups")
+    source = tmp_path / "source"
+    bundles = (
+        ("db-old", "2026-01-01T00:00:00+00:00", "database.dump"),
+        ("db-latest", "2026-01-30T00:00:00+00:00", "database.dump"),
+        ("parquet-old", "2026-01-01T00:00:00+00:00", "parquet.tar.gz"),
+        ("parquet-latest", "2026-01-30T00:00:00+00:00", "parquet.tar.gz"),
+    )
+    for identity, created_at, logical_name in bundles:
+        source.write_text(identity)
+        store.create(
+            backup_id=identity,
+            created_at=created_at,
+            files={logical_name: source},
+        )
+    (store.root / "parquet-latest/parquet.tar.gz").write_text("damaged")
+    verified = []
+    verify = store.verify
+
+    def track_verify(identity):
+        verified.append(identity)
+        return verify(identity)
+
+    monkeypatch.setattr(store, "verify", track_verify)
+
+    removed = store.prune(
+        older_than_timestamp=dt.datetime(2026, 1, 15, tzinfo=dt.UTC).timestamp(),
+        logical_name="database.dump",
+    )
+
+    assert removed == ("db-old",)
+    assert verified == ["db-latest"]
+    assert (store.root / "parquet-old").is_dir()
+    assert (store.root / "parquet-latest").is_dir()
+
+
+def test_backup_move_hashes_once_and_rejects_source_changes(tmp_path, monkeypatch):
+    import hashlib
+
+    from src.services import backups
+
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"verified backup bytes")
+    source_inode = source.stat().st_ino
+    hash_calls = []
+    file_hash = backups.file_hash
+
+    def count_hash(path):
+        hash_calls.append(path)
+        return file_hash(path)
+
+    monkeypatch.setattr(backups, "file_hash", count_hash)
+    store = backups.BackupStore(tmp_path / "backups")
+    bundle = store.create(
+        backup_id="moved",
+        created_at="2026-01-01T00:00:00+00:00",
+        files={"database.dump": source},
+        move_sources=True,
+    )
+    destination = store.root / "moved/database.dump"
+    assert hash_calls == [source]
+    assert destination.stat().st_ino == source_inode
+    assert (
+        bundle.files["database.dump"]
+        == "sha256:" + hashlib.sha256(b"verified backup bytes").hexdigest()
+    )
+
+    changed_source = tmp_path / "changed.dump"
+    changed_source.write_bytes(b"before")
+    real_hash = file_hash
+
+    def change_while_hashing(path):
+        digest = real_hash(path)
+        path.write_bytes(b"after!")
+        return digest
+
+    monkeypatch.setattr(backups, "file_hash", change_while_hashing)
+    with pytest.raises(RuntimeError, match="changed while hashing"):
+        store.create(
+            backup_id="changed",
+            created_at="2026-01-02T00:00:00+00:00",
+            files={"database.dump": changed_source},
+            move_sources=True,
+        )
+    assert changed_source.read_bytes() == b"after!"
+    assert not (store.root / "changed").exists()
+
+
 def test_research_hard_deadline_terminates_a_stuck_process():
     import subprocess
     import sys
@@ -480,6 +580,8 @@ def test_backup_verification_ignores_unpublished_builds(tmp_path, monkeypatch):
 
 
 def test_backup_restart_removes_only_unpublished_builds(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
     from src.services import backup_service
     from src.services.backups import BackupStore
 
@@ -502,9 +604,11 @@ def test_backup_restart_removes_only_unpublished_builds(tmp_path, monkeypatch):
     (root / ".parquet-build-link").symlink_to(tmp_path, target_is_directory=True)
     config = SimpleNamespace(paths={"backups": str(root)})
     monkeypatch.setattr(backup_service, "load_platform_config", lambda _: config)
-    monkeypatch.setattr(backup_service, "prune_backups", lambda **_: ())
+    prune = Mock(return_value=())
+    monkeypatch.setattr(backup_service, "prune_backups", prune)
     monkeypatch.setattr(backup_service, "create_database_backup", lambda **_: "created")
     backup_service.main(["--mode", "postgresql", "--config", str(tmp_path / "config")])
+    prune.assert_called_once_with(config_path=tmp_path / "config", logical_name="database.dump")
     assert all(not (root / name).exists() for name in abandoned)
     assert all((root / name / "data").read_bytes() == b"evidence" for name in retained)
     assert (root / ".parquet-build-link").is_symlink()

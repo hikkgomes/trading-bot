@@ -22,4 +22,6 @@ ProtectHome=true
 ReadWritePaths=/opt/trading-bot/runtime/backups /opt/trading-bot/runtime/numba-cache
 Slice=trading-platform-background.slice
 Nice=10
-IOSchedulingClass=idle
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+IOWeight=10

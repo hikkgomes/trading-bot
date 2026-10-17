@@ -14,6 +14,7 @@ from src.data.atomic import write_json_atomic
 from src.domain._codec import canonical_hash, timestamp
 from src.observability.reports import DatabasePlatformReport
 from src.services.alerting import AlertSeverity, SqlAlertService
+from src.services.runtime import utc_now
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -57,6 +58,15 @@ class DatabaseReportWorker:
         self.backup_max_age_seconds = backup_max_age_seconds
         self.minimum_free_bytes = minimum_free_bytes
 
+    def _renew_report_lease(self, claimed):
+        if claimed is None or self.queue is None:
+            return claimed
+        return self.queue.heartbeat(
+            claimed,
+            now=utc_now(),
+            lease_seconds=self.lease_seconds,
+        )
+
     def run_once(self, *, now: str) -> dict[str, Any]:
         now = timestamp(now, field="now")
         claimed = None
@@ -71,28 +81,68 @@ class DatabaseReportWorker:
             )
             if claimed is None:
                 return {"reason_code": "report_queue_empty"}
-        self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        self.root.chmod(0o700)
-        report = {**self.report.build(now=now), "generated_at": now}
-        operations = report.setdefault("operations", {})
-        operations["disk"] = self._disk_status()
-        if self.backup_root is not None:
-            operations["backups"] = self._backup_status(now)
-        report_hash = canonical_hash(report)
-        destination = self.root / "latest.json"
-        write_json_atomic(destination, report)
-        destination.chmod(0o600)
-        emitted_alerts = self._emit_sli_alerts(report, now=now)
-        result = {
-            "reason_code": "operator_report_written",
-            "report_hash": report_hash,
-            "path": str(destination),
-            "alert_ids": emitted_alerts,
-        }
-        if claimed is not None and self.queue is not None:
-            self.queue.complete(claimed, completed_at=now)
-            result["job_id"] = claimed.job_id
-        return result
+        current_claim = [claimed]
+
+        def renew_lease() -> None:
+            current_claim[0] = self._renew_report_lease(current_claim[0])
+
+        try:
+            self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
+            self.root.chmod(0o700)
+            report = {
+                **self.report.build(
+                    now=now,
+                    on_progress=renew_lease if claimed is not None else None,
+                ),
+                "generated_at": now,
+            }
+            operations = report.setdefault("operations", {})
+            operations["disk"] = self._disk_status()
+            if self.backup_root is not None:
+                operations["backups"] = self._backup_status(now)
+            report_hash = canonical_hash(report)
+            destination = self.root / "latest.json"
+            renew_lease()
+            write_json_atomic(destination, report)
+            destination.chmod(0o600)
+            renew_lease()
+            emitted_alerts = self._emit_sli_alerts(report, now=now)
+            result = {
+                "reason_code": "operator_report_written",
+                "report_hash": report_hash,
+                "path": str(destination),
+                "alert_ids": emitted_alerts,
+            }
+            claimed = current_claim[0]
+            if claimed is not None and self.queue is not None:
+                completed_at = utc_now()
+                self.queue.complete(claimed, completed_at=completed_at)
+                result["job_id"] = claimed.job_id
+            return result
+        except Exception as exc:
+            claimed = current_claim[0]
+            if claimed is None or self.queue is None:
+                raise
+            completed_at = utc_now()
+            retry_at = (
+                dt.datetime.fromisoformat(completed_at)
+                + dt.timedelta(seconds=max(self.lease_seconds, 300))
+            ).isoformat()
+            error = f"{type(exc).__name__}: {exc}"[:1000]
+            self.queue.fail(
+                claimed,
+                completed_at=completed_at,
+                error=error,
+                retry_at=retry_at,
+            )
+            return {
+                "reason_code": "operator_report_failed",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "completed_at": completed_at,
+                "retry_at": retry_at,
+            }
 
     def _disk_status(self) -> dict[str, Any]:
         path = self.root.parent
@@ -318,12 +368,13 @@ class DatabaseReportWorker:
                     payload={"backups": backups},
                 )
             )
-        delivery_failures = [
-            item
-            for item in operations.get("alerts", [])
-            if isinstance(item, Mapping) and item.get("event_type") == "delivery_failed"
-        ]
-        if delivery_failures:
+        delivery_failure_count = operations.get("alert_delivery_failure_count")
+        if delivery_failure_count is None:
+            delivery_failure_count = sum(
+                isinstance(item, Mapping) and item.get("event_type") == "delivery_failed"
+                for item in operations.get("alerts", [])
+            )
+        if delivery_failure_count:
             emitted.append(
                 self._emit(
                     event_type="alert_delivery_failed",
@@ -332,7 +383,7 @@ class DatabaseReportWorker:
                     target="control-monitoring",
                     message="external alert delivery failures are recorded",
                     now=now,
-                    payload={"count": len(delivery_failures)},
+                    payload={"count": delivery_failure_count},
                 )
             )
         return emitted

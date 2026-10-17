@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -92,7 +93,13 @@ def _queue_payload_identity(name: str, payload: Mapping[str, Any]) -> dict[str, 
     return identity
 
 
-def _queue_values_match(name: str, actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+def _queue_values_match(
+    name: str, actual: Mapping[str, Any], expected: Mapping[str, Any], *, attempts: int
+) -> bool:
+    if attempts > 0:
+        # Operator recovery can extend a used job's retry budget without changing its work.
+        actual = {key: value for key, value in actual.items() if key != "max_attempts"}
+        expected = {key: value for key, value in expected.items() if key != "max_attempts"}
     if name == "market_event_batch_write":
         actual = {**actual, "payload": _queue_payload_identity(name, actual["payload"])}
         expected = {**expected, "payload": _queue_payload_identity(name, expected["payload"])}
@@ -107,6 +114,7 @@ class ClaimedJob:
     worker_id: str
     attempt: int
     lease_expires_at: str
+    lease_token: str
 
 
 @dataclass(frozen=True)
@@ -1259,24 +1267,33 @@ class DatabaseJobQueue:
             "capabilities": list(capabilities),
             "payload": {},
         }
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             exists = connection.execute(select(worker.c.id).where(worker.c.id == worker_id)).first()
             if exists:
                 connection.execute(update(worker).where(worker.c.id == worker_id).values(**values))
             else:
                 connection.execute(insert(worker).values(**values))
 
-    def enqueue(
+    @contextmanager
+    def _transaction(self):
+        # Queue locks must not outlive worker leases or block service shutdown.
+        with self.engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                connection.exec_driver_sql("SET LOCAL lock_timeout = '2s'")
+                connection.exec_driver_sql("SET LOCAL statement_timeout = '10s'")
+            yield connection
+
+    def _submission_values(
         self,
         *,
         job_id: str,
         name: str,
         payload: dict[str, Any],
         available_at: str,
-        priority: int = 0,
-        producer_identity: str | None = None,
-        max_attempts: int = 3,
-    ) -> None:
+        priority: int,
+        producer_identity: str | None,
+        max_attempts: int,
+    ) -> dict[str, Any]:
         if isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
         try:
@@ -1288,7 +1305,7 @@ class DatabaseJobQueue:
         producer = self._producer_identity(
             name=name, payload=clean_payload, producer_identity=producer_identity
         )
-        values = {
+        return {
             "id": non_empty(job_id, field="job_id"),
             "name": non_empty(name, field="name"),
             "state": "pending",
@@ -1303,7 +1320,28 @@ class DatabaseJobQueue:
             "content_hash": canonical_hash(_queue_payload_identity(name, clean_payload)),
             "payload": json_value(clean_payload, field="payload"),
         }
-        with self.engine.begin() as connection:
+
+    def enqueue(
+        self,
+        *,
+        job_id: str,
+        name: str,
+        payload: dict[str, Any],
+        available_at: str,
+        priority: int = 0,
+        producer_identity: str | None = None,
+        max_attempts: int = 3,
+    ) -> None:
+        values = self._submission_values(
+            job_id=job_id,
+            name=name,
+            payload=payload,
+            available_at=available_at,
+            priority=priority,
+            producer_identity=producer_identity,
+            max_attempts=max_attempts,
+        )
+        with self._transaction() as connection:
             restricted = _restricted_job_insert(connection, values)
             if restricted is not None:
                 if not restricted:
@@ -1325,32 +1363,15 @@ class DatabaseJobQueue:
         max_attempts: int = 3,
         connection=None,
     ) -> bool:
-        if isinstance(max_attempts, bool) or max_attempts < 1:
-            raise ValueError("max_attempts must be a positive integer")
-        try:
-            clean_payload = validate_job_payload(name, payload)
-        except JobSchemaError:
-            if self.engine.dialect.name != "sqlite" or not _legacy_risk_fixture(payload):
-                raise
-            clean_payload = json_value(dict(payload), field=f"{name} payload")
-        producer = self._producer_identity(
-            name=name, payload=clean_payload, producer_identity=producer_identity
+        values = self._submission_values(
+            job_id=job_id,
+            name=name,
+            payload=payload,
+            available_at=available_at,
+            priority=priority,
+            producer_identity=producer_identity,
+            max_attempts=max_attempts,
         )
-        values = {
-            "id": non_empty(job_id, field="job_id"),
-            "name": non_empty(name, field="name"),
-            "state": "pending",
-            "priority": int(priority),
-            "available_at": timestamp(available_at, field="available_at"),
-            "lease_owner": None,
-            "lease_expires_at": None,
-            "attempts": 0,
-            "max_attempts": max_attempts,
-            "terminal_reason": None,
-            "producer_identity": producer,
-            "content_hash": canonical_hash(_queue_payload_identity(name, clean_payload)),
-            "payload": json_value(clean_payload, field="payload"),
-        }
         dialect = self.engine.dialect.name
         statement = insert(job).values(**values)
         if dialect == "postgresql":
@@ -1366,7 +1387,12 @@ class DatabaseJobQueue:
                 .on_conflict_do_nothing(index_elements=[job.c.id])
             )
         statement = statement.returning(job.c.id)
-        with connection_scope(self.engine, connection, write=True) as connection:
+        transaction = (
+            self._transaction()
+            if connection is None
+            else connection_scope(self.engine, connection, write=True)
+        )
+        with transaction as connection:
             restricted = _restricted_job_insert(connection, values)
             if restricted is not None:
                 return restricted
@@ -1390,7 +1416,7 @@ class DatabaseJobQueue:
         ):
             expected["available_at"] = values["available_at"]
         actual = {key: existing[key] for key in expected}
-        if not _queue_values_match(name, actual, expected):
+        if not _queue_values_match(name, actual, expected, attempts=int(existing["attempts"])):
             raise ValueError(f"job identity collision: {job_id}")
         return False
 
@@ -1408,7 +1434,7 @@ class DatabaseJobQueue:
 
         if self.engine.dialect.name != "postgresql":
             raise RuntimeError("market batch queue retention requires PostgreSQL")
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             return int(
                 connection.execute(
                     text("SELECT public.prune_completed_public_market_batch_jobs()")
@@ -1429,7 +1455,7 @@ class DatabaseJobQueue:
             raise ValueError("additional_attempts must be positive")
         available_at = timestamp(available_at, field="available_at")
         non_empty(reason, field="requeue reason")
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             current = connection.execute(
                 select(job.c.state, job.c.attempts, job.c.max_attempts).where(job.c.id == job_id)
             ).first()
@@ -1465,7 +1491,7 @@ class DatabaseJobQueue:
             raise ValueError("lease_seconds must be positive")
         now = timestamp(now, field="now")
         expires_at = _plus_seconds(now, lease_seconds)
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             if (
                 connection.execute(select(worker.c.id).where(worker.c.id == worker_id)).first()
                 is None
@@ -1497,67 +1523,95 @@ class DatabaseJobQueue:
             row = connection.execute(statement).mappings().first()
             if row is None:
                 return None
-            if row["state"] == "running":
+            if self._expire_for_reclaim(connection, row, now):
+                terminal_row = row
+            else:
+                attempt = int(row["attempts"]) + 1
+                attempt_id = f"{row['id']}:{attempt}"
+                lease_token = str(uuid4())
                 connection.execute(
-                    update(job_attempt)
-                    .where(job_attempt.c.job_id == row["id"], job_attempt.c.status == "running")
-                    .values(completed_at=now, status="expired", error="worker_lease_expired")
-                )
-                connection.execute(
-                    update(worker_lease)
-                    .where(
-                        worker_lease.c.job_id == row["id"],
-                        worker_lease.c.status == "active",
+                    update(job)
+                    .where(job.c.id == row["id"])
+                    .values(
+                        state="running",
+                        lease_owner=worker_id,
+                        lease_expires_at=expires_at,
+                        attempts=attempt,
                     )
-                    .values(status="expired")
                 )
-            attempt = int(row["attempts"]) + 1
-            attempt_id = f"{row['id']}:{attempt}"
+                connection.execute(
+                    insert(job_attempt).values(
+                        id=attempt_id,
+                        job_id=row["id"],
+                        worker_id=worker_id,
+                        started_at=now,
+                        completed_at=None,
+                        status="running",
+                        error=None,
+                        payload={},
+                    )
+                )
+                connection.execute(
+                    insert(worker_lease).values(
+                        id=attempt_id,
+                        job_id=row["id"],
+                        worker_id=worker_id,
+                        expires_at=expires_at,
+                        status="active",
+                        payload={"lease_token": lease_token},
+                    )
+                )
+                connection.execute(
+                    update(worker)
+                    .where(worker.c.id == worker_id)
+                    .values(last_heartbeat=now, status="busy")
+                )
+                return ClaimedJob(
+                    job_id=row["id"],
+                    name=row["name"],
+                    payload=dict(row["payload"]),
+                    worker_id=worker_id,
+                    attempt=attempt,
+                    lease_expires_at=expires_at,
+                    lease_token=lease_token,
+                )
+
+        self._emit_terminal_failure(
+            job_id=str(terminal_row["id"]),
+            job_name=str(terminal_row["name"]),
+            attempt=int(terminal_row["attempts"]),
+            error="worker_lease_expired",
+            observed_at=now,
+        )
+        return None
+
+    @staticmethod
+    def _expire_for_reclaim(connection, row, now: str) -> bool:
+        if row["state"] != "running":
+            return False
+        connection.execute(
+            update(job_attempt)
+            .where(job_attempt.c.job_id == row["id"], job_attempt.c.status == "running")
+            .values(completed_at=now, status="expired", error="worker_lease_expired")
+        )
+        connection.execute(
+            update(worker_lease)
+            .where(worker_lease.c.job_id == row["id"], worker_lease.c.status == "active")
+            .values(status="expired")
+        )
+        terminal = int(row["attempts"]) >= int(row["max_attempts"])
+        if terminal:
             connection.execute(
                 update(job)
                 .where(job.c.id == row["id"])
                 .values(
-                    state="running",
-                    lease_owner=worker_id,
-                    lease_expires_at=expires_at,
-                    attempts=attempt,
+                    state="dead_letter",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    terminal_reason="worker_lease_expired",
                 )
             )
-            connection.execute(
-                insert(job_attempt).values(
-                    id=attempt_id,
-                    job_id=row["id"],
-                    worker_id=worker_id,
-                    started_at=now,
-                    completed_at=None,
-                    status="running",
-                    error=None,
-                    payload={},
-                )
-            )
-            connection.execute(
-                insert(worker_lease).values(
-                    id=attempt_id,
-                    job_id=row["id"],
-                    worker_id=worker_id,
-                    expires_at=expires_at,
-                    status="active",
-                    payload={},
-                )
-            )
-            connection.execute(
-                update(worker)
-                .where(worker.c.id == worker_id)
-                .values(last_heartbeat=now, status="busy")
-            )
-            return ClaimedJob(
-                job_id=row["id"],
-                name=row["name"],
-                payload=dict(row["payload"]),
-                worker_id=worker_id,
-                attempt=attempt,
-                lease_expires_at=expires_at,
-            )
+        return terminal
 
     def _producer_identity(
         self,
@@ -1573,25 +1627,37 @@ class DatabaseJobQueue:
             field="producer_identity",
         )
 
+    @staticmethod
+    def _owned_job(connection, claimed: ClaimedJob):
+        statement = select(
+            job.c.state, job.c.lease_owner, job.c.attempts, job.c.max_attempts
+        ).where(job.c.id == claimed.job_id)
+        if connection.dialect.name == "postgresql":
+            statement = statement.with_for_update()
+        current = connection.execute(statement).first()
+        if (
+            current is None
+            or current.state != "running"
+            or current.lease_owner != claimed.worker_id
+            or current.attempts != claimed.attempt
+        ):
+            raise ValueError("worker no longer owns the job lease")
+        payload = connection.execute(
+            select(worker_lease.c.payload).where(
+                worker_lease.c.id == f"{claimed.job_id}:{claimed.attempt}",
+                worker_lease.c.status == "active",
+            )
+        ).scalar_one_or_none()
+        if not isinstance(payload, Mapping) or payload.get("lease_token") != claimed.lease_token:
+            raise ValueError("worker no longer owns the job lease")
+        return current
+
     def heartbeat(self, claimed: ClaimedJob, *, now: str, lease_seconds: int) -> ClaimedJob:
         now = timestamp(now, field="now")
         expires_at = _plus_seconds(now, lease_seconds)
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
-        with self.engine.begin() as connection:
-            current = connection.execute(
-                select(
-                    job.c.state,
-                    job.c.lease_owner,
-                    job.c.attempts,
-                    job.c.max_attempts,
-                ).where(job.c.id == claimed.job_id)
-            ).first()
-            if (
-                current is None
-                or current.state != "running"
-                or current.lease_owner != claimed.worker_id
-            ):
-                raise ValueError("worker no longer owns the job lease")
+        with self._transaction() as connection:
+            self._owned_job(connection, claimed)
             connection.execute(
                 update(job).where(job.c.id == claimed.job_id).values(lease_expires_at=expires_at)
             )
@@ -1610,6 +1676,7 @@ class DatabaseJobQueue:
             worker_id=claimed.worker_id,
             attempt=claimed.attempt,
             lease_expires_at=expires_at,
+            lease_token=claimed.lease_token,
         )
 
     def complete(
@@ -1652,18 +1719,8 @@ class DatabaseJobQueue:
         available_at = timestamp(available_at, field="available_at")
         reason = non_empty(reason, field="defer reason")
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
-        with self.engine.begin() as connection:
-            current = connection.execute(
-                select(job.c.state, job.c.lease_owner, job.c.attempts).where(
-                    job.c.id == claimed.job_id
-                )
-            ).first()
-            if (
-                current is None
-                or current.state != "running"
-                or current.lease_owner != claimed.worker_id
-            ):
-                raise ValueError("worker no longer owns the job lease")
+        with self._transaction() as connection:
+            current = self._owned_job(connection, claimed)
             connection.execute(
                 update(job)
                 .where(job.c.id == claimed.job_id)
@@ -1709,21 +1766,8 @@ class DatabaseJobQueue:
         completed_at = timestamp(completed_at, field="completed_at")
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
         terminal_failure = False
-        with self.engine.begin() as connection:
-            current = connection.execute(
-                select(
-                    job.c.state,
-                    job.c.lease_owner,
-                    job.c.attempts,
-                    job.c.max_attempts,
-                ).where(job.c.id == claimed.job_id)
-            ).first()
-            if (
-                current is None
-                or current.state != "running"
-                or current.lease_owner != claimed.worker_id
-            ):
-                raise ValueError("worker no longer owns the job lease")
+        with self._transaction() as connection:
+            current = self._owned_job(connection, claimed)
             terminal = int(current.attempts) >= int(current.max_attempts)
             terminal_failure = bool(retry_at and terminal and error)
             next_state = "dead_letter" if terminal else "pending"
@@ -1800,16 +1844,15 @@ class DatabaseJobQueue:
     def recover_expired(self, *, now: str) -> int:
         now = timestamp(now, field="now")
         terminal_failures: list[dict[str, Any]] = []
-        with self.engine.begin() as connection:
-            expired = (
-                connection.execute(
-                    select(job.c.id, job.c.attempts, job.c.max_attempts).where(
-                        job.c.state == "running", job.c.lease_expires_at < now
-                    )
-                )
-                .mappings()
-                .all()
+        with self._transaction() as connection:
+            statement = (
+                select(job.c.id, job.c.attempts, job.c.max_attempts)
+                .where(job.c.state == "running", job.c.lease_expires_at < now)
+                .order_by(job.c.id)
             )
+            if connection.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            expired = connection.execute(statement).mappings().all()
             if not expired:
                 return 0
             for row in expired:

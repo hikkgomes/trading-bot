@@ -42,7 +42,6 @@ def create_database_backup(*, config_path: Path, now: dt.datetime | None = None)
             files={"database.dump": dump},
             move_sources=True,
         )
-    store.verify(backup_id)
     return backup_id
 
 
@@ -65,7 +64,6 @@ def create_parquet_backup(*, config_path: Path, now: dt.datetime | None = None) 
             files={"parquet.tar.gz": archive},
             move_sources=True,
         )
-    store.verify(backup_id)
     return backup_id
 
 
@@ -108,7 +106,7 @@ def _backup_created_timestamp(bundle: BackupBundle) -> float:
     return created_at.timestamp()
 
 
-def prune_backups(*, config_path: Path) -> tuple[str, ...]:
+def prune_backups(*, config_path: Path, logical_name: str | None = None) -> tuple[str, ...]:
     config = load_platform_config(config_path)
     retention_days = int(config.backup["retention_days"])
     recent_hours = int(config.backup.get("hourly_retention_hours", 24))
@@ -118,6 +116,7 @@ def prune_backups(*, config_path: Path) -> tuple[str, ...]:
     return BackupStore(Path(config.paths["backups"])).prune(
         older_than_timestamp=now - retention_days * 86_400,
         thin_before_timestamp=now - recent_hours * 3_600,
+        logical_name=logical_name,
     )
 
 
@@ -165,13 +164,20 @@ def main(argv: list[str] | None = None) -> None:
     lock_target = Path(config.paths["backups"]) / "maintenance"
     with acquire_file_update_lock(lock_target, label="backup maintenance"):
         discarded: tuple[str, ...] = ()
+        removed: tuple[str, ...] = ()
         if args.mode in {"postgresql", "parquet"}:
             discarded = BackupStore(lock_target.parent).discard_abandoned_builds()
-            prune_backups(config_path=args.config)
-        _run_command(args, discarded_temporary=discarded)
+            logical_name = "database.dump" if args.mode == "postgresql" else "parquet.tar.gz"
+            removed = prune_backups(config_path=args.config, logical_name=logical_name)
+        _run_command(args, discarded_temporary=discarded, removed_backups=removed)
 
 
-def _run_command(args: argparse.Namespace, *, discarded_temporary: tuple[str, ...] = ()) -> None:
+def _run_command(
+    args: argparse.Namespace,
+    *,
+    discarded_temporary: tuple[str, ...] = (),
+    removed_backups: tuple[str, ...] = (),
+) -> None:
     if args.mode == "postgresql":
         result: object = create_database_backup(config_path=args.config)
     elif args.mode == "parquet":
@@ -196,15 +202,12 @@ def _run_command(args: argparse.Namespace, *, discarded_temporary: tuple[str, ..
             backup_id=args.backup_id,
             destination=args.destination,
         )
-    removed = (
-        prune_backups(config_path=args.config) if args.mode in {"postgresql", "parquet"} else ()
-    )
     print(
         {
             "ok": True,
             "mode": args.mode,
             "result": result,
-            "removed": list(removed),
+            "removed": list(removed_backups),
             "discarded_temporary_builds": list(discarded_temporary),
         }
     )

@@ -1943,6 +1943,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
         },
         worker_id="catalogue-worker",
         attempt=1,
+        lease_token="fixture",
         lease_expires_at="2026-08-30T10:01:00+00:00",
     )
     handlers = DatabaseResearchJobHandlers(

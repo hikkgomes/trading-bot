@@ -492,6 +492,7 @@ def test_generation_worker_persists_a_typed_dataset_plan(tmp_path) -> None:
         },
         worker_id="generation-worker",
         attempt=1,
+        lease_token="fixture",
         lease_expires_at="2026-08-30T00:01:00+00:00",
     )
     result = DatabaseResearchJobHandlers(SqlResearchStore(database.engine)).generate_hypotheses(
@@ -522,6 +523,7 @@ def test_catalogue_registration_waits_without_a_ready_dataset() -> None:
         },
         worker_id="catalogue-worker",
         attempt=1,
+        lease_token="fixture",
         lease_expires_at="2026-08-23T00:01:00+00:00",
     )
 

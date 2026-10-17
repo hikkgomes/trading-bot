@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from src.agents.openclaw_bridge import OpenClawAgentBridge
 from src.agents.store import SqlAgentStore
-from src.data.database import job
+from src.data.database import job, worker_lease
 from src.domain._codec import timestamp
 from src.services.health import DatabaseHeartbeatStore
 from src.services.scheduler import ClaimedJob, DatabaseJobQueue
@@ -72,10 +72,23 @@ class AgentReviewTransport:
         job_id = f"agent-delivery:{envelope.get('review_id')}"
         with self.queue.engine.connect() as connection:
             row = connection.execute(select(job).where(job.c.id == job_id)).mappings().one_or_none()
+            lease_payload = None
+            if row is not None and row["state"] == "running":
+                lease_payload = connection.execute(
+                    select(worker_lease.c.payload).where(
+                        worker_lease.c.id == f"{job_id}:{row['attempts']}",
+                        worker_lease.c.status == "active",
+                    )
+                ).scalar_one_or_none()
         if row is None or row["state"] not in {"running", "completed"}:
             raise PermissionError("OpenClaw response has no delivered request")
+        if row["state"] == "running" and (
+            not lease_payload or not lease_payload.get("lease_token")
+        ):
+            raise PermissionError("OpenClaw response has no current delivery lease")
         proposal = self.bridge.ingest_review_response(envelope, key=self.key, now=now)
         if row["state"] == "running":
+            assert lease_payload is not None
             claimed = ClaimedJob(
                 job_id=job_id,
                 name=row["name"],
@@ -83,6 +96,7 @@ class AgentReviewTransport:
                 worker_id=row["lease_owner"],
                 attempt=row["attempts"],
                 lease_expires_at=row["lease_expires_at"],
+                lease_token=str(lease_payload["lease_token"]),
             )
             self.queue.complete(
                 claimed,

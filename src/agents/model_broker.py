@@ -111,6 +111,9 @@ def request_model_proposal(
     connection.settimeout(timeout)
     try:
         connection.connect(str(socket_path))
+        greeting = _read_frame(connection, maximum_bytes=MAX_OUTPUT_BYTES)
+        if greeting.get("state") != "ready":
+            raise ModelBrokerError(str(greeting.get("reason_code") or "broker_failed"))
         _write_frame(
             connection,
             envelope,
@@ -477,6 +480,7 @@ class _ModelBrokerRequestHandler(socketserver.BaseRequestHandler):
             uid = server.peer_uid_reader(connection)
             if uid not in server.allowed_uids:
                 raise ModelBrokerError("unauthorised_peer")
+            _write_frame(connection, {"state": "ready"}, maximum_bytes=MAX_OUTPUT_BYTES)
             envelope = _read_frame(connection, maximum_bytes=MAX_REQUEST_BYTES)
             result = server.broker.proposal(envelope)
         except ModelBrokerError as exc:

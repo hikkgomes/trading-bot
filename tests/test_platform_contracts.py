@@ -978,7 +978,14 @@ def test_strategy_artefact_is_reproducible_and_content_addressed(tmp_path: Path)
     assert first.name == f"{artefact.artefact_hash.removeprefix('sha256:')}.json"
 
 
-def test_database_workers_claim_by_priority_and_resume_after_lease_expiry(tmp_path: Path):
+@pytest.mark.parametrize("recovery_worker", ["mac-research", "mac-recovery"])
+def test_database_workers_claim_by_priority_and_resume_after_lease_expiry(
+    tmp_path: Path, recovery_worker
+):
+    from sqlalchemy import select
+
+    from src.data.database import job
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
@@ -1019,13 +1026,56 @@ def test_database_workers_claim_by_priority_and_resume_after_lease_expiry(tmp_pa
     queue.complete(low, completed_at="2026-08-13T12:00:05+00:00")
     assert queue.recover_expired(now="2026-08-13T12:00:11+00:00") == 1
     recovered = queue.claim(
-        worker_id="mac-recovery",
+        worker_id=recovery_worker,
         now="2026-08-13T12:00:11+00:00",
         lease_seconds=10,
     )
     assert recovered is not None
     assert recovered.job_id == "high"
     assert recovered.attempt == 2
+
+    with pytest.raises(ValueError, match="no longer owns"):
+        queue.complete(high, completed_at="2026-08-13T12:00:12+00:00")
+    with pytest.raises(ValueError, match="no longer owns"):
+        queue.fail(
+            high,
+            completed_at="2026-08-13T12:00:12+00:00",
+            error="late",
+            retry_at="2026-08-13T12:00:13+00:00",
+        )
+    with pytest.raises(ValueError, match="no longer owns"):
+        queue.defer(high, available_at="2026-08-13T12:00:13+00:00", reason="late")
+    with pytest.raises(ValueError, match="no longer owns"):
+        queue.heartbeat(high, now="2026-08-13T12:00:12+00:00", lease_seconds=30)
+    with database.engine.connect() as connection:
+        current = connection.execute(
+            select(job.c.state, job.c.attempts).where(job.c.id == "high")
+        ).one()
+        assert tuple(current) == ("running", 2)
+    queue.complete(recovered, completed_at="2026-08-13T12:00:12+00:00")
+    queue.enqueue(
+        job_id="last-attempt", name="research", payload={}, available_at=NOW, max_attempts=1
+    )
+    last = queue.claim(worker_id="mac-research", now=NOW, lease_seconds=10)
+    assert last is not None
+    assert (
+        queue.claim(worker_id="mac-research", now="2026-08-13T12:00:11+00:00", lease_seconds=10)
+        is None
+    )
+    assert queue.state("last-attempt") == "dead_letter"
+    assert queue.requeue("last-attempt", available_at=LATER, reason="dependency_repaired")
+    assert not queue.enqueue_if_absent(
+        job_id="last-attempt", name="research", payload={}, available_at=NOW, max_attempts=1
+    )
+    with pytest.raises(ValueError, match="identity collision"):
+        queue.enqueue_if_absent(
+            job_id="last-attempt",
+            name="research",
+            payload={"changed": True},
+            available_at=NOW,
+            max_attempts=1,
+        )
+    database.dispose()
 
 
 @pytest.mark.parametrize(

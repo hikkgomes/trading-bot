@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, column, or_, select, table
 
 from src.data.bar_window import RecentBarWindow
 from src.data.database import (
@@ -33,6 +33,10 @@ from src.research.datasets import (
     DatasetLifecycleState,
     DatasetResolutionError,
     _prior_bars,
+)
+
+_PUBLIC_FUNDING_HISTORY = table(
+    "public_funding_history", *(column(item.name, item.type) for item in funding_entry.columns)
 )
 
 
@@ -883,20 +887,22 @@ class DatabaseDatasetBundleService:
     ) -> dict[str, dict[str, dict[str, Any]]]:
         from src.research.funding import settlement_index
 
+        funding = (
+            _PUBLIC_FUNDING_HISTORY if self.engine.dialect.name == "postgresql" else funding_entry
+        )
         with self.engine.connect() as connection:
             rows = (
                 connection.execute(
-                    select(funding_entry.c.id, funding_entry.c.payload, funding_entry.c.created_at)
+                    select(funding.c.id, funding.c.payload, funding.c.created_at)
                     .where(
-                        funding_entry.c.payload["product_id"].as_string() == product_id,
+                        funding.c.payload["kind"].as_string() == "historical_funding",
+                        funding.c.payload["product_id"].as_string() == product_id,
                         or_(
-                            funding_entry.c.created_at <= created,
-                            funding_entry.c.payload["supersedes_record_id"]
-                            .as_string()
-                            .is_not(None),
+                            funding.c.created_at <= created,
+                            funding.c.payload["supersedes_record_id"].as_string().is_not(None),
                         ),
                     )
-                    .order_by(funding_entry.c.created_at, funding_entry.c.id)
+                    .order_by(funding.c.created_at, funding.c.id)
                 )
                 .mappings()
                 .all()

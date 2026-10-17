@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -37,6 +38,38 @@ def file_hash(path: Path) -> str:
         raise ValueError(f"backup input must be a regular file: {path}")
     with path.open("rb") as handle:
         return "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    result = path.lstat()
+    if not stat.S_ISREG(result.st_mode):
+        raise ValueError(f"backup input must be a regular file: {path}")
+    return (
+        result.st_dev,
+        result.st_ino,
+        result.st_size,
+        result.st_mtime_ns,
+        result.st_ctime_ns,
+    )
+
+
+def _move_hashed_source(
+    source: Path, target: Path, logical_name: str
+) -> tuple[str, tuple[int, int, int, int, int]]:
+    source_identity = _file_identity(source)
+    digest = file_hash(source)
+    if _file_identity(source) != source_identity:
+        raise RuntimeError(f"backup input changed while hashing: {logical_name}")
+    os.replace(source, target)
+    try:
+        moved_identity = _file_identity(target)
+        if moved_identity[:4] != source_identity[:4]:
+            raise RuntimeError(f"backup input changed while moving: {logical_name}")
+    except Exception:
+        if target.exists() and not source.exists():
+            os.replace(target, source)
+        raise
+    return digest, moved_identity
 
 
 @dataclass(frozen=True)
@@ -210,20 +243,25 @@ class BackupStore:
         temporary = self.root / f".{backup_id}.tmp"
         temporary.mkdir(parents=True, exist_ok=False)
         hashes: dict[str, str] = {}
+        moved_sources: list[tuple[Path, Path]] = []
         try:
             for logical_name, source in sorted(files.items()):
                 logical_name = _safe_logical_name(logical_name)
-                digest = file_hash(source)
                 target = temporary / logical_name
                 target.parent.mkdir(parents=True, exist_ok=True)
+                moved_identity: tuple[int, int, int, int, int] | None = None
                 if move_sources:
-                    os.replace(source, target)
+                    digest, moved_identity = _move_hashed_source(source, target, logical_name)
+                    moved_sources.append((source, target))
                 else:
+                    digest = file_hash(source)
                     shutil.copyfile(source, target)
-                if file_hash(target) != digest:
+                if not move_sources and file_hash(target) != digest:
                     raise RuntimeError(f"backup verification failed: {logical_name}")
                 with target.open("rb") as handle:
                     os.fsync(handle.fileno())
+                if moved_identity is not None and _file_identity(target) != moved_identity:
+                    raise RuntimeError(f"backup input changed while creating: {logical_name}")
                 hashes[logical_name] = digest
             bundle = BackupBundle(backup_id=backup_id, created_at=created_at, files=hashes)
             manifest = temporary / "manifest.json"
@@ -236,6 +274,9 @@ class BackupStore:
             os.replace(temporary, destination)
             _fsync_directory(self.root)
         except Exception:
+            for source, target in reversed(moved_sources):
+                if target.exists() and not source.exists():
+                    os.replace(target, source)
             shutil.rmtree(temporary, ignore_errors=True)
             raise
         return bundle
@@ -315,18 +356,27 @@ class BackupStore:
         return tuple(restored)
 
     def prune(
-        self, *, older_than_timestamp: float, thin_before_timestamp: float | None = None
+        self,
+        *,
+        older_than_timestamp: float,
+        thin_before_timestamp: float | None = None,
+        logical_name: str | None = None,
     ) -> tuple[str, ...]:
         if not self.root.exists():
             return ()
-        bundles = [
-            self._read_bundle(directory.name)
-            for directory in self.root.iterdir()
-            if directory.is_dir()
-            and not directory.is_symlink()
-            and not directory.name.startswith(".")
-            and (directory / "manifest.json").is_file()
-        ]
+        if logical_name is not None:
+            logical_name = _safe_logical_name(logical_name)
+        bundles = []
+        for directory in self.root.iterdir():
+            if (
+                directory.is_dir()
+                and not directory.is_symlink()
+                and not directory.name.startswith(".")
+                and (directory / "manifest.json").is_file()
+            ):
+                bundle = self._read_bundle(directory.name)
+                if logical_name is None or tuple(sorted(bundle.files)) == (logical_name,):
+                    bundles.append(bundle)
         removed, latest = _retention_plan(bundles, older_than_timestamp, thin_before_timestamp)
         # Never delete an earlier recovery point unless its replacement verifies.
         for backup_id in latest:

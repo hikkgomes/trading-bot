@@ -86,9 +86,15 @@ refuse_user_authorities() {
 }
 
 stop_current_authorities() {
-  local unit
+  local unit state
   local -a current_units
   current_units=(
+    trading-platform-backup-postgresql.timer
+    trading-platform-backup-parquet.timer
+    trading-platform-backup-verify.timer
+    trading-platform-backup@postgresql.service
+    trading-platform-backup@parquet.service
+    trading-platform-backup@verify.service
     trading-platform-runtime.service
     trading-platform-market-gateway.service
     trading-platform-data-writer.service
@@ -100,19 +106,19 @@ stop_current_authorities() {
     trading-platform-control.service
     trading-platform-migration.service
   )
+  # Stop timers and their in-progress oneshots in the same transaction.
+  systemctl stop "${current_units[@]}" >/dev/null 2>&1 || true
   for unit in "${current_units[@]}"; do
-    if systemctl is-active --quiet "$unit"; then
-      systemctl stop "$unit" || {
-        echo "Refusing platform upgrade because the current unit did not stop: $unit" >&2
-        exit 1
-      }
-    fi
+    state="$(systemctl show "$unit" --property=ActiveState --value)" || {
+      echo "Cannot verify stopped trading unit: $unit" >&2
+      exit 1
+    }
+    case "$state" in
+      inactive|failed) ;;
+      *) echo "Refusing platform upgrade while $unit is $state" >&2; exit 1 ;;
+    esac
     if [[ "$unit" != "trading-platform-model-broker.service" ]]; then
       systemctl disable "$unit" >/dev/null 2>&1 || true
-    fi
-    if systemctl is-active --quiet "$unit"; then
-      echo "Refusing platform upgrade while current unit remains active: $unit" >&2
-      exit 1
     fi
   done
 }
