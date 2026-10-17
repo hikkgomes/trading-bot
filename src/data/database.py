@@ -777,6 +777,7 @@ job = Table(
     Column("payload", JSON, nullable=False),
 )
 Index("ix_job_state_name_available", job.c.state, job.c.name, job.c.available_at)
+Index("ix_job_state_available_id", job.c.state, job.c.available_at, job.c.id)
 job_quarantine = Table(
     "job_quarantine",
     metadata,
