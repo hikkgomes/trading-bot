@@ -20,7 +20,11 @@ from src.services.portfolio_engine import _validate_state_health
 from src.services.risk_state import PortfolioRiskCalculator
 
 
-def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path) -> None:
+def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from src.risk import engine as risk_engine
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'market-buffer.sqlite3'}")
     database.create_schema()
     store = SqlRiskSnapshotStore(database.engine)
@@ -53,6 +57,25 @@ def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path) -
 
     pinned = store.get(identities[-1])
     assert pinned == payloads[-1]
+    with monkeypatch.context() as patch:
+        patch.setattr(risk_engine, "canonical_hash", Mock(return_value=identities[-1]))
+        with pytest.raises(ValueError, match="market input content-hash collision"):
+            store.save_market_input(
+                {**payloads[-1], "values": {"close": 999}},
+                created_at=(start + dt.timedelta(minutes=20)).isoformat(),
+                retention_at=(start + dt.timedelta(minutes=20)).isoformat(),
+            )
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(market_input_buffer).values(
+                id=identities[-1],
+                product_id="active_income",
+                instrument_id="binance:futures:BTCUSDT:USDT",
+                event_type="best_bid_ask",
+                created_at=(start + dt.timedelta(minutes=20)).isoformat(),
+                payload=payloads[-1],
+            )
+        )
     later = start + dt.timedelta(minutes=36)
     latest_payload = {
         **payloads[-1],
@@ -69,6 +92,7 @@ def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path) -
         recent = set(connection.execute(select(market_input_buffer.c.id)).scalars())
         durable = set(connection.execute(select(risk_snapshot.c.id)).scalars())
     assert recent == {latest_id}
+    assert identities[-1] not in recent
     assert identities[-1] in durable
     assert store.get(identities[-1]) == payloads[-1]
     with pytest.raises(KeyError, match="risk snapshot does not exist"):

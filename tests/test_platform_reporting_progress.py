@@ -45,6 +45,8 @@ NOW = "2026-08-31T10:00:00+00:00"
 
 
 def test_report_counts_real_queue_states_and_terminal_attempts(tmp_path) -> None:
+    from unittest.mock import Mock
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'report.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
@@ -70,12 +72,44 @@ def test_report_counts_real_queue_states_and_terminal_attempts(tmp_path) -> None
         error="terminal failure",
         retry_at="2026-08-31T10:00:02+00:00",
     )
-    report = DatabasePlatformReport(database.engine).build()
+    for index in range(105):
+        queue.enqueue(
+            job_id=f"deferred-{index:03d}",
+            name="report-deferral-test",
+            payload={},
+            available_at=NOW,
+        )
+        deferred = queue.claim(
+            worker_id="worker",
+            now=NOW,
+            lease_seconds=10,
+            names=("report-deferral-test",),
+        )
+        assert deferred is not None
+        queue.defer(
+            deferred,
+            available_at="2030-01-01T00:00:00+00:00",
+            reason=f"temporary failure {index:03d}",
+        )
+    report_builder = DatabasePlatformReport(database.engine)
+    queue_progress = Mock(wraps=report_builder._queue_progress)
+    report_builder._queue_progress = queue_progress
+    report = report_builder.build(now=NOW)
     funnel = report["research"]["funnel"]
-    assert funnel["jobs_waiting"] == 0
+    assert funnel["jobs_waiting"] == 105
     assert funnel["jobs_dead_letter"] == 1
     assert funnel["jobs_failed_attempts"] == 1
     assert funnel["jobs_terminal_failures"][0]["job_id"] == "poison"
+    assert queue_progress.call_count == 1
+    progress = report["operations"]["queue_progress"]
+    assert progress["attempt_count"] == 106
+    assert progress["resource_deferral_count"] == 105
+    assert progress["resource_deferral_detail_limit"] == 100
+    assert len(progress["resource_deferrals"]) == 100
+    assert sum(progress["resource_deferrals"].values()) == 100
+    assert progress["resource_deferral_omitted_count"] == 5
+    assert progress["resource_deferral_omitted_reason_count"] == 5
+    assert funnel["resource_deferrals"] == progress["resource_deferrals"]
     database.dispose()
 
 
@@ -273,23 +307,23 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
     active_income = report["products"]["active_income"]
     btc = report["products"]["btc_accumulation"]
 
-    assert len(report["trading"]["alpha_forecasts"]) == 1000
+    assert len(report["trading"]["alpha_forecasts"]) == 100
     assert report["trading"]["detail_counts"]["alpha_forecasts"] == count
-    assert len(research["candidate_queue"]) == 1000
+    assert len(research["candidate_queue"]) == 100
     assert research["detail_counts"]["candidate_queue"] == count
-    assert len(research["validation_stages"]) == 1000
+    assert len(research["validation_stages"]) == 100
     assert research["detail_counts"]["validation_stages"] == count
-    assert len(research["holdout_outcomes"]) == 1000
+    assert len(research["holdout_outcomes"]) == 100
     assert research["detail_counts"]["holdout_outcomes"] == count
     assert funnel["candidates_generated"] == count
     assert funnel["candidates_evaluated"] == count
     assert funnel["candidates_compiled"] == count
     assert funnel["candidate_age_by_state"]["screening"]["count"] == count
     assert funnel["signal_frequency_count"] == count
-    assert len(funnel["signal_frequency_distribution"]) == 1000
+    assert len(funnel["signal_frequency_distribution"]) == 100
     assert funnel["candidate_correlation_count"] == count
     assert funnel["protected_holdout_count"] == count
-    assert len(report["operations"]["alerts"]) == 1000
+    assert len(report["operations"]["alerts"]) == 100
     assert report["operations"]["detail_counts"]["alerts"] == count
     assert report["operations"]["decision_funnel_blocked"] == {
         "data_available:market_data_stale": count
@@ -305,6 +339,8 @@ def test_report_caps_details_and_keeps_full_research_and_financial_totals(tmp_pa
 
 
 def test_queued_report_failure_is_recorded_and_retried_after_delay(tmp_path) -> None:
+    from unittest.mock import Mock
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'report-failure.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
@@ -329,10 +365,7 @@ def test_queued_report_failure_is_recorded_and_retried_after_delay(tmp_path) -> 
         worker_id="reporter",
     )
 
-    def fail_build(**_kwargs):
-        raise RuntimeError("database temporarily unavailable")
-
-    worker.report.build = fail_build
+    worker.report.build = Mock(side_effect=RuntimeError("database temporarily unavailable"))
     result = worker.run_once(now=NOW)
     with database.engine.connect() as connection:
         saved_job = connection.execute(

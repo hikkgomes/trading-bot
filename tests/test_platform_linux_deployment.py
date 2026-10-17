@@ -133,6 +133,8 @@ def test_deployment_runbook_targets_the_actual_optiplex_checkout() -> None:
 def test_installed_service_users_can_traverse_and_write_their_real_paths() -> None:
     import pwd
 
+    for directory in ("src", "config", "alembic"):
+        assert (INSTALLED_ROOT / directory).stat().st_mode & 0o022 == 0
     checks = {
         "trading-runtime": (
             str(INSTALLED_ROOT / "data/raw"),

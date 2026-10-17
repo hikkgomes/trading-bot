@@ -74,7 +74,8 @@ from src.observability.queue_progress import queue_progress
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.outcomes import terminal_trial_disposition
 
-REPORT_DETAIL_LIMIT = 1000
+REPORT_DETAIL_LIMIT = 100
+REPORT_STREAM_BATCH_SIZE = 1000
 REPORT_BUILD_BUDGET_SECONDS = 120
 REPORT_STATEMENT_TIMEOUT_MILLISECONDS = 20_000
 REPORT_LOCK_TIMEOUT_MILLISECONDS = 5_000
@@ -157,12 +158,19 @@ class DatabasePlatformReport:
         self._progress_callback = on_progress
         try:
             with self._read_connection():
+                queue_progress_report = self._queue_progress(now=report_time)
                 report = {
                     "schema": "platform.operator_report/v1",
                     "trading": self._trading(),
-                    "research": self._research(now=report_time),
+                    "research": self._research(
+                        now=report_time,
+                        queue_progress_report=queue_progress_report,
+                    ),
                     "products": self._products(),
-                    "operations": self._operations(now=report_time),
+                    "operations": self._operations(
+                        now=report_time,
+                        queue_progress_report=queue_progress_report,
+                    ),
                 }
                 self._check_deadline()
                 return report
@@ -267,12 +275,14 @@ class DatabasePlatformReport:
         return [to_primitive(dict(row)) for row in rows], total
 
     def _iter_rows(self, statement):
-        statement = statement.execution_options(stream_results=True, yield_per=REPORT_DETAIL_LIMIT)
+        statement = statement.execution_options(
+            stream_results=True, yield_per=REPORT_STREAM_BATCH_SIZE
+        )
         with self._read_connection() as connection:
             result = self._execute(connection, statement)
             for index, row in enumerate(result.mappings(), start=1):
                 yield row
-                if index % REPORT_DETAIL_LIMIT == 0:
+                if index % REPORT_STREAM_BATCH_SIZE == 0:
                     self._progress_checkpoint()
 
     def _count_where(self, table, *criteria) -> int:
@@ -324,7 +334,7 @@ class DatabasePlatformReport:
             "fills": self._count(fill),
         }
 
-    def _research(self, *, now: str) -> dict[str, Any]:
+    def _research(self, *, now: str, queue_progress_report: dict[str, Any]) -> dict[str, Any]:
         experiments, experiment_count = self._detail_rows(
             experiment, order_by=experiment.c.submitted_at.desc()
         )
@@ -413,6 +423,7 @@ class DatabasePlatformReport:
             report,
             now=now,
             diagnostic_candidate_count=diagnostic_candidate_count,
+            queue_progress_report=queue_progress_report,
         )
         return report
 
@@ -498,6 +509,7 @@ class DatabasePlatformReport:
         *,
         now: str,
         diagnostic_candidate_count: int,
+        queue_progress_report: dict[str, Any],
     ) -> dict[str, Any]:
         diagnostic_ids = self._diagnostic_experiments()
         invalidated = exists(
@@ -652,7 +664,7 @@ class DatabasePlatformReport:
         )
         return {
             **measured,
-            **self._queue_progress(now=now),
+            **queue_progress_report,
             "research_rounds_completed": self._count_where(
                 research_round, research_round.c.state == "completed"
             ),
@@ -909,7 +921,7 @@ class DatabasePlatformReport:
                     without_job.append(str(candidate["id"]))
             if _waiting_dataset_role(state):
                 batch.append(candidate)
-                if len(batch) == REPORT_DETAIL_LIMIT:
+                if len(batch) == REPORT_STREAM_BATCH_SIZE:
                     self._count_missing_stage_datasets(batch, missing)
                     batch.clear()
         if batch:
@@ -1218,7 +1230,7 @@ class DatabasePlatformReport:
             "latest_by_universe": {key: latest[key] for key in sorted(latest) if key},
         }
 
-    def _operations(self, *, now: str) -> dict[str, Any]:
+    def _operations(self, *, now: str, queue_progress_report: dict[str, Any]) -> dict[str, Any]:
         blocked = self._decision_funnel_blocked()
         active_job_states = job.c.state.in_(("pending", "running", "dead_letter"))
         job_count = self._count_where(job, active_job_states)
@@ -1281,8 +1293,8 @@ class DatabasePlatformReport:
                 alert, alert.c.payload["event_type"].as_string() == "delivery_failed"
             ),
             "job_queue": jobs,
-            "job_queue_detail_limit": 1000,
-            "queue_progress": self._queue_progress(now=now),
+            "job_queue_detail_limit": REPORT_DETAIL_LIMIT,
+            "queue_progress": queue_progress_report,
             "workers": workers,
             "heartbeats": [latest_heartbeats[key] for key in sorted(latest_heartbeats)],
             "alerts": alerts,

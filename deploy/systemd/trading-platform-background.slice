@@ -4,6 +4,6 @@ Description=Trading platform research services
 [Slice]
 CPUWeight=100
 IOWeight=100
-MemoryHigh=2G
+MemoryHigh=2560M
 MemoryMax=2816M
 TasksMax=128

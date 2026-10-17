@@ -486,7 +486,7 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tm
     os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
     reason="requires PostgreSQL role fixture",
 )
-def test_every_platform_role_has_only_its_declared_authority(tmp_path) -> None:
+def test_every_platform_role_has_only_its_declared_authority(tmp_path, monkeypatch) -> None:
     run_id = uuid.uuid4().hex
     research_job_id = f"role-test-research-job-{run_id}"
     agent_proposal_id = f"role-test-agent-proposal-{run_id}"
@@ -525,7 +525,9 @@ def test_every_platform_role_has_only_its_declared_authority(tmp_path) -> None:
         )
     _as_role("trading_runtime", "DELETE FROM market_input_buffer WHERE id=:id", {"id": buffer_id})
     from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import Mock
 
+    from src.risk import engine as risk_engine
     from src.risk.engine import SqlRiskSnapshotStore
 
     runtime = create_engine(
@@ -535,28 +537,38 @@ def test_every_platform_role_has_only_its_declared_authority(tmp_path) -> None:
     store = SqlRiskSnapshotStore(runtime)
     observed_at = dt.datetime.now(dt.UTC).isoformat()
     pinned_payload = {**market_payload, "fixture": run_id, "values": {"price": 100}}
+    peer_payload = {**pinned_payload, "values": {"price": 102}}
+    batches = (
+        ((pinned_payload, observed_at), (peer_payload, observed_at)),
+        ((peer_payload, observed_at), (pinned_payload, observed_at)),
+    )
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             publications = [
                 pool.submit(
                     store.save_market_inputs,
-                    (
-                        (pinned_payload, observed_at),
-                        ({**pinned_payload, "values": {"price": 102}}, observed_at),
-                    ),
+                    batch,
                     retention_at=observed_at,
                 )
-                for _ in range(2)
+                for batch in batches
             ]
-            identities = {publication.result() for publication in publications}
-        assert len(identities) == 1
-        pinned_id, batch_peer_id = identities.pop()
+            results = [publication.result() for publication in publications]
+        assert results[0] == tuple(reversed(results[1]))
+        pinned_id, batch_peer_id = results[0]
         assert (
             store.save_market_input(
                 pinned_payload, created_at=observed_at, retention_at=observed_at
             )
             == pinned_id
         )
+        with monkeypatch.context() as patch:
+            patch.setattr(risk_engine, "canonical_hash", Mock(return_value=pinned_id))
+            with pytest.raises(ValueError, match="market input content-hash collision"):
+                store.save_market_input(
+                    {**pinned_payload, "values": {"price": 101}},
+                    created_at=observed_at,
+                    retention_at=observed_at,
+                )
         transient_id = store.save_market_input(
             {**pinned_payload, "values": {"price": 101}},
             created_at=observed_at,
@@ -565,9 +577,31 @@ def test_every_platform_role_has_only_its_declared_authority(tmp_path) -> None:
         with ThreadPoolExecutor(max_workers=2) as pool:
             reads = [pool.submit(store.get, pinned_id) for _ in range(2)]
             assert all(read.result() == pinned_payload for read in reads)
+        with runtime.begin() as connection:
+            connection.execute(
+                text("""INSERT INTO market_input_buffer
+                    (id, product_id, instrument_id, event_type, created_at, payload)
+                    VALUES (:id, :product_id, :instrument_id, :event_type,
+                            CAST(:created_at AS timestamptz), CAST(:payload AS jsonb))"""),
+                {
+                    "id": pinned_id,
+                    "product_id": pinned_payload["product_id"],
+                    "instrument_id": pinned_payload["instrument_id"],
+                    "event_type": pinned_payload["source_event_type"],
+                    "created_at": observed_at,
+                    "payload": json.dumps(pinned_payload),
+                },
+            )
         store.expire_market_inputs(
             at=(dt.datetime.fromisoformat(observed_at) + dt.timedelta(minutes=16)).isoformat()
         )
+        with runtime.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT id FROM market_input_buffer WHERE id=:id"), {"id": pinned_id}
+                ).scalar_one_or_none()
+                is None
+            )
         assert store.get(pinned_id) == pinned_payload
         with pytest.raises(KeyError):
             store.get(transient_id)

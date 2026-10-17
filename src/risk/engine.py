@@ -226,6 +226,21 @@ class SqlRiskSnapshotStore:
                 {"identity": f"risk-snapshot:{snapshot_id}"},
             )
 
+    @staticmethod
+    def _lock_market_input_identities(connection, identities) -> None:
+        if connection.dialect.name == "postgresql" and identities:
+            lock_identities = [f"risk-snapshot:{identity}" for identity in sorted(identities)]
+            connection.execute(
+                text(
+                    """
+                    SELECT pg_advisory_xact_lock(hashtextextended(lock_identity, 0))
+                    FROM unnest(CAST(:lock_identities AS text[])) AS lock_keys(lock_identity)
+                    ORDER BY lock_identity
+                    """
+                ),
+                {"lock_identities": lock_identities},
+            ).all()
+
     def save(self, payload: dict[str, object], *, created_at: str) -> str:
         if self.book_id is not None:
             payload = {**payload, "book_id": self.book_id}
@@ -272,10 +287,9 @@ class SqlRiskSnapshotStore:
         identities, rows = self._market_input_rows(inputs, cutoff)
         with self.engine.begin() as connection:
             if rows:
-                for identity in sorted(rows):
-                    self._lock_identity(connection, identity)
+                self._lock_market_input_identities(connection, rows)
                 self._store_market_input_rows(connection, rows)
-            self._expire_unpinned_market_inputs(connection, cutoff)
+            self._prune_expired_market_inputs(connection, cutoff)
         return identities
 
     def _market_input_rows(self, inputs, cutoff):
@@ -337,7 +351,7 @@ class SqlRiskSnapshotStore:
         current = timestamp(at, field="at")
         cutoff = (dt.datetime.fromisoformat(current) - _MARKET_INPUT_RETENTION).isoformat()
         with self.engine.begin() as connection:
-            return self._expire_unpinned_market_inputs(connection, cutoff)
+            return self._prune_expired_market_inputs(connection, cutoff)
 
     def _prepare_market_input(
         self, payload: dict[str, object]
@@ -367,16 +381,10 @@ class SqlRiskSnapshotStore:
         )
 
     @staticmethod
-    def _expire_unpinned_market_inputs(connection, cutoff: str) -> int:
-        pinned = select(risk_snapshot_table.c.id).where(
-            risk_snapshot_table.c.id == market_input_buffer_table.c.id
-        )
+    def _prune_expired_market_inputs(connection, cutoff: str) -> int:
         expired = (
             select(market_input_buffer_table.c.id)
-            .where(
-                market_input_buffer_table.c.created_at < cutoff,
-                ~pinned.exists(),
-            )
+            .where(market_input_buffer_table.c.created_at < cutoff)
             .order_by(market_input_buffer_table.c.created_at, market_input_buffer_table.c.id)
             .limit(_MARKET_INPUT_CLEANUP_LIMIT)
         )

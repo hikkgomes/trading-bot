@@ -5,6 +5,8 @@ from sqlalchemy import case, exists, func, select
 from src.data.database import job, job_attempt
 from src.domain._codec import to_primitive
 
+RESOURCE_DEFERRAL_DETAIL_LIMIT = 100
+
 
 def queue_progress(engine, *, now):
     with engine.connect() as connection:
@@ -79,17 +81,48 @@ def _attempt_progress(connection):
     )
     outcomes = dict(connection.execute(select(outcome, func.count()).group_by(outcome)).all())
     reason = func.coalesce(job_attempt.c.error, "unspecified")
-    deferrals = dict(
-        connection.execute(
-            select(reason, func.count())
-            .where(job_attempt.c.status == "deferred", outcome == "blocked_infrastructure")
-            .group_by(reason)
-        ).all()
+    deferral_groups = (
+        select(reason.label("reason"), func.count().label("attempt_count"))
+        .where(job_attempt.c.status == "deferred", outcome == "blocked_infrastructure")
+        .group_by(reason)
+        .subquery()
     )
+    ranked_deferrals = select(
+        deferral_groups.c.reason,
+        deferral_groups.c.attempt_count,
+        func.sum(deferral_groups.c.attempt_count).over().label("total_attempts"),
+        func.count().over().label("reason_count"),
+        func.row_number()
+        .over(
+            order_by=(
+                deferral_groups.c.attempt_count.desc(),
+                deferral_groups.c.reason,
+            )
+        )
+        .label("rank"),
+    ).subquery()
+    rows = connection.execute(
+        select(
+            ranked_deferrals.c.reason,
+            ranked_deferrals.c.attempt_count,
+            ranked_deferrals.c.total_attempts,
+            ranked_deferrals.c.reason_count,
+        )
+        .where(ranked_deferrals.c.rank <= RESOURCE_DEFERRAL_DETAIL_LIMIT)
+        .order_by(ranked_deferrals.c.rank)
+    ).all()
+    deferrals = {row.reason: int(row.attempt_count) for row in rows}
+    deferral_count = int(rows[0].total_attempts) if rows else 0
+    deferral_reason_count = int(rows[0].reason_count) if rows else 0
+    displayed_deferral_count = sum(deferrals.values())
     return {
         "attempt_count": sum(outcomes.values()),
         "attempt_outcomes": outcomes,
         "resource_deferrals": deferrals,
+        "resource_deferral_count": deferral_count,
+        "resource_deferral_detail_limit": RESOURCE_DEFERRAL_DETAIL_LIMIT,
+        "resource_deferral_omitted_count": deferral_count - displayed_deferral_count,
+        "resource_deferral_omitted_reason_count": deferral_reason_count - len(deferrals),
     }
 
 

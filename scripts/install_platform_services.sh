@@ -239,6 +239,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     setfacl -m g:trading-platform:--x "$repository_home"
   fi
   setfacl -R -m g:trading-platform:r-X "$REPO/src" "$REPO/config" "$REPO/alembic"
+  chmod -R go-w "$REPO/src" "$REPO/config" "$REPO/alembic"
   setfacl -m g:trading-platform:r "$REPO/alembic.ini"
   setfacl -R -m u:trading-research:r-X,u:trading-evaluator:r-X,u:trading-agent:--- "$REPO/.git"
   setfacl -R -m u:trading-runtime:r-X,u:trading-evaluator:r-X,u:trading-platform-owner:r-X \
