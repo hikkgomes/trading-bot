@@ -22,6 +22,7 @@ python3 -m venv .venv-agent
 .venv-runtime/bin/pip install -r requirements-runtime.txt
 .venv-research/bin/pip install -r requirements-research-linux.txt -r requirements-dev.txt
 .venv-agent/bin/pip install -r requirements-agent.txt
+ln -s .venv-runtime .venv
 make platform-validate
 make platform-install-dry-run
 sudo REPO=/home/alfred/trading-bot NODE=linux-optiplex bash scripts/install_platform_services.sh
