@@ -82,6 +82,7 @@ class PostgreSQLTools:
 _POSTGRESQL_TOOL_NAMES = ("initdb", "pg_ctl", "pg_restore", "postgres", "psql", "createdb")
 # The retained event database must also restore on the server's shared spinning disk.
 _RESTORE_TIMEOUT_SECONDS = 90 * 60
+_RESTORE_SUMMARY_TIMEOUT_SECONDS = 10 * 60
 _RESTORE_ROLES = ("trading_runtime", "trading_research", "trading_evaluator")
 
 
@@ -703,7 +704,7 @@ def _restored_database_summary(
             query,
         ],
         environment,
-        timeout=60,
+        timeout=_RESTORE_SUMMARY_TIMEOUT_SECONDS,
     )
     summary = json.loads(result.stdout)
     if not isinstance(summary, dict) or not summary.get("schema_revision"):

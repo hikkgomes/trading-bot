@@ -1,6 +1,6 @@
 """Aggregate queue history in SQL without loading every job payload into memory."""
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, literal_column, select
 
 from src.data.database import job, job_attempt
 from src.domain._codec import to_primitive
@@ -127,38 +127,48 @@ def _attempt_progress(connection):
 
 
 def _scheduled_progress(connection):
-    suffix = func.substr(job.c.id, 11)
-    schedule = (
+    job_suffix = func.substr(job.c.id, 11)
+    scheduled_family = (
         func.split_part(job.c.id, ":", 2)
         if connection.dialect.name == "postgresql"
-        else func.substr(suffix, 1, func.instr(suffix, ":") - 1)
+        else func.substr(job_suffix, 1, func.instr(job_suffix, ":") - 1)
     )
-    scheduled_jobs = (
-        select(job.c.id.label("job_id"), schedule.label("schedule"))
-        .where(job.c.id.startswith("scheduled:"))
-        .cte("scheduled_jobs")
+    scheduled_counts = (
+        select(scheduled_family.label("schedule"), func.count().label("scheduled"))
+        .where(literal_column("job.id LIKE 'scheduled:%'"))
+        .group_by(scheduled_family)
+        .cte("scheduled_counts")
     )
-    if connection.dialect.name == "postgresql":
-        scheduled_jobs = scheduled_jobs.prefix_with("MATERIALIZED", dialect="postgresql")
-    attempted_jobs = (
+    attempted_scheduled_jobs = (
         select(job_attempt.c.job_id.label("job_id"))
-        .join(scheduled_jobs, scheduled_jobs.c.job_id == job_attempt.c.job_id)
+        .where(literal_column("job_attempt.job_id LIKE 'scheduled:%'"))
         .distinct()
         .cte("attempted_scheduled_jobs")
+    )
+    attempt_suffix = func.substr(attempted_scheduled_jobs.c.job_id, 11)
+    attempt_family = (
+        func.split_part(attempted_scheduled_jobs.c.job_id, ":", 2)
+        if connection.dialect.name == "postgresql"
+        else func.substr(attempt_suffix, 1, func.instr(attempt_suffix, ":") - 1)
+    )
+    started_counts = (
+        select(attempt_family.label("schedule"), func.count().label("started"))
+        .group_by(attempt_family)
+        .cte("started_counts")
     )
     rows = (
         connection.execute(
             select(
-                scheduled_jobs.c.schedule,
-                func.count().label("scheduled"),
-                func.count(attempted_jobs.c.job_id).label("started"),
+                scheduled_counts.c.schedule,
+                scheduled_counts.c.scheduled,
+                func.coalesce(started_counts.c.started, 0).label("started"),
             )
             .select_from(
-                scheduled_jobs.outerjoin(
-                    attempted_jobs, attempted_jobs.c.job_id == scheduled_jobs.c.job_id
+                scheduled_counts.outerjoin(
+                    started_counts, started_counts.c.schedule == scheduled_counts.c.schedule
                 )
             )
-            .group_by(scheduled_jobs.c.schedule)
+            .order_by(scheduled_counts.c.schedule)
         )
         .mappings()
         .all()

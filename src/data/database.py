@@ -21,6 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    literal_column,
     select,
     union_all,
 )
@@ -778,6 +779,12 @@ job = Table(
 )
 Index("ix_job_state_name_available", job.c.state, job.c.name, job.c.available_at)
 Index("ix_job_state_available_id", job.c.state, job.c.available_at, job.c.id)
+Index(
+    "ix_job_scheduled_prefix",
+    job.c.id,
+    postgresql_where=literal_column("id LIKE 'scheduled:%'"),
+    sqlite_where=literal_column("id LIKE 'scheduled:%'"),
+)
 job_quarantine = Table(
     "job_quarantine",
     metadata,
@@ -802,6 +809,12 @@ job_attempt = Table(
     Column("error", Text),
     Column("payload", JSON, nullable=False),
     Index("ix_job_attempt_status_started", "status", "started_at"),
+)
+Index(
+    "ix_job_attempt_scheduled_prefix",
+    job_attempt.c.job_id,
+    postgresql_where=literal_column("job_id LIKE 'scheduled:%'"),
+    sqlite_where=literal_column("job_id LIKE 'scheduled:%'"),
 )
 worker = Table(
     "worker",

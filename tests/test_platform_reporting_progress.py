@@ -110,6 +110,12 @@ def test_report_counts_real_queue_states_and_terminal_attempts(tmp_path) -> None
     assert progress["resource_deferral_omitted_count"] == 5
     assert progress["resource_deferral_omitted_reason_count"] == 5
     assert funnel["resource_deferrals"] == progress["resource_deferrals"]
+    assert progress["scheduled_versus_started_jobs"] == {
+        "scheduled": 0,
+        "started": 0,
+        "not_started": 0,
+        "by_schedule": {},
+    }
     database.dispose()
 
 
