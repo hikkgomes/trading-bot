@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -23,7 +24,8 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, 
 from src.domain.risk import RiskDecision
 
 REQUIRED_RISK_SCOPES = ("strategy", "instrument", "sleeve", "product", "account", "global")
-_MARKET_INPUT_RETENTION = dt.timedelta(minutes=15)
+MARKET_INPUT_RETENTION_SECONDS = 15 * 60
+_MARKET_INPUT_RETENTION = dt.timedelta(seconds=MARKET_INPUT_RETENTION_SECONDS)
 _MARKET_INPUT_CLEANUP_LIMIT = 1_000
 _BUFFERED_MARKET_EVENT_TYPES = {
     "best_bid_ask",
@@ -33,6 +35,24 @@ _BUFFERED_MARKET_EVENT_TYPES = {
     "trade",
     "aggregate_trade",
 }
+
+
+def _market_input_timeout_setting(value: float | None, *, field: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field} must be a finite positive number of seconds")
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite positive number of seconds") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{field} must be a finite positive number of seconds")
+    try:
+        milliseconds = max(1, math.ceil(seconds * 1_000))
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} is outside the supported range") from exc
+    return f"{milliseconds}ms"
 
 
 class SqlRiskPolicyStore:
@@ -279,13 +299,46 @@ class SqlRiskSnapshotStore:
         inputs: Iterable[tuple[dict[str, object], str]],
         *,
         retention_at: str | None = None,
+        transaction_timeout_seconds: float | None = None,
+        statement_timeout_seconds: float | None = None,
+        lock_timeout_seconds: float | None = None,
     ) -> tuple[str, ...]:
+        """Save one atomic buffer batch with optional transaction-local deadlines.
+
+        The transaction timeout uses PostgreSQL 17's ``transaction_timeout`` setting.
+        """
+
+        transaction_timeout = _market_input_timeout_setting(
+            transaction_timeout_seconds, field="transaction_timeout_seconds"
+        )
+        statement_timeout = _market_input_timeout_setting(
+            statement_timeout_seconds, field="statement_timeout_seconds"
+        )
+        lock_timeout = _market_input_timeout_setting(
+            lock_timeout_seconds, field="lock_timeout_seconds"
+        )
         retained_at = timestamp(
             retention_at or dt.datetime.now(dt.UTC).isoformat(), field="retention_at"
         )
         cutoff = (dt.datetime.fromisoformat(retained_at) - _MARKET_INPUT_RETENTION).isoformat()
         identities, rows = self._market_input_rows(inputs, cutoff)
         with self.engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                if transaction_timeout is not None:
+                    connection.execute(
+                        text("SELECT set_config('transaction_timeout', :timeout, true)"),
+                        {"timeout": transaction_timeout},
+                    )
+                if lock_timeout is not None:
+                    connection.execute(
+                        text("SELECT set_config('lock_timeout', :timeout, true)"),
+                        {"timeout": lock_timeout},
+                    )
+                if statement_timeout is not None:
+                    connection.execute(
+                        text("SELECT set_config('statement_timeout', :timeout, true)"),
+                        {"timeout": statement_timeout},
+                    )
             if rows:
                 self._lock_market_input_identities(connection, rows)
                 self._store_market_input_rows(connection, rows)

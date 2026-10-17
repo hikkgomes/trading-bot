@@ -1798,11 +1798,13 @@ def test_connected_gateway_uses_testnet_public_endpoints(tmp_path: Path, monkeyp
             "api_key_env": "BINANCE_API_KEY",
             "api_secret_env": "BINANCE_API_SECRET",
         },
+        product_id="active_income",
     )
 
     assert gateway.testnet is True
+    assert gateway.product_ids_by_market == {"futures": ("active_income",)}
+    assert {source.market for source in gateway.capture_config.sources} == {"futures"}
     assert {source.url for source in gateway.capture_config.sources} == {
-        "wss://stream.testnet.binance.vision/stream",
         "wss://demo-fstream.binance.com/stream",
     }
     assert _stream_endpoints(

@@ -171,7 +171,7 @@
   },
   "backup": {
     "postgresql_schedule": "hourly",
-    "parquet_schedule": "daily",
+    "offsite_schedule": "daily",
     "retention_days": 7,
     "hourly_retention_hours": 6,
     "restore_test_schedule": "weekly",

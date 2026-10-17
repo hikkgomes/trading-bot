@@ -730,21 +730,31 @@ def _market_gateway_cycle(
     maximum_seconds: float,
 ) -> Callable[[], dict[str, Any]]:
     products = _by_id(configuration["products"], collection="products", identity="product_id")
+    accounts_by_id = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
+    product_ids_by_market: dict[str, list[str]] = {}
+    for product_id, product in products.items():
+        product_account = accounts_by_id[str(product["account_id"])]
+        market = {"spot": "spot", "usdt_futures": "futures"}.get(str(product_account["market"]))
+        if market is None:
+            raise ValueError(f"unsupported account market for {product_id}")
+        product_ids_by_market.setdefault(market, []).append(product_id)
     live_account_ids = {
         str(product["account_id"])
         for product in products.values()
         if product.get("execution_mode") == "live"
     }
     accounts = tuple(
-        account
+        user_account
         for payload in configuration["accounts"]["accounts"]
         if str(payload["account_id"]) in live_account_ids
-        if (account := UserStreamAccount.from_config(payload)) is not None
+        if (user_account := UserStreamAccount.from_config(payload)) is not None
     )
     universe = DatabaseUniverseService(store=SqlUniverseStore(database.engine))
     gateway = DatabaseMarketGateway(
         queue=DatabaseJobQueue(database.engine),
         capture_config=load_event_capture_config(config_root / "event_capture.json"),
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market=product_ids_by_market,
         accounts=accounts,
         universe_symbols=lambda: universe.eligible_symbols_for_capture(),
     )

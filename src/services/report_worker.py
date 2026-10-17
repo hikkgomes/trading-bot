@@ -14,6 +14,7 @@ from src.data.atomic import write_json_atomic
 from src.domain._codec import canonical_hash, timestamp
 from src.observability.reports import DatabasePlatformReport
 from src.services.alerting import AlertSeverity, SqlAlertService
+from src.services.offsite_backup import offsite_status
 from src.services.runtime import utc_now
 from src.services.scheduler import DatabaseJobQueue
 
@@ -170,14 +171,22 @@ class DatabaseReportWorker:
                 if path.is_symlink() or not path.is_dir() or not (path / "manifest.json").is_file():
                     continue
                 kind = path.name.split("-", 1)[0]
-                if kind in {"postgresql", "parquet"}:
+                if kind == "postgresql":
                     latest[kind] = max(latest.get(kind, 0.0), path.stat().st_mtime)
         current = dt.datetime.fromisoformat(now).timestamp()
         ages = {kind: max(0.0, current - observed) for kind, observed in sorted(latest.items())}
-        missing = sorted({"postgresql", "parquet"} - set(ages))
+        offsite = offsite_status(
+            self.backup_root,
+            now=dt.datetime.fromisoformat(now),
+            maximum_age_seconds=self.backup_max_age_seconds,
+        )
+        if offsite["age_seconds"] is not None:
+            ages["offsite"] = offsite["age_seconds"]
+        missing = sorted({"postgresql", "offsite"} - set(ages))
         stale = sorted(kind for kind, age in ages.items() if age > self.backup_max_age_seconds)
         return {
-            "healthy": not missing and not stale,
+            "healthy": not missing and not stale and offsite["ok"],
+            "offsite": offsite,
             "root": str(self.backup_root),
             "ages_seconds": ages,
             "missing": missing,
@@ -363,7 +372,7 @@ class DatabaseReportWorker:
                     severity=AlertSeverity.CRITICAL,
                     dedupe_key="platform:backup-failure-or-stale",
                     target="control-monitoring",
-                    message="a required platform backup is missing or stale",
+                    message="a required platform backup is missing, stale or unverified",
                     now=now,
                     payload={"backups": backups},
                 )

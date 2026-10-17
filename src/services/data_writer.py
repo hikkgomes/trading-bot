@@ -503,11 +503,7 @@ class DatabaseMarketDataWriter:
                 raise RuntimeError(
                     "high-rate market input has no product scope for snapshot storage"
                 )
-            values = _market_snapshot_values(event) or {}
-            buffered.extend(
-                (_market_snapshot_payload(event, product_id, values), event.availability_timestamp)
-                for product_id in products
-            )
+            buffered.extend(market_input_snapshot_rows(event, products))
         if buffered:
             assert self.snapshot_store is not None
             immutable.extend(self.snapshot_store.save_market_inputs(buffered, retention_at=now))
@@ -524,26 +520,16 @@ class DatabaseMarketDataWriter:
             return ()
         if _requires_market_input_buffer(event) and not product_ids:
             raise RuntimeError("high-rate market input has no product scope for snapshot storage")
-        if event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
-            return ()
-        values = _market_snapshot_values(event)
-        if values is None and not _requires_market_input_buffer(event):
+        inputs = market_input_snapshot_rows(event, product_ids)
+        if not inputs:
             return ()
         retained_at = retention_at or event.availability_timestamp
-        values = values or {}
-
-        def save(payload: dict[str, object], *, created_at: str) -> str:
-            if not _requires_market_input_buffer(event):
-                return store.save(payload, created_at=created_at)
-            return store.save_market_input(payload, created_at=created_at, retention_at=retained_at)
-
-        identities = tuple(
-            save(
-                _market_snapshot_payload(event, product_id, values),
-                created_at=event.availability_timestamp,
+        if _requires_market_input_buffer(event):
+            identities = store.save_market_inputs(inputs, retention_at=retained_at)
+        else:
+            identities = tuple(
+                store.save(payload, created_at=created_at) for payload, created_at in inputs
             )
-            for product_id in product_ids
-        )
 
         if _is_closed_candle(event):
             self._enqueue_paper_protection_snapshots(event, product_ids, identities)
@@ -881,6 +867,27 @@ def _market_snapshot_payload(
             }
         )
     return payload
+
+
+def market_input_snapshot_rows(
+    event: MarketEvent,
+    product_ids: Iterable[str],
+) -> tuple[tuple[dict[str, object], str], ...]:
+    """Project one canonical event into the existing product-scoped snapshot payloads."""
+
+    if event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
+        return ()
+    values = _market_snapshot_values(event)
+    if values is None and not _requires_market_input_buffer(event):
+        return ()
+    snapshot_values = values or {}
+    return tuple(
+        (
+            _market_snapshot_payload(event, str(product_id), snapshot_values),
+            event.availability_timestamp,
+        )
+        for product_id in product_ids
+    )
 
 
 def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -20,6 +21,109 @@ def test_privilege_fixture_is_explicitly_enabled() -> None:
     # Role grants are applied by the owner Alembic revision. This test remains
     # opt-in because local developer databases do not normally contain roles.
     assert os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") == "1"
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
+    reason="requires isolated PostgreSQL 17 test database",
+)
+def test_quote_batch_transaction_timeout_rolls_back_market_inputs(monkeypatch):
+    from src.data.database import PlatformDatabase
+    from src.domain._codec import canonical_hash
+    from src.risk.engine import SqlRiskSnapshotStore
+
+    database = PlatformDatabase(os.environ["TRADING_PLATFORM_DATABASE_URL"])
+    now = "2026-10-18T00:00:00+00:00"
+    batch_key = uuid.uuid4().hex
+    inputs = []
+    for index in range(3):
+        payload = {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": "binance:futures:BTCUSDT:USDT",
+            "source_event_id": canonical_hash({"quote": batch_key, "index": index}),
+            "source_event_type": "best_bid_ask",
+            "source_event_time": now,
+            "availability_time": now,
+            "values": {"close": 100.0 + index},
+        }
+        inputs.append((payload, now))
+    identities = tuple(canonical_hash(payload) for payload, _ in inputs)
+    store = SqlRiskSnapshotStore(database.engine)
+
+    def delay_after_insert(connection, _cutoff):
+        count = connection.execute(
+            text("SELECT count(*) FROM market_input_buffer WHERE id IN (:first, :second, :third)"),
+            dict(zip(("first", "second", "third"), identities, strict=True)),
+        ).scalar_one()
+        assert count == len(identities)
+        for _ in range(3):
+            connection.execute(text("SELECT pg_sleep(0.4)"))
+
+    monkeypatch.setattr(store, "_prune_expired_market_inputs", delay_after_insert)
+    try:
+        with database.engine.connect() as version_connection:
+            if (
+                int(version_connection.execute(text("SHOW server_version_num")).scalar_one())
+                < 170000
+            ):
+                pytest.skip("transaction_timeout requires PostgreSQL 17 or newer")
+        with pytest.raises(DBAPIError):
+            store.save_market_inputs(
+                inputs,
+                retention_at=now,
+                transaction_timeout_seconds=1,
+                lock_timeout_seconds=5,
+                statement_timeout_seconds=0.75,
+            )
+        with database.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM market_input_buffer "
+                        "WHERE id IN (:first, :second, :third)"
+                    ),
+                    dict(zip(("first", "second", "third"), identities, strict=True)),
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM risk_snapshot WHERE id IN (:first, :second, :third)"
+                    ),
+                    dict(zip(("first", "second", "third"), identities, strict=True)),
+                ).scalar_one()
+                == 0
+            )
+    finally:
+        database.dispose()
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
+    reason="requires isolated PostgreSQL pool exhaustion test",
+)
+def test_platform_postgresql_engine_pool_checkout_has_a_five_second_bound():
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeout
+
+    from src.data.database import PlatformDatabase
+
+    database = PlatformDatabase(os.environ["TRADING_PLATFORM_DATABASE_URL"])
+    held = []
+    try:
+        pool = database.engine.pool
+        capacity = pool.size() + pool._max_overflow
+        held.extend(database.engine.connect() for _ in range(capacity))
+        started = time.monotonic()
+        with pytest.raises(SQLAlchemyPoolTimeout):
+            database.engine.connect()
+        elapsed = time.monotonic() - started
+        assert 4.5 <= elapsed < 10
+    finally:
+        for connection in held:
+            connection.close()
+        database.dispose()
 
 
 def _as_role(role: str, statement: str, parameters: dict | None = None):

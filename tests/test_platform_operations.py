@@ -915,3 +915,149 @@ def test_archive_creation_bounds_inode_metadata_memory(tmp_path):
     peak = int(result.stdout.strip())
     assert peak < 8 * 1024 * 1024
     assert verify_directory_archive(archive) == 20_001
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({}, True),
+        ({"verified_at": "2026-10-19T00:00:00+00:00"}, False),
+        ({"full_repository_read_at": "2026-09-01T00:00:00+00:00"}, False),
+        ({"database_dump_roundtrip_verified": False}, False),
+        ({"data_file_roundtrip_verified": False}, False),
+        ({"retention_succeeded": False}, False),
+        ({"snapshot_id": "not-a-snapshot"}, False),
+    ],
+)
+def test_offsite_readiness_requires_recent_verified_recovery_evidence(tmp_path, change, expected):
+    import datetime as dt
+
+    from src.services.offsite_backup import offsite_status
+
+    now = dt.datetime(2026, 10, 18, tzinfo=dt.UTC)
+    receipt = {
+        "schema": "platform.offsite_backup/v1",
+        "snapshot_id": "a" * 64,
+        "verified_at": now.isoformat(),
+        "full_repository_read_at": now.isoformat(),
+        "repository_check": "full",
+        "database_dump_roundtrip_verified": True,
+        "data_file_roundtrip_verified": True,
+        "retention_succeeded": True,
+        **change,
+    }
+    (tmp_path / "offsite-latest.json").write_text(json.dumps(receipt))
+    assert offsite_status(tmp_path, now=now, maximum_age_seconds=172800)["ok"] is expected
+    (tmp_path / "offsite-latest.json").write_text("truncated {")
+    assert offsite_status(tmp_path, now=now, maximum_age_seconds=172800)["ok"] is False
+
+
+def test_failed_cloud_restore_preserves_verified_receipt_and_retained_snapshots(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "bars.parquet").write_bytes(b"canonical-bars")
+    pinned = tmp_path / ".offsite-source"
+    pinned.mkdir()
+    (pinned / "database.dump").write_bytes(b"captured-dump")
+    old_receipt = b'{"schema":"previous-recovery-point"}'
+    (tmp_path / "offsite-latest.json").write_bytes(old_receipt)
+    manifest = {
+        "backup_id": "postgresql-fixture",
+        "files": {"database.dump": offsite_backup.file_hash(pinned / "database.dump")},
+    }
+    monkeypatch.setattr(offsite_backup, "_pin_database", Mock(return_value=(pinned, manifest)))
+    restic = Mock(return_value=[{"message_type": "summary", "snapshot_id": "b" * 64}])
+    monkeypatch.setattr(offsite_backup, "_restic", restic)
+    config = SimpleNamespace(
+        paths={"parquet": str(data), "artefacts": str(data / "artefacts")},
+        backup={"hourly_retention_hours": 6, "retention_days": 7},
+    )
+    # A successful upload/check is insufficient: no restored bytes were produced.
+    with pytest.raises(ValueError, match="regular file"):
+        offsite_backup._capture_offsite(tmp_path / "config/platform.json", config, tmp_path)
+    assert (tmp_path / "offsite-latest.json").read_bytes() == old_receipt
+    assert [call.args[1] for call in restic.call_args_list] == ["backup", "check", "restore"]
+
+
+def test_cloud_restore_checks_both_database_and_canonical_data_bytes(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+
+    originals = {
+        tmp_path / "database.dump": b"financial-history",
+        tmp_path / "data.parquet": b"market-history",
+    }
+    expected = {}
+    for path, content in originals.items():
+        path.write_bytes(content)
+        expected[path] = offsite_backup.file_hash(path)
+
+    def restore(_root, *args):
+        if args[0] != "restore":
+            return []
+        destination = Path(args[args.index("--target") + 1])
+        for source, content in originals.items():
+            target = destination.joinpath(*source.parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        return []
+
+    monkeypatch.setattr(offsite_backup, "_restic", Mock(side_effect=restore))
+    offsite_backup._verify_snapshot(tmp_path, "a" * 64, expected, full=True)
+    originals[tmp_path / "data.parquet"] = b"damaged-market-history"
+    with pytest.raises(RuntimeError, match="cloud restore differs"):
+        offsite_backup._verify_snapshot(tmp_path, "a" * 64, expected, full=True)
+
+
+def test_offsite_data_probe_survives_atomic_live_partition_replacement(tmp_path):
+    from src.services.offsite_backup import _pin_data_file, file_hash
+
+    data = tmp_path / "data"
+    pinned = tmp_path / "pinned"
+    data.mkdir()
+    pinned.mkdir()
+    source = data / "current.parquet"
+    source.write_bytes(b"captured-history")
+    probe = _pin_data_file(data, pinned)
+    original_hash = file_hash(probe)
+    replacement = data / "next.parquet"
+    replacement.write_bytes(b"new-candles")
+    os.replace(replacement, source)
+    assert probe.read_bytes() == b"captured-history"
+    assert file_hash(probe) == original_hash
+    assert file_hash(source) != original_hash
+
+
+def test_backup_monitor_requires_verified_offsite_without_obsolete_tar(tmp_path):
+    import datetime as dt
+
+    from src.services.report_worker import DatabaseReportWorker
+
+    now = dt.datetime.now(dt.UTC)
+    local = tmp_path / "postgresql-current"
+    local.mkdir()
+    (local / "manifest.json").write_text("{}")
+    receipt = {
+        "schema": "platform.offsite_backup/v1",
+        "snapshot_id": "a" * 64,
+        "verified_at": now.isoformat(),
+        "full_repository_read_at": now.isoformat(),
+        "repository_check": "full",
+        "database_dump_roundtrip_verified": True,
+        "data_file_roundtrip_verified": True,
+        "retention_succeeded": True,
+    }
+    path = tmp_path / "offsite-latest.json"
+    path.write_text(json.dumps(receipt))
+    worker = DatabaseReportWorker(engine=None, root=tmp_path / "reports", backup_root=tmp_path)
+    assert worker._backup_status(now.isoformat())["healthy"] is True
+    receipt["retention_succeeded"] = False
+    path.write_text(json.dumps(receipt))
+    assert worker._backup_status(now.isoformat())["healthy"] is False

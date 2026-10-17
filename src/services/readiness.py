@@ -61,6 +61,7 @@ from src.services.live_execution import (
     execution_engine_identity,
     live_authority_configuration_hash,
 )
+from src.services.offsite_backup import offsite_status
 from src.services.portfolio_state import DatabasePortfolioStateWorker, portfolio_state_policies
 from src.services.scheduler import AUTONOMOUS_SCHEDULES
 
@@ -1250,6 +1251,11 @@ def _operational_readiness(
     compact_backup = newest_parquet_backup_age is not None and newest_parquet_backup_age <= int(
         config.backup["maximum_age_seconds"]
     )
+    offsite = offsite_status(
+        backup_root,
+        now=dt.datetime.fromtimestamp(current_epoch, dt.UTC),
+        maximum_age_seconds=int(config.backup["maximum_age_seconds"]),
+    )
     return {
         "service_topology": {
             "ok": topology_ok,
@@ -1280,12 +1286,13 @@ def _operational_readiness(
             "metadata_files": metadata_files,
             "metadata_products": sorted(metadata_products),
         },
-        "compact_backup": {
-            "ok": compact_backup,
+        "data_backup": {
+            "ok": compact_backup or offsite["ok"],
             "backup_root": str(backup_root),
             "latest_age_seconds": newest_parquet_backup_age,
             "maximum_age_seconds": int(config.backup["maximum_age_seconds"]),
         },
+        "offsite_backup": offsite,
         "alert_delivery": {"ok": failed_deliveries == 0, "failed_attempts": failed_deliveries},
         "emergency_actions": {"ok": not emergency, "pending_jobs": emergency},
         "lifecycle_authority": _lifecycle_readiness(

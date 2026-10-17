@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -997,9 +998,15 @@ class PlatformDatabase:
             if url.startswith("postgresql://")
             else url
         )
-        self.engine: Engine = create_engine(
-            self.url, echo=echo, future=True, pool_pre_ping=True, hide_parameters=True
-        )
+        engine_options: dict[str, Any] = {
+            "echo": echo,
+            "future": True,
+            "pool_pre_ping": True,
+            "hide_parameters": True,
+        }
+        if self.url.startswith("postgresql"):
+            engine_options["pool_timeout"] = 5
+        self.engine: Engine = create_engine(self.url, **engine_options)
 
     @property
     def is_postgresql(self) -> bool:

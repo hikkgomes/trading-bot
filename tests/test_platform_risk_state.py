@@ -20,6 +20,33 @@ from src.services.portfolio_engine import _validate_state_health
 from src.services.risk_state import PortfolioRiskCalculator
 
 
+def test_market_input_write_deadlines_are_optional_and_require_finite_positive_values(tmp_path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'market-deadlines.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+
+    assert store.save_market_inputs((), retention_at="2026-09-01T00:00:00+00:00") == ()
+    assert (
+        store.save_market_inputs(
+            (),
+            retention_at="2026-09-01T00:00:00+00:00",
+            transaction_timeout_seconds=0.001,
+            statement_timeout_seconds=0.001,
+            lock_timeout_seconds=0.001,
+        )
+        == ()
+    )
+    for name in (
+        "transaction_timeout_seconds",
+        "statement_timeout_seconds",
+        "lock_timeout_seconds",
+    ):
+        for value in (0, -1, float("nan"), float("inf"), True):
+            with pytest.raises(ValueError, match="finite positive"):
+                store.save_market_inputs((), **{name: value})
+    database.dispose()
+
+
 def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path, monkeypatch) -> None:
     from unittest.mock import Mock
 
@@ -120,6 +147,67 @@ def test_market_input_buffer_expires_unpinned_updates_and_keeps_pins(tmp_path, m
             ),
             retention_at=later.isoformat(),
         )
+    database.dispose()
+
+
+def test_gateway_quote_projection_keeps_identity_rollback_and_pin_semantics(tmp_path, monkeypatch):
+    import datetime as dt
+    from dataclasses import replace
+
+    from src.data.binance_market import normalise_public_event
+    from src.domain._codec import canonical_hash
+    from src.risk import engine as risk_engine
+    from src.services.data_writer import market_input_snapshot_rows
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'gateway-quote-pins.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    received = "2026-09-01T00:00:01+00:00"
+    event = normalise_public_event(
+        market="futures",
+        stream="btcusdt@bookTicker",
+        receive_timestamp=received,
+        payload={
+            "e": "bookTicker",
+            "E": 1_788_220_800_000,
+            "s": "BTCUSDT",
+            "b": "100",
+            "B": "10",
+            "a": "101",
+            "A": "20",
+        },
+    )
+    event = replace(
+        event,
+        payload={**event.payload, "capture_policy": "latest_quote_per_flush/v1"},
+    )
+    inputs = market_input_snapshot_rows(event, ("active_income",))
+    identity = canonical_hash(inputs[0][0])
+    now = event.availability_timestamp
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            risk_engine.SqlRiskSnapshotStore,
+            "_prune_expired_market_inputs",
+            staticmethod(
+                lambda _connection, _cutoff: (_ for _ in ()).throw(RuntimeError("rollback"))
+            ),
+        )
+        with pytest.raises(RuntimeError, match="rollback"):
+            store.save_market_inputs(inputs, retention_at=now)
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(market_input_buffer.c.id).where(market_input_buffer.c.id == identity)
+            ).first()
+            is None
+        )
+
+    assert store.save_market_inputs(inputs, retention_at=now) == (identity,)
+    assert store.get(identity) == inputs[0][0]
+    later = (dt.datetime.fromisoformat(now) + dt.timedelta(minutes=16)).isoformat()
+    store.expire_market_inputs(at=later)
+    assert store.get(identity) == inputs[0][0]
     database.dispose()
 
 

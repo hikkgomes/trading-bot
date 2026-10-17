@@ -32,22 +32,26 @@ NOW = "2026-08-24T00:00:00+00:00"
 
 
 def test_gateway_keeps_latest_quote_in_each_flush_and_ignores_delayed_updates(tmp_path):
+    from src.data.parquet_store import DurableMarketBatchSpool
+    from src.services.data_writer import market_input_snapshot_rows
     from src.services.market_gateway import DatabaseGatewaySink
 
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'quote-coalescing.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
-    later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=3)).isoformat()
+    base = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    later = (base + dt.timedelta(seconds=3)).isoformat()
     queue.register_worker(
         worker_id="writer",
         node_id="fixture",
         role="writer",
-        capabilities=("market_event_write",),
+        capabilities=("market_event_write", "market_event_batch_write"),
         observed_at=NOW,
     )
-    sink = DatabaseGatewaySink(queue, coalesce_quotes=True)
+    spool = DurableMarketBatchSpool(tmp_path / "legacy-quote-spool", max_rows=1, max_bytes=10_000)
+    sink = DatabaseGatewaySink(queue, spool=spool, coalesce_quotes=True)
     for offset in (1, 2, 0):
-        observed = dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=offset)
+        observed = base + dt.timedelta(seconds=offset)
         event = normalise_public_event(
             market="futures",
             stream="btcusdt@bookTicker",
@@ -65,13 +69,34 @@ def test_gateway_keeps_latest_quote_in_each_flush_and_ignores_delayed_updates(tm
         sink._write_market_event(event, market="futures", symbol="BTCUSDT")
     assert queue.claim(worker_id="writer", now=later, lease_seconds=60) is None
     sink.flush()
-    claimed = queue.claim(worker_id="writer", now=later, lease_seconds=60)
-    assert claimed is not None
-    assert claimed.payload["event"]["payload"]["data"]["b"] == "102"
-    assert claimed.payload["event"]["payload"]["capture_policy"] == "latest_quote_per_flush/v1"
-    queue.complete(claimed, completed_at=later)
-    sink.flush()
     assert queue.claim(worker_id="writer", now=later, lease_seconds=60) is None
+    quote_batch = sink.take_quote_batch()
+    assert len(quote_batch) == 1
+    market, symbol, event = quote_batch[0]
+    assert (market, symbol) == ("futures", "BTCUSDT")
+    assert event.payload["data"]["b"] == "102"
+    assert event.payload["capture_policy"] == "latest_quote_per_flush/v1"
+    inputs = market_input_snapshot_rows(event, ("active_income",))
+    identities = SqlRiskSnapshotStore(database.engine).save_market_inputs(
+        inputs, retention_at=later
+    )
+    assert len(identities) == 1
+    persisted = SqlRiskSnapshotStore(database.engine).get(identities[0])
+    assert persisted["source_event_id"] == event.event_id
+    assert persisted["source_payload"]["capture_policy"] == "latest_quote_per_flush/v1"
+
+    legacy_segment = spool.append(event, venue="binance", market="futures", symbol="BTCUSDT")
+    assert legacy_segment is not None
+    sink._enqueue_segment(legacy_segment)
+    result = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="writer",
+        root=tmp_path / "legacy-quote-market",
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market={"futures": ("active_income",)},
+    ).run_once(now=later)
+    assert result["reason_code"] == "market_event_batch_written"
+    assert result["market_snapshot_ids"] == list(identities)
     database.dispose()
 
 

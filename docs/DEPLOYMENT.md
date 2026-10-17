@@ -7,12 +7,14 @@ data. Legacy SQLite data is read only for one-time migration.
 
 ## 1. Install the host
 
-Use a Debian or Ubuntu Linux host with PostgreSQL, ACL support, and Python 3.11
+Use a Debian or Ubuntu Linux host with PostgreSQL 17 or newer, ACL support, and Python 3.11
 or later.
+Quote writes use PostgreSQL 17 transaction deadlines. Use the official PostgreSQL
+APT repository if the distribution provides an older major version.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y acl bubblewrap git jq make postgresql postgresql-client python3 python3-venv rsync
+sudo apt-get install -y acl bubblewrap git jq make postgresql-17 postgresql-client-17 python3 python3-venv rsync restic rclone
 sudo systemctl enable --now postgresql
 git clone "$REPOSITORY_URL" /home/alfred/trading-bot
 cd /home/alfred/trading-bot
@@ -167,7 +169,7 @@ sudo systemctl start trading-platform-evaluator.service
 sudo systemctl start trading-platform-agent.service
 sudo systemctl start trading-platform-control.service
 sudo systemctl enable --now trading-platform-backup-postgresql.timer
-sudo systemctl enable --now trading-platform-backup-parquet.timer
+sudo systemctl enable --now trading-platform-backup-offsite.timer
 sudo systemctl enable --now trading-platform-backup-verify.timer
 ```
 
@@ -299,12 +301,39 @@ local cluster with TCP disabled and a private Unix socket. It checks the schema
 revision and core table counts, then writes a separate hash-bound restore
 receipt. The rehearsal does not connect to or change the production database.
 
-Create and verify both PostgreSQL and Parquet backups:
+Daily offsite backups use restic through a private rclone Google Drive remote.
+They capture a fresh PostgreSQL dump, all canonical data and public configuration
+in one encrypted incremental snapshot. The database capture is pinned with a
+hard link, so normal hourly retention cannot remove an in-progress input.
+The old daily full-tar timer is retired; manual local archives remain available.
+
+Install the maintained `restic` and `rclone` packages. Configure only `drive.file`
+on the dedicated Google OAuth client. Store its configuration at
+`/etc/trading-platform/offsite/rclone.conf` and the restic password at
+`/etc/trading-platform/offsite/restic-password`, readable only by `trading-runtime`.
+The directory must allow that user to save refreshed OAuth tokens. Initialise
+the repository once; the scheduled job never silently creates a replacement.
+The root-owned `/etc/trading-platform/offsite.env` supplies `RCLONE_CONFIG`,
+`RESTIC_PASSWORD_FILE`, `RESTIC_REPOSITORY` and `RESTIC_CACHE_DIR`.
+Keep the encryption password outside the server. The installed recovery copy
+is in Henrique's Mac login Keychain, service `Trading Platform encrypted backups`,
+account `hikkgomes/trading-bot/optiplex`.
+
+Every offsite run checks the repository and restores the captured database dump
+and a canonical Parquet file into a private temporary directory. Both hashes
+must match before retention runs. The first run and each subsequent week read
+all encrypted repository data; intervening runs rotate through seven subsets.
+`runtime/backups/offsite-latest.json` records the verified snapshot and checks.
+Readiness rejects a missing, corrupt, future-dated or stale offsite receipt.
+The offsite recovery point is daily; hourly local database backups remain.
+
+Create and verify local backups, or trigger the encrypted offsite service:
 
 ```bash
 make platform-backup-postgresql
 make platform-backup-parquet
 make platform-backup-verify
+sudo systemctl start trading-platform-backup-offsite.service
 ```
 
 Restore into a new target. Never restore over the active database or data

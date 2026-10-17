@@ -495,6 +495,7 @@ def _prepare_rehearsal_runtime(
         queue=queue,
         config_path=config_path,
         account_payload=account,
+        product_id=product_id,
     )
     user_stream_worker, accounting_worker = _event_workers(
         database=database,
@@ -1486,10 +1487,14 @@ def _connected_gateway(
     queue: DatabaseJobQueue | None = None,
     config_path: Path,
     account_payload: Mapping[str, Any],
+    product_id: str,
 ):
+    from src.risk.engine import SqlRiskSnapshotStore
+
     account = UserStreamAccount.from_config(account_payload)
     if account is None:
         raise ConnectedTestnetError("testnet user stream credentials are missing")
+    market = account.market
     capture_config = load_event_capture_config(config_path.parent / "event_capture.json")
     testnet_urls = {
         "spot": "wss://stream.testnet.binance.vision/stream",
@@ -1498,7 +1503,9 @@ def _connected_gateway(
     capture_config = replace(
         capture_config,
         sources=tuple(
-            replace(source, url=testnet_urls[source.market]) for source in capture_config.sources
+            replace(source, url=testnet_urls[source.market])
+            for source in capture_config.sources
+            if source.market == market
         ),
     )
     gateway_queue = queue or DatabaseJobQueue(
@@ -1507,6 +1514,8 @@ def _connected_gateway(
     return DatabaseMarketGateway(
         queue=gateway_queue,
         capture_config=capture_config,
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market={market: (product_id,)},
         accounts=(account,),
         testnet=True,
         user_stream_job_name=_USER_STREAM_JOB_NAME,

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted trading platform offsite backup
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=trading-platform-backup-offsite.service
+
+[Install]
+WantedBy=timers.target

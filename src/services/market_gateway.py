@@ -12,7 +12,8 @@ import os
 import stat
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,8 @@ from src.execution.rate_limit import (
     observe_http_response,
     shared_exchange_rate_limiter,
 )
+from src.risk.engine import MARKET_INPUT_RETENTION_SECONDS
+from src.services.data_writer import market_input_snapshot_rows
 from src.services.scheduler import DatabaseJobQueue
 
 _CLOCK_ENDPOINTS = {
@@ -56,6 +59,9 @@ _SPOT_USER_STREAM = "wss://ws-api.binance.com:443/ws-api/v3?returnRateLimits=fal
 _SPOT_TESTNET_USER_STREAM = "wss://ws-api.testnet.binance.vision/ws-api/v3?returnRateLimits=false"
 _QUEUE_RETENTION_INTERVAL_SECONDS = 5 * 60
 _MARKET_BATCH_RETENTION_TAG = "public_market_batch_completed_7d/v1"
+_MARKET_QUOTE_STATEMENT_TIMEOUT_SECONDS = 10.0
+_MARKET_QUOTE_LOCK_TIMEOUT_SECONDS = 2.0
+_MARKET_QUOTE_SHUTDOWN_WAIT_SECONDS = 25.0
 
 
 @dataclass(frozen=True)
@@ -226,11 +232,7 @@ class DatabaseGatewaySink:
         )
 
     def _write_market_event(self, event: MarketEvent, *, market: str, symbol: str) -> None:
-        if self.coalesce_quotes and event.event_type in {
-            MarketEventType.BEST_BID_ASK,
-            MarketEventType.MARK_PRICE,
-            MarketEventType.FUNDING_RATE,
-        }:
+        if self.coalesce_quotes and _is_ephemeral_quote_event(event):
             key = (market, symbol, event.event_type.value)
             previous = self._quotes.get(key)
             if previous is None or event.exchange_timestamp >= previous.exchange_timestamp:
@@ -276,10 +278,32 @@ class DatabaseGatewaySink:
             producer_identity="market-gateway",
         )
 
-    def flush(self) -> None:
+    def take_quote_batch(self) -> tuple[tuple[str, str, MarketEvent], ...]:
+        """Detach pending volatile quotes on the event-loop thread."""
+
         quotes, self._quotes = self._quotes, {}
-        for (market, symbol, _kind), event in sorted(quotes.items()):
-            self._append_market_event(event, market=market, symbol=symbol)
+        return tuple(
+            (market, symbol, event) for (market, symbol, _kind), event in sorted(quotes.items())
+        )
+
+    def merge_quote_batch(self, quotes: tuple[tuple[str, str, MarketEvent], ...]) -> None:
+        """Restore failed writes without replacing a newer quote seen meanwhile."""
+
+        for market, symbol, event in quotes:
+            if not _is_ephemeral_quote_event(event):
+                raise ValueError("only ephemeral quote events can be merged")
+            key = (market, symbol, event.event_type.value)
+            previous = self._quotes.get(key)
+            if previous is None or event.exchange_timestamp > previous.exchange_timestamp:
+                self._quotes[key] = event
+
+    @property
+    def pending_quote_count(self) -> int:
+        return len(self._quotes)
+
+    def flush(self) -> None:
+        """Flush durable event rows; volatile quotes use the direct snapshot writer."""
+
         if self.spool is not None:
             segment = self.spool.flush()
             if segment is not None:
@@ -300,6 +324,16 @@ class DatabaseGatewaySink:
             )
             == "completed",
         )
+
+
+def _is_ephemeral_quote_event(event: MarketEvent) -> bool:
+    return event.event_type in {
+        MarketEventType.BEST_BID_ASK,
+        MarketEventType.MARK_PRICE,
+    } or (
+        event.event_type is MarketEventType.FUNDING_RATE
+        and bool(event.payload.get("source_event_id"))
+    )
 
 
 class BinanceUserStreams:
@@ -569,6 +603,8 @@ class DatabaseMarketGateway:
         *,
         queue: DatabaseJobQueue,
         capture_config: EventCaptureConfig,
+        snapshot_store: Any,
+        product_ids_by_market: Mapping[str, Iterable[str]],
         accounts: tuple[UserStreamAccount, ...] = (),
         universe_symbols: Callable[[], tuple[str, ...]] | None = None,
         maximum_clock_skew_ms: float = 1_000.0,
@@ -580,6 +616,11 @@ class DatabaseMarketGateway:
             raise ValueError("maximum clock skew must be positive")
         self.queue = queue
         self.capture_config = capture_config
+        self.snapshot_store = snapshot_store
+        self.product_ids_by_market = {
+            str(market): tuple(str(product_id) for product_id in product_ids)
+            for market, product_ids in product_ids_by_market.items()
+        }
         self.accounts = accounts
         self.universe_symbols = universe_symbols or (lambda: ())
         self.maximum_clock_skew_ms = maximum_clock_skew_ms
@@ -600,6 +641,17 @@ class DatabaseMarketGateway:
         self._continuous_error: BaseException | None = None
         self._queue_retention_checked_at: float | None = None
         self._queue_retention_status: dict[str, Any] = {"reason_code": "queue_retention_not_run"}
+        self._quote_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="market-quote")
+        self._quote_write_future: Future | None = None
+        self._quote_batch: tuple[tuple[str, str, MarketEvent], ...] = ()
+        self._quote_persisted_source_time: str | None = None
+        self._quote_persisted_at: str | None = None
+        self._quote_last_error_type: str | None = None
+        self._quote_last_reason = "market_quote_snapshot_idle"
+        self._quote_failure_count = 0
+        self._quote_retry_at = 0.0
+        self._quote_last_rows_written = 0
+        self._quote_expired_events = 0
 
     def start(self) -> None:
         """Start one persistent event loop for all public and authenticated streams."""
@@ -630,7 +682,10 @@ class DatabaseMarketGateway:
         if self._thread is not None:
             self._thread.join(timeout=30)
             if self._thread.is_alive():
+                self._quote_executor.shutdown(wait=False, cancel_futures=True)
                 raise RuntimeError("persistent market gateway did not stop cleanly")
+        # The existing market-gateway systemd unit's 45-second stop timeout is the hard boundary.
+        self._quote_executor.shutdown(wait=False, cancel_futures=True)
 
     def wait_for_user_stream(self, account_id: str, *, timeout_seconds: float) -> bool:
         deadline = time.monotonic() + timeout_seconds
@@ -665,6 +720,141 @@ class DatabaseMarketGateway:
                 "retention_days": 7,
             }
         return self._queue_retention_status
+
+    def _save_quote_batch(
+        self, batch: tuple[tuple[str, str, MarketEvent], ...]
+    ) -> tuple[str | None, int, int]:
+        retained_at = dt.datetime.now(dt.UTC).replace(microsecond=0)
+        cutoff = retained_at - dt.timedelta(seconds=MARKET_INPUT_RETENTION_SECONDS)
+        retained: list[tuple[str, str, MarketEvent]] = []
+        expired = 0
+        rows: list[tuple[dict[str, object], str]] = []
+        for market, symbol, event in batch:
+            if dt.datetime.fromisoformat(event.availability_timestamp) < cutoff:
+                expired += 1
+                continue
+            product_ids = self.product_ids_by_market.get(market, ())
+            if not product_ids:
+                raise RuntimeError(f"market input has no product scope for {market}")
+            rows.extend(market_input_snapshot_rows(event, product_ids))
+            retained.append((market, symbol, event))
+        if not rows:
+            return None, 0, expired
+        identities = self.snapshot_store.save_market_inputs(
+            rows,
+            retention_at=retained_at.isoformat(),
+            transaction_timeout_seconds=_MARKET_QUOTE_STATEMENT_TIMEOUT_SECONDS,
+            statement_timeout_seconds=_MARKET_QUOTE_STATEMENT_TIMEOUT_SECONDS,
+            lock_timeout_seconds=_MARKET_QUOTE_LOCK_TIMEOUT_SECONDS,
+        )
+        source_time = max(event.exchange_timestamp for _market, _symbol, event in retained)
+        return source_time, len(identities), expired
+
+    def _start_quote_write(self, sink: DatabaseGatewaySink) -> None:
+        if self._quote_write_future is not None or time.monotonic() < self._quote_retry_at:
+            return
+        batch = sink.take_quote_batch()
+        if not batch:
+            return
+        self._quote_batch = batch
+        self._quote_write_future = self._quote_executor.submit(self._save_quote_batch, batch)
+        self._quote_last_reason = "market_quote_snapshot_write_pending"
+
+    def _collect_quote_write(self, sink: DatabaseGatewaySink) -> None:
+        future = self._quote_write_future
+        if future is None or not future.done():
+            return
+        batch = self._quote_batch
+        try:
+            source_time, rows_written, expired = future.result()
+        except Exception as exc:
+            sink.merge_quote_batch(batch)
+            self._quote_failure_count += 1
+            self._quote_retry_at = time.monotonic() + min(
+                60.0, 2.0 ** min(self._quote_failure_count - 1, 6)
+            )
+            self._quote_last_error_type = type(exc).__name__
+            self._quote_last_reason = "market_quote_snapshot_write_failed"
+        else:
+            self._quote_expired_events += expired
+            self._quote_failure_count = 0
+            self._quote_retry_at = 0.0
+            self._quote_last_error_type = None
+            if source_time is None:
+                self._quote_last_reason = "market_quote_snapshot_batch_expired"
+            else:
+                self._quote_persisted_source_time = source_time
+                self._quote_persisted_at = (
+                    dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+                )
+                self._quote_last_reason = "market_quote_snapshot_written"
+            self._quote_last_rows_written = rows_written
+        self._quote_write_future = None
+        self._quote_batch = ()
+
+    async def _wait_for_quote_write(self, sink: DatabaseGatewaySink) -> None:
+        future = self._quote_write_future
+        if future is None:
+            return
+        deadline = time.monotonic() + _MARKET_QUOTE_SHUTDOWN_WAIT_SECONDS
+        while not future.done() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if not future.done():
+            self._quote_last_error_type = "TimeoutError"
+            self._quote_last_reason = "market_quote_snapshot_write_pending"
+            return
+        self._collect_quote_write(sink)
+
+    def _quote_persistence_status(self, sink: DatabaseGatewaySink, *, now: str) -> dict[str, Any]:
+        source_age = None
+        if self._quote_persisted_source_time is not None:
+            current = dt.datetime.fromisoformat(now)
+            source = dt.datetime.fromisoformat(self._quote_persisted_source_time)
+            source_age = max(0.0, (current - source).total_seconds())
+        reason = (
+            "market_quote_snapshot_write_pending"
+            if self._quote_write_future is not None
+            else "market_quote_snapshot_retry_deferred"
+            if sink.pending_quote_count and time.monotonic() < self._quote_retry_at
+            else "market_quote_snapshot_pending"
+            if sink.pending_quote_count
+            else self._quote_last_reason
+        )
+        return {
+            "reason_code": reason,
+            "in_flight": self._quote_write_future is not None,
+            "pending_quote_keys": sink.pending_quote_count,
+            "last_persisted_source_time": self._quote_persisted_source_time,
+            "last_persisted_at": self._quote_persisted_at,
+            "persisted_source_age_seconds": source_age,
+            "last_error_type": self._quote_last_error_type,
+            "last_rows_written": getattr(self, "_quote_last_rows_written", 0),
+            "expired_quote_events": self._quote_expired_events,
+        }
+
+    def _publish_quote_health(
+        self,
+        sink: DatabaseGatewaySink,
+        *,
+        now: str,
+        healthy_reason_code: str = "market_gateway_running",
+    ) -> dict[str, Any]:
+        quote_status = self._quote_persistence_status(sink, now=now)
+        error_type = quote_status.get("last_error_type")
+        self._continuous_status = {
+            **self._continuous_status,
+            "reason_code": (
+                "market_gateway_quote_snapshot_write_failed"
+                if error_type is not None
+                else healthy_reason_code
+            ),
+            "quote_persistence": quote_status,
+        }
+        if error_type is None:
+            self._continuous_status.pop("error_type", None)
+        else:
+            self._continuous_status["error_type"] = error_type
+        return quote_status
 
     def _run_continuous_thread(self) -> None:
         loop = asyncio.new_event_loop()
@@ -722,13 +912,19 @@ class DatabaseMarketGateway:
                 "clock_status": clocks,
                 "user_stream_accounts": len(self.accounts),
             }
+            self._publish_quote_health(
+                sink, now=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+            )
             try:
                 queue_retention = await self._prune_queue_history()
                 while True:
                     await asyncio.sleep(self.capture_config.flush_seconds)
                     sink.flush()
+                    self._collect_quote_write(sink)
+                    self._start_quote_write(sink)
                     spool_status = sink.enforce_retention()
                     queue_retention = await self._prune_queue_history()
+                    now = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
                     self._continuous_status = {
                         **self._continuous_status,
                         "events_enqueued": sink.events,
@@ -736,6 +932,7 @@ class DatabaseMarketGateway:
                         "spool": spool_status,
                         "queue_retention": queue_retention,
                     }
+                    self._publish_quote_health(sink, now=now)
                     failed = next(
                         (
                             task.exception()
@@ -753,6 +950,12 @@ class DatabaseMarketGateway:
                     task.cancel()
                 await asyncio.gather(public, *authenticated, return_exceptions=True)
                 sink.close()
+                self._collect_quote_write(sink)
+                self._start_quote_write(sink)
+                await self._wait_for_quote_write(sink)
+                self._publish_quote_health(
+                    sink, now=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+                )
 
     async def _capture_user_forever(
         self,
@@ -846,6 +1049,10 @@ class DatabaseMarketGateway:
                 results = await asyncio.gather(public_task, *user_tasks, return_exceptions=True)
         finally:
             sink.close()
+            self._collect_quote_write(sink)
+            self._start_quote_write(sink)
+            await self._wait_for_quote_write(sink)
+            self._collect_quote_write(sink)
             spool_status = sink.enforce_retention()
         public_result = results[0]
         if isinstance(public_result, BaseException):
@@ -857,8 +1064,17 @@ class DatabaseMarketGateway:
         ]
         if user_errors:
             raise RuntimeError("; ".join(user_errors))
+        quote_status = self._quote_persistence_status(
+            sink, now=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        )
+        quote_error = quote_status.get("last_error_type")
         return {
-            "reason_code": "market_gateway_cycle_completed",
+            "reason_code": (
+                "market_gateway_quote_snapshot_write_failed"
+                if quote_error is not None
+                else "market_gateway_cycle_completed"
+            ),
+            **({"error_type": quote_error} if quote_error is not None else {}),
             "events_enqueued": sink.events,
             "bytes_received": sink.bytes,
             "clock_status": clocks,
@@ -866,6 +1082,7 @@ class DatabaseMarketGateway:
             "user_stream_errors": [],
             "spool": spool_status,
             "queue_retention": queue_retention,
+            "quote_persistence": quote_status,
         }
 
     async def _clock_status(self, session: aiohttp.ClientSession) -> dict[str, Any]:

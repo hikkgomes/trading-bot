@@ -91,10 +91,12 @@ stop_current_authorities() {
   current_units=(
     trading-platform-backup-postgresql.timer
     trading-platform-backup-parquet.timer
+    trading-platform-backup-offsite.timer
     trading-platform-backup-verify.timer
     trading-platform-backup@postgresql.service
     trading-platform-backup@parquet.service
     trading-platform-backup@verify.service
+    trading-platform-backup-offsite.service
     trading-platform-runtime.service
     trading-platform-market-gateway.service
     trading-platform-data-writer.service
@@ -359,8 +361,10 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     /etc/systemd/system/trading-platform-backup@.service
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-postgresql.timer" \
     /etc/systemd/system/trading-platform-backup-postgresql.timer
-  install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-parquet.timer" \
-    /etc/systemd/system/trading-platform-backup-parquet.timer
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-backup-offsite.service" \
+    /etc/systemd/system/trading-platform-backup-offsite.service
+  install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-offsite.timer" \
+    /etc/systemd/system/trading-platform-backup-offsite.timer
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-verify.timer" \
     /etc/systemd/system/trading-platform-backup-verify.timer
   systemctl daemon-reload
@@ -382,7 +386,8 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   systemctl enable trading-platform-control.service
   systemctl enable trading-platform-migration.service
   systemctl enable trading-platform-backup-postgresql.timer
-  systemctl enable trading-platform-backup-parquet.timer
+  systemctl disable --now trading-platform-backup-parquet.timer 2>/dev/null || true
+  systemctl enable trading-platform-backup-offsite.timer
   systemctl enable trading-platform-backup-verify.timer
   echo "Installed Linux service units. Add service-specific files under /etc/trading-platform/, then start them."
   exit 0
