@@ -412,6 +412,7 @@ def adaptive_research_report(engine, *, product_id: str, at: str) -> dict[str, A
         candidates.c.state != "legacy_import",
         ~diagnostic,
     )
+    family = strategy_definition.c.definition["family"].as_string()
     public_stage_scope = and_(
         strategy_definition.c.product_id == product_id,
         candidates.c.state != "legacy_import",
@@ -460,12 +461,12 @@ def adaptive_research_report(engine, *, product_id: str, at: str) -> dict[str, A
         family_counts = dict(
             connection.execute(
                 select(
-                    strategy_definition.c.definition["family"].as_string(),
+                    family,
                     func.count(func.distinct(validation_stage.c.experiment_id)),
                 )
                 .select_from(stage_source)
                 .where(public_stage_scope)
-                .group_by(strategy_definition.c.definition["family"].as_string())
+                .group_by(family)
             ).all()
         )
         evaluated_count = int(
