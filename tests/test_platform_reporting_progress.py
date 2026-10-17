@@ -745,6 +745,76 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
                     "error": "temporary database load",
                     "payload": {"outcome_category": "blocked_infrastructure"},
                 },
+                {
+                    "id": "attempt-null-category",
+                    "job_id": "scheduled:research:2",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "deferred",
+                    "error": "legacy null category",
+                    "payload": {"outcome_category": None},
+                },
+                {
+                    "id": "attempt-empty-category",
+                    "job_id": "scheduled:research:2",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "deferred",
+                    "error": "legacy empty category",
+                    "payload": {"outcome_category": ""},
+                },
+                {
+                    "id": "attempt-unknown-category",
+                    "job_id": "scheduled:research:1",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "completed",
+                    "error": None,
+                    "payload": {"outcome_category": "operator_review_" + "x" * 80},
+                },
+                {
+                    "id": "attempt-expired-default",
+                    "job_id": "scheduled:research:1",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "expired",
+                    "error": "lease expired",
+                    "payload": {},
+                },
+                {
+                    "id": "attempt-failed-default",
+                    "job_id": "scheduled:research:1",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "failed",
+                    "error": "legacy failure",
+                    "payload": {},
+                },
+                {
+                    "id": "attempt-failed-explicit-category",
+                    "job_id": "scheduled:research:1",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "failed",
+                    "error": "explicit result",
+                    "payload": {"outcome_category": "accepted"},
+                },
+                {
+                    "id": "attempt-unclassified-default",
+                    "job_id": "scheduled:research:1",
+                    "worker_id": "worker",
+                    "started_at": NOW,
+                    "completed_at": NOW,
+                    "status": "completed",
+                    "error": None,
+                    "payload": {},
+                },
             ],
         )
         connection.execute(
@@ -840,6 +910,18 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
         "account-3-latest",
     ]
     assert slis["stale_market_data"]["count"] == 1
+    assert report["operations"]["queue_progress"]["attempt_count"] == 10
+    assert report["operations"]["queue_progress"]["attempt_outcomes"] == {
+        "": 1,
+        "accepted": 1,
+        "blocked_infrastructure": 4,
+        "operator_review_" + "x" * 80: 1,
+        "unclassified": 3,
+    }
+    assert report["operations"]["queue_progress"]["resource_deferral_count"] == 2
+    assert report["operations"]["queue_progress"]["resource_deferrals"] == {
+        "temporary database load": 2,
+    }
     database.dispose()
 
 

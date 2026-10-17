@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Computed,
     DateTime,
     ForeignKey,
     Index,
@@ -808,8 +809,20 @@ job_attempt = Table(
     Column("status", String(40), nullable=False),
     Column("error", Text),
     Column("payload", JSON, nullable=False),
+    Column(
+        "outcome_category",
+        Text,
+        Computed(
+            "COALESCE(payload->>'outcome_category', "
+            "CASE WHEN status IN ('failed','expired') THEN 'blocked_infrastructure' "
+            "ELSE 'unclassified' END)",
+            persisted=True,
+        ),
+        nullable=False,
+    ),
     Index("ix_job_attempt_status_started", "status", "started_at"),
 )
+Index("ix_job_attempt_outcome_category", job_attempt.c.outcome_category)
 Index(
     "ix_job_attempt_scheduled_prefix",
     job_attempt.c.job_id,

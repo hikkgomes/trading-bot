@@ -1,6 +1,6 @@
 """Aggregate queue history in SQL without loading every job payload into memory."""
 
-from sqlalchemy import case, func, literal_column, select
+from sqlalchemy import func, literal_column, select
 
 from src.data.database import job, job_attempt
 from src.domain._codec import to_primitive
@@ -72,13 +72,7 @@ def queue_progress(engine, *, now):
 
 
 def _attempt_progress(connection):
-    outcome = func.coalesce(
-        job_attempt.c.payload["outcome_category"].as_string(),
-        case(
-            (job_attempt.c.status.in_(("failed", "expired")), "blocked_infrastructure"),
-            else_="unclassified",
-        ),
-    )
+    outcome = job_attempt.c.outcome_category
     outcomes = dict(connection.execute(select(outcome, func.count()).group_by(outcome)).all())
     reason = func.coalesce(job_attempt.c.error, "unspecified")
     deferral_groups = (

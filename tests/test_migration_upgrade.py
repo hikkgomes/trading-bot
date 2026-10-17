@@ -25,6 +25,8 @@ def test_all_provider_upgrade_retains_counts_closed_epochs_and_exposure():
         dataset_bundle,
         experiment,
         holdout_claim,
+        job,
+        job_attempt,
         research_epoch,
         strategy_definition,
         strategy_version,
@@ -43,6 +45,66 @@ def test_all_provider_upgrade_retains_counts_closed_epochs_and_exposure():
         database.migrate(target="platform_v2_0035")
         at = "2026-09-07T00:00:00+00:00"
         with database.engine.begin() as connection:
+            connection.execute(
+                insert(job).values(
+                    id="attempt-outcome-backfill-job",
+                    name="reporting",
+                    state="completed",
+                    priority=0,
+                    available_at=at,
+                    attempts=1,
+                    max_attempts=3,
+                    terminal_reason=None,
+                    producer_identity="migration-fixture",
+                    content_hash="sha256:" + "8" * 64,
+                    payload={},
+                )
+            )
+            connection.execute(
+                insert(job_attempt),
+                [
+                    {
+                        "id": "attempt-outcome-backfill-long-label",
+                        "job_id": "attempt-outcome-backfill-job",
+                        "worker_id": "migration-fixture",
+                        "started_at": at,
+                        "completed_at": at,
+                        "status": "completed",
+                        "error": None,
+                        "payload": {"outcome_category": "operator_review_" + "x" * 80},
+                    },
+                    {
+                        "id": "attempt-outcome-backfill-failed-default",
+                        "job_id": "attempt-outcome-backfill-job",
+                        "worker_id": "migration-fixture",
+                        "started_at": at,
+                        "completed_at": at,
+                        "status": "failed",
+                        "error": "legacy failure",
+                        "payload": {},
+                    },
+                    {
+                        "id": "attempt-outcome-backfill-empty-override",
+                        "job_id": "attempt-outcome-backfill-job",
+                        "worker_id": "migration-fixture",
+                        "started_at": at,
+                        "completed_at": at,
+                        "status": "failed",
+                        "error": "empty outcome",
+                        "payload": {"outcome_category": ""},
+                    },
+                    {
+                        "id": "attempt-outcome-backfill-null-fallback",
+                        "job_id": "attempt-outcome-backfill-job",
+                        "worker_id": "migration-fixture",
+                        "started_at": at,
+                        "completed_at": at,
+                        "status": "expired",
+                        "error": "legacy expiry",
+                        "payload": {"outcome_category": None},
+                    },
+                ],
+            )
             for identity, providers in {
                 "closed": ["bounded_hypothesis_generator", "agent", "catalogue"],
                 "missing": ["agent"],
@@ -126,6 +188,19 @@ def test_all_provider_upgrade_retains_counts_closed_epochs_and_exposure():
         database.migrate()
         database.assert_migrated()
         with database.engine.connect() as connection:
+            backfilled_outcomes = dict(
+                connection.execute(
+                    select(job_attempt.c.id, job_attempt.c.outcome_category).where(
+                        job_attempt.c.id.like("attempt-outcome-backfill-%")
+                    )
+                ).all()
+            )
+            assert backfilled_outcomes == {
+                "attempt-outcome-backfill-long-label": "operator_review_" + "x" * 80,
+                "attempt-outcome-backfill-failed-default": "blocked_infrastructure",
+                "attempt-outcome-backfill-empty-override": "",
+                "attempt-outcome-backfill-null-fallback": "blocked_infrastructure",
+            }
             queue_options = connection.execute(
                 text(
                     "SELECT relname, reloptions FROM pg_class "
