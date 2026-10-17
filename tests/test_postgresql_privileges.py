@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -21,6 +22,38 @@ def test_privilege_fixture_is_explicitly_enabled() -> None:
     # Role grants are applied by the owner Alembic revision. This test remains
     # opt-in because local developer databases do not normally contain roles.
     assert os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") == "1"
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRADING_PLATFORM_PRIVILEGE_TEST") != "1",
+    reason="requires isolated PostgreSQL test database",
+)
+def test_alert_retry_persists_success_and_acknowledgement_on_postgresql():
+    from src.services.alerting import SqlAlertService
+
+    engine = create_engine(os.environ["TRADING_PLATFORM_DATABASE_URL"])
+    sink = Mock()
+    sink.name = f"alert-contract-{uuid.uuid4().hex}"
+    sink.send.side_effect = OSError("destination unavailable")
+    service = SqlAlertService(engine, sinks=(sink,))
+    try:
+        result = service.emit(
+            event_type="contract_check",
+            severity="critical",
+            dedupe_key=sink.name,
+            message="Local delivery contract check",
+            emitted_at="2026-10-18T00:00:00+00:00",
+        )
+        assert result.delivery_status == "failed"
+        sink.send.side_effect = None
+        service.deliver_pending(now="2026-10-18T00:02:00+00:00")
+        attempts = service.delivery_attempts(alert_id=result.alert_id)
+        assert [attempt["status"] for attempt in attempts] == ["failed", "delivered"]
+        assert attempts[-1]["acknowledged_at"] == "2026-10-18T00:02:00+00:00"
+        service.deliver_pending(now="2026-10-18T01:00:00+00:00")
+        assert sink.send.call_count == 2
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.skipif(

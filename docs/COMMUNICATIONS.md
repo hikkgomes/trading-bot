@@ -6,9 +6,14 @@ webhooks, or OpenClaw.
 
 ## Control API
 
-`control-api` listens on the configured local bind and requires the bearer
-token from the private service environment. It reads and writes control state
-through PostgreSQL.
+`control-api` listens on the configured local bind. Operator routes require the
+bearer token from the private service environment. They read and write control
+state through PostgreSQL.
+
+`GET /healthz` accepts only actual loopback peers without a token. It returns
+fixed health categories and service names, without account data or stored
+heartbeat payloads. It checks the configured node's current heartbeats and
+published operational report. Missing or stale evidence returns HTTP 503.
 
 Read-only routes:
 
@@ -46,6 +51,10 @@ missing datasets, unstarted jobs, stale account or market authority, missing
 risk inputs, unresolved recovery, conflicting execution authority, backup
 failure, and remote delivery failure.
 
+Current delivery failures count the latest unacknowledged attempt for each
+alert and destination. A successful retry or acknowledgement clears that count;
+the failure history remains in PostgreSQL.
+
 ## OpenClaw
 
 OpenClaw has no order, approval, credential, or live-risk access. Scheduled
@@ -62,6 +71,14 @@ response, compilation and evaluation remain durable, separate states.
 Agents may request bounded research, revise a thesis, or retire a lineage.
 They cannot grant `live_ready`, create a live assignment, or alter execution
 controls.
+
+The main OpenClaw profile can run `python3 scripts/check_platform_health.py`
+as a command job. This reads only the loopback health endpoint and needs no
+operator or exchange credential. It prints `NO_REPLY` when healthy and exits
+with a fixed failure description otherwise. Native job failure alerts can use
+the existing Telegram destination after the operator approves delivery. A
+monitor on the OptiPlex cannot report a power or network loss of that host;
+server-down notification needs a monitor elsewhere.
 
 ## Verification
 

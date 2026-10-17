@@ -12,7 +12,7 @@ from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import func, insert, literal, select, text, update
 from sqlalchemy.engine import Engine
 
 from src.data.database import alert, alert_delivery_attempt
@@ -188,6 +188,8 @@ class SqlAlertService:
         for sink in self.sinks:
             sink_name = _sink_name(sink)
             attempt_no = self._start_delivery_attempt(record, sink_name, emitted_at)
+            if attempt_no is None:
+                continue
             try:
                 sink.send(record)
             except Exception as exc:  # external delivery must not stop trading controls
@@ -259,8 +261,9 @@ class SqlAlertService:
             payload={"acknowledged_by": acknowledged_by, "alert_id": alert_id},
             parent_alert_id=alert_id,
         )
-        self._append(record)
         with self.engine.begin() as connection:
+            self._lock_alert(connection, alert_id)
+            self._append_record(connection, record)
             connection.execute(
                 update(alert_delivery_attempt)
                 .where(
@@ -278,33 +281,7 @@ class SqlAlertService:
             raise ValueError("maximum_attempts must be positive")
         delivered: list[str] = []
         failed: list[str] = []
-        with self.engine.connect() as connection:
-            attempts = (
-                connection.execute(
-                    select(alert_delivery_attempt).order_by(
-                        alert_delivery_attempt.c.attempt_no,
-                        alert_delivery_attempt.c.id,
-                    )
-                )
-                .mappings()
-                .all()
-            )
-        latest: dict[tuple[str, str], Mapping[str, Any]] = {}
-        for row in attempts:
-            key = (str(row["alert_id"]), str(row["sink"]))
-            latest[key] = row
-        rows = tuple(
-            row
-            for row in latest.values()
-            if (
-                row["status"] == "failed"
-                and row["next_attempt_at"] is not None
-                and str(row["next_attempt_at"]) <= now
-                and int(row["attempt_no"]) < maximum_attempts
-            )
-            or (row["status"] == "running" and str(row["attempted_at"]) <= _plus_seconds(now, -60))
-        )
-        for row in rows:
+        for row in self._pending_delivery_attempts(now, maximum_attempts):
             attempt_no = int(row["attempt_no"])
             source = self._get(str(row["alert_id"]))
             if source is None:
@@ -334,7 +311,12 @@ class SqlAlertService:
             if sink is None:
                 failed.append(str(row["alert_id"]))
                 continue
-            attempt_no = self._start_delivery_attempt(source, str(row["sink"]), now)
+            next_attempt = self._start_delivery_attempt(
+                source, str(row["sink"]), now, expected_attempt=attempt_no
+            )
+            if next_attempt is None:
+                continue
+            attempt_no = next_attempt
             try:
                 sink.send(source)
             except Exception as exc:
@@ -357,6 +339,40 @@ class SqlAlertService:
                     attempted_at=now,
                 )
         return AlertDelivery("delivery-retry", tuple(delivered), tuple(failed))
+
+    def _pending_delivery_attempts(self, now: str, maximum_attempts: int):
+        with self.engine.connect() as connection:
+            attempts = (
+                connection.execute(
+                    select(alert_delivery_attempt).order_by(
+                        alert_delivery_attempt.c.attempt_no,
+                        alert_delivery_attempt.c.id,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        latest: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for row in attempts:
+            key = (str(row["alert_id"]), str(row["sink"]))
+            latest[key] = row
+        return tuple(
+            row
+            for row in latest.values()
+            if row["acknowledged_at"] is None
+            and (
+                (
+                    row["status"] == "failed"
+                    and row["next_attempt_at"] is not None
+                    and str(row["next_attempt_at"]) <= now
+                    and int(row["attempt_no"]) < maximum_attempts
+                )
+                or (
+                    row["status"] == "running"
+                    and str(row["attempted_at"]) <= _plus_seconds(now, -60)
+                )
+            )
+        )
 
     def delivery_attempts(self, *, alert_id: str | None = None) -> tuple[dict[str, Any], ...]:
         with self.engine.connect() as connection:
@@ -394,21 +410,29 @@ class SqlAlertService:
         return _record_from_payload(dict(payload)) if payload is not None else None
 
     def _append(self, record: AlertRecord) -> None:
-        payload = record.to_dict()
         with self.engine.begin() as connection:
-            existing = connection.execute(
-                select(alert.c.payload).where(alert.c.id == record.alert_id)
-            ).scalar_one_or_none()
-            if existing is not None:
-                if dict(existing) != payload:
-                    raise ValueError("alert identity collision")
-                return
+            self._append_record(connection, record)
+
+    @staticmethod
+    def _append_record(connection, record: AlertRecord) -> None:
+        payload = record.to_dict()
+        existing = connection.execute(
+            select(alert.c.payload).where(alert.c.id == record.alert_id)
+        ).scalar_one_or_none()
+        if existing is not None:
+            if dict(existing) != payload:
+                raise ValueError("alert identity collision")
+            return
+        connection.execute(
+            insert(alert).values(id=record.alert_id, created_at=record.emitted_at, payload=payload)
+        )
+
+    @staticmethod
+    def _lock_alert(connection, alert_id: str) -> None:
+        if connection.dialect.name == "postgresql":
             connection.execute(
-                insert(alert).values(
-                    id=record.alert_id,
-                    created_at=record.emitted_at,
-                    payload=payload,
-                )
+                text("SELECT pg_advisory_xact_lock(hashtext(:delivery_key))"),
+                {"delivery_key": f"alert-delivery:{alert_id}"},
             )
 
     def _append_delivery_failure(
@@ -445,20 +469,28 @@ class SqlAlertService:
         self._append(failure)
 
     def _start_delivery_attempt(
-        self, record: AlertRecord, sink_name: str, attempted_at: str
-    ) -> int:
+        self, record: AlertRecord, sink_name: str, attempted_at: str, *, expected_attempt: int = 0
+    ) -> int | None:
         with self.engine.begin() as connection:
-            if connection.dialect.name == "postgresql":
-                connection.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:delivery_key))"),
-                    {"delivery_key": f"alert-delivery:{record.alert_id}:{sink_name}"},
+            self._lock_alert(connection, record.alert_id)
+            acknowledged = connection.execute(
+                select(alert.c.id)
+                .where(
+                    alert.c.payload["event_type"].as_string() == "acknowledged",
+                    alert.c.payload["parent_alert_id"].as_string() == record.alert_id,
                 )
+                .limit(1)
+            ).first()
+            if acknowledged is not None:
+                return None
             current = connection.execute(
                 select(func.max(alert_delivery_attempt.c.attempt_no)).where(
                     alert_delivery_attempt.c.alert_id == record.alert_id,
                     alert_delivery_attempt.c.sink == sink_name,
                 )
             ).scalar_one()
+            if int(current or 0) != expected_attempt:
+                return None
             attempt_no = int(current or 0) + 1
             attempt_id = f"{record.alert_id}:{sink_name}:{attempt_no}"
             connection.execute(
@@ -502,7 +534,13 @@ class SqlAlertService:
                     status=status,
                     error=f"{type(error).__name__}: {error}" if error else None,
                     next_attempt_at=next_attempt,
-                    acknowledged_at=attempted_at if status == "delivered" else None,
+                    acknowledged_at=func.coalesce(
+                        alert_delivery_attempt.c.acknowledged_at,
+                        literal(
+                            attempted_at if status == "delivered" else None,
+                            type_=alert_delivery_attempt.c.acknowledged_at.type,
+                        ),
+                    ),
                 )
             )
 

@@ -475,9 +475,82 @@ def _candidate(database, bundle):
     return candidate
 
 
+def test_registered_strategy_preflight_classifies_missing_inputs_and_empty_presets() -> None:
+    from src.research.executors import (
+        DataUnavailableError,
+        UnsupportedExecutorError,
+        execute_registered_python,
+    )
+
+    template = registered_strategy_candidates(
+        product="active_income",
+        dataset_snapshot_hashes=("sha256:" + "a" * 64,),
+        instrument_universe=("BTCUSDT",),
+        submitted_at=NOW,
+    )[0]
+    cases = (
+        (
+            "fear_greed_contrarian",
+            {
+                "extreme_fear": 25,
+                "extreme_greed": 75,
+                "column": "fear_greed",
+                "allow_short": True,
+            },
+            DataUnavailableError,
+        ),
+        (
+            "regime_filter",
+            {
+                "strategy": "sma_cross",
+                "regime_ids": [0],
+                "regime_column": "tf_1d_regime_id",
+                "child_params": None,
+            },
+            DataUnavailableError,
+        ),
+        (
+            "regime_filter",
+            {
+                "strategy": "sma_cross",
+                "regime_ids": "",
+                "regime_column": "tf_1d_regime_id",
+                "child_params": None,
+            },
+            UnsupportedExecutorError,
+        ),
+        ("condition_grid", {"conditions": [], "direction": "long"}, UnsupportedExecutorError),
+    )
+    context = {
+        "market_frame": [
+            {
+                "instrument_id": "binance:futures:BTCUSDT:USDT",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 10.0,
+            }
+        ]
+    }
+
+    for name, parameters, expected_error in cases:
+        definition = replace(
+            template.definition,
+            signal_model={
+                "registered_strategy": name,
+                "parameters": parameters,
+                "behaviour_contract": "registered_strategy/v1",
+            },
+        )
+        candidate = replace(template, definition=definition)
+
+        with pytest.raises(expected_error):
+            execute_registered_python(candidate, context)
+
+
 def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from unittest.mock import Mock
 
     from sqlalchemy import func
 
@@ -495,18 +568,76 @@ def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, mon
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'blocked-data.sqlite3'}")
     database.create_schema()
     bundle = _bundle(database)
-    initial = _candidate(database, bundle)
+    from src.research.catalogue import (
+        registered_strategy_provenance,
+    )
+
+    theses = registered_strategy_theses(product="active_income", instrument_universe=("BTCUSDT",))
+    template = next(
+        item
+        for item in registered_strategy_candidates(
+            product="active_income",
+            instrument_universe=("BTCUSDT",),
+            dataset_snapshot_hashes=tuple(bundle.stage_snapshot_ids.values()),
+            submitted_at=NOW,
+            dataset_bundle_id=bundle.bundle_id,
+            universe_snapshot_id=bundle.universe_snapshot_id,
+        )
+        if item.definition.identity == "sma_cross"
+    )
+    dataset_plan = CandidateDatasetPlan.from_bundle(bundle)
+    sentiment_name = "fear_greed_contrarian"
+    sentiment_provenance = registered_strategy_provenance(sentiment_name)
+    sentiment_definition = replace(
+        template.definition,
+        identity=sentiment_name,
+        family="mean_reversion",
+        feature_graph={"version": "canonical-features/v2", "required_nodes": ["sentiment"]},
+        signal_model={
+            "registered_strategy": sentiment_name,
+            "parameters": {
+                "extreme_fear": 25,
+                "extreme_greed": 75,
+                "column": "fear_greed",
+                "allow_short": True,
+            },
+            "behaviour_contract": "registered_strategy/v1",
+        },
+        validation_policy={"evidence_type": "intraday"},
+        source_hash=str(sentiment_provenance["source_hash"]),
+        metadata={
+            **dict(template.definition.metadata),
+            "description": "Long on extreme fear, short on extreme greed.",
+            "manifest_family": "mean_reversion",
+            "source_provenance": sentiment_provenance,
+        },
+    )
+    initial = replace(
+        template,
+        definition=sentiment_definition,
+        thesis_id=theses[sentiment_name].thesis_id,
+        lineage_id=canonical_hash(
+            {"thesis_id": theses[sentiment_name].thesis_id, "root": sentiment_name}
+        ),
+        dataset_plan=dataset_plan,
+    )
     next_candidate = replace(
-        initial,
+        template,
         definition=replace(
-            initial.definition,
+            template.definition,
             signal_model={
-                **dict(initial.definition.signal_model),
+                **dict(template.definition.signal_model),
                 "parameters": {"fast": 3, "slow": 6, "allow_short": True},
             },
         ),
+        dataset_plan=dataset_plan,
     )
-    ResearchCoordinator(SqlResearchStore(database.engine)).submit(next_candidate)
+    registry = SqlThesisRegistry(database.engine)
+    for thesis_name in (sentiment_name, "sma_cross"):
+        registry.register(theses[thesis_name])
+    coordinator = ResearchCoordinator(SqlResearchStore(database.engine))
+    coordinator.submit(initial)
+    coordinator.submit(next_candidate)
 
     configuration = load_split_configuration(Path(__file__).resolve().parents[1] / "config")
     product = next(
@@ -547,27 +678,24 @@ def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, mon
     with database.engine.connect() as connection:
         scheduled_jobs = (
             connection.execute(
-                select(job.c.id, job.c.payload)
+                select(job.c.id, job.c.payload, job.c.priority)
                 .where(job.c.name == "evaluate_candidate")
                 .order_by(job.c.id)
             )
             .mappings()
             .all()
         )
-    held_candidate_id = str(scheduled_jobs[0]["payload"]["candidate_id"])
-    continuing_candidate_id = str(scheduled_jobs[1]["payload"]["candidate_id"])
-    assert {held_candidate_id, continuing_candidate_id} == {
-        initial.candidate_id,
-        next_candidate.candidate_id,
-    }
-    held_job_id = str(scheduled_jobs[0]["id"])
-    original_executor = handlers.executors._executors[initial.definition.source_type]
-    unavailable_executor = Mock(
-        side_effect=DataUnavailableError("frozen futures inputs cannot order stop and funding")
-    )
-    monkeypatch.setitem(
-        handlers.executors._executors, initial.definition.source_type, unavailable_executor
-    )
+    scheduled_by_candidate = {str(item["payload"]["candidate_id"]): item for item in scheduled_jobs}
+    held_candidate_id = initial.candidate_id
+    continuing_candidate_id = next_candidate.candidate_id
+    assert set(scheduled_by_candidate) == {held_candidate_id, continuing_candidate_id}
+    held_record = scheduled_by_candidate[held_candidate_id]
+    held_job_id = str(held_record["id"])
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE job SET priority = 100 WHERE id = :job_id"),
+            {"job_id": held_job_id},
+        )
 
     blocked = worker.run_once(now=NOW)
     assert blocked["reason_code"] == "research_job_completed"
@@ -575,7 +703,11 @@ def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, mon
     assert blocked["outcome_category"] == "blocked_data"
     assert blocked["deferred"] is True
     assert "_defer" not in blocked
-    assert unavailable_executor.call_count == 1
+    with database.engine.begin() as connection:
+        connection.execute(
+            text("UPDATE job SET priority = :priority WHERE id = :job_id"),
+            {"job_id": held_job_id, "priority": held_record["priority"]},
+        )
 
     with database.engine.connect() as connection:
         held_state, held_metadata = connection.execute(
@@ -611,7 +743,6 @@ def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, mon
     later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=1)).isoformat()
     second_schedule = scheduler.run_once(now=later)
     assert second_schedule["jobs_enqueued"] == 0
-    unavailable_executor.assert_called_once()
     with database.engine.connect() as connection:
         assert (
             connection.execute(
@@ -623,14 +754,13 @@ def test_blocked_data_evaluation_completes_and_waits_for_new_input(tmp_path, mon
         )
         assert (
             connection.execute(
-                select(job.c.state).where(job.c.id == str(scheduled_jobs[1]["id"]))
+                select(job.c.state).where(
+                    job.c.id == str(scheduled_by_candidate[continuing_candidate_id]["id"])
+                )
             ).scalar_one()
             == "pending"
         )
 
-    monkeypatch.setitem(
-        handlers.executors._executors, initial.definition.source_type, original_executor
-    )
     continued = worker.run_once(now=later)
     assert continued["reason_code"] == "research_job_completed"
     assert continued["candidate_id"] == continuing_candidate_id

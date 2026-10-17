@@ -128,13 +128,23 @@ class DatabaseHeartbeatStore:
                 )
         return ServiceHealth(service_name, node_id, observed_at, bool(healthy), stored_payload)
 
-    def latest(self) -> tuple[ServiceHealth, ...]:
+    def latest(self, *, include_payload: bool = True) -> tuple[ServiceHealth, ...]:
+        columns = (
+            service_heartbeat.c.service_name,
+            service_heartbeat.c.node_id,
+            service_heartbeat.c.observed_at,
+            service_heartbeat.c.healthy,
+        )
+        statement = select(
+            *columns,
+            *([service_heartbeat.c.payload] if include_payload else []),
+        ).order_by(
+            service_heartbeat.c.observed_at.desc(),
+            service_heartbeat.c.healthy.asc(),
+            service_heartbeat.c.id.desc(),
+        )
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(service_heartbeat).order_by(
-                    service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc()
-                )
-            ).mappings()
+            rows = connection.execute(statement).mappings()
             latest_by_service: dict[tuple[str, str], ServiceHealth] = {}
             for row in rows:
                 key = (row["node_id"], row["service_name"])
@@ -144,7 +154,7 @@ class DatabaseHeartbeatStore:
                         node_id=row["node_id"],
                         observed_at=row["observed_at"],
                         healthy=bool(row["healthy"]),
-                        payload=dict(row["payload"]),
+                        payload=dict(row["payload"]) if include_payload else {},
                     )
         return tuple(latest_by_service[key] for key in sorted(latest_by_service))
 

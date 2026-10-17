@@ -9,7 +9,7 @@ import inspect
 import subprocess
 import sys
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,6 +31,36 @@ from src.strategies.manifest import (
     registered_feature_contract,
 )
 from src.strategies.registry import available, describe, get
+
+_REGISTERED_CATALOGUE_EXCLUSIONS = {
+    "fear_greed_contrarian": {
+        "eligible": False,
+        "reason_code": "historical_sentiment_not_declared_by_data_plan",
+        "required_market_frame_columns": ("fear_greed",),
+    },
+    "regime_filter": {
+        "eligible": False,
+        "reason_code": "regime_feature_and_default_ids_not_predeclared",
+        "required_market_frame_columns": ("tf_1d_regime_id",),
+    },
+}
+
+
+def registered_strategy_catalogue_eligibility(
+    name: str, *, parameters: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Describe whether a registered preset fits the frozen OHLCV catalogue."""
+
+    exclusion = _REGISTERED_CATALOGUE_EXCLUSIONS.get(name)
+    if exclusion is not None:
+        return dict(exclusion)
+    if name == "condition_grid" and not (parameters or {}).get("conditions"):
+        return {
+            "eligible": False,
+            "reason_code": "default_condition_grid_has_no_conditions",
+            "required_parameters": ("conditions",),
+        }
+    return {"eligible": True, "reason_code": "canonical_ohlcv_inputs_available"}
 
 
 def registered_strategy_theses(
@@ -200,6 +230,35 @@ def registered_strategy_candidates(
     dataset_bundle_id: str | None = None,
     universe_snapshot_id: str | None = None,
 ) -> tuple[Candidate, ...]:
+    """Return only candidates whose default presets fit canonical data inputs."""
+
+    candidates = _registered_strategy_candidates(
+        product=product,
+        dataset_snapshot_hashes=dataset_snapshot_hashes,
+        instrument_universe=instrument_universe,
+        submitted_at=submitted_at,
+        dataset_bundle_id=dataset_bundle_id,
+        universe_snapshot_id=universe_snapshot_id,
+    )
+    return tuple(
+        candidate
+        for candidate in candidates
+        if registered_strategy_catalogue_eligibility(
+            candidate.definition.identity,
+            parameters=candidate.definition.signal_model.get("parameters"),
+        )["eligible"]
+    )
+
+
+def _registered_strategy_candidates(
+    *,
+    product: str,
+    dataset_snapshot_hashes: Iterable[str],
+    instrument_universe: Iterable[str] = ("BTCUSDT",),
+    submitted_at: str | None = None,
+    dataset_bundle_id: str | None = None,
+    universe_snapshot_id: str | None = None,
+) -> tuple[Candidate, ...]:
     """Create common-contract candidates for every registered strategy.
 
     Parameter search remains a research concern. This adapter prevents the
@@ -315,7 +374,7 @@ def registered_strategy_candidate_page(
 ) -> tuple[tuple[Candidate, ...], int, bool]:
     if cursor < 0 or limit < 1:
         raise ValueError("catalogue cursor must be non-negative and page limit positive")
-    candidates = registered_strategy_candidates(
+    candidates = _registered_strategy_candidates(
         product=product,
         dataset_snapshot_hashes=dataset_snapshot_hashes,
         instrument_universe=instrument_universe,
@@ -326,7 +385,15 @@ def registered_strategy_candidate_page(
     ordered = _round_robin_candidates(candidates)
     start = min(cursor, len(ordered))
     end = min(start + limit, len(ordered))
-    return ordered[start:end], end, end == len(ordered)
+    page = tuple(
+        candidate
+        for candidate in ordered[start:end]
+        if registered_strategy_catalogue_eligibility(
+            candidate.definition.identity,
+            parameters=candidate.definition.signal_model.get("parameters"),
+        )["eligible"]
+    )
+    return page, end, end == len(ordered)
 
 
 def _round_robin_candidates(candidates: tuple[Candidate, ...]) -> tuple[Candidate, ...]:

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 
 from src.data.database import PlatformDatabase, alert
+from src.observability.reports import DatabasePlatformReport
 from src.services.alerting import AlertSeverity, SqlAlertService
 
 FIRST = "2026-08-31T10:00:00+00:00"
@@ -113,5 +114,74 @@ def test_failed_external_delivery_is_visible_without_recursive_delivery(tmp_path
         failure = next(item for item in events if item.event_type == "delivery_failed")
         assert failure.payload["parent_alert_id"] == result.alert_id
         assert "url" not in str(failure.payload).lower()
+        reports = DatabasePlatformReport(database.engine)
+        assert reports.build(now=FIRST)["operations"]["alert_delivery_failure_count"] == 1
+        sink.fail = False
+        service.deliver_pending(now=AFTER)
+        assert len(sink.records) == 1
+        assert reports.build(now=AFTER)["operations"]["alert_delivery_failure_count"] == 0
+        assert any(item.event_type == "delivery_failed" for item in service.events())
+    finally:
+        database.dispose()
+
+
+def test_acknowledged_delivery_failure_is_not_retried_or_reported(tmp_path) -> None:
+    sink = FakeSink(fail=True)
+    database, service = _service(tmp_path, sink)
+    try:
+        result = service.emit(
+            event_type="protective_stop_failed",
+            severity="critical",
+            dedupe_key="stop:acknowledged",
+            message="protective stop placement failed",
+            emitted_at=FIRST,
+        )
+        service.acknowledge(
+            alert_id=result.alert_id, acknowledged_by="operator", acknowledged_at=WITHIN
+        )
+        sink.fail = False
+        service.deliver_pending(now=AFTER)
+        assert not sink.records
+        assert len(service.delivery_attempts(alert_id=result.alert_id)) == 1
+        report = DatabasePlatformReport(database.engine).build(now=AFTER)
+        assert report["operations"]["alert_delivery_failure_count"] == 0
+        assert any(item.event_type == "delivery_failed" for item in service.events())
+    finally:
+        database.dispose()
+
+
+def test_acknowledgement_survives_an_in_flight_delivery_failure(tmp_path) -> None:
+    sink = FakeSink(fail=True)
+    database, service = _service(tmp_path, sink)
+    try:
+        result = service.emit(
+            event_type="protective_stop_failed",
+            severity="critical",
+            dedupe_key="stop:in-flight",
+            message="protective stop placement failed",
+            emitted_at=FIRST,
+        )
+        attempt = service._start_delivery_attempt(result, sink.name, AFTER, expected_attempt=1)
+        assert attempt == 2
+        assert service._start_delivery_attempt(result, sink.name, AFTER, expected_attempt=1) is None
+        service.acknowledge(
+            alert_id=result.alert_id, acknowledged_by="operator", acknowledged_at=AFTER
+        )
+        service._finish_delivery_attempt(
+            result,
+            sink.name,
+            attempt_no=attempt,
+            status="failed",
+            attempted_at=AFTER,
+            error=OSError("delivery failed after acknowledgement"),
+        )
+        assert service.delivery_attempts(alert_id=result.alert_id)[-1]["acknowledged_at"] == AFTER
+        assert service._start_delivery_attempt(result, sink.name, AFTER, expected_attempt=2) is None
+        sink.fail = False
+        service.deliver_pending(now="2026-08-31T11:00:00+00:00")
+        assert not sink.records
+        assert len(service.delivery_attempts(alert_id=result.alert_id)) == 2
+        report = DatabasePlatformReport(database.engine).build(now=AFTER)
+        assert report["operations"]["alert_delivery_failure_count"] == 0
     finally:
         database.dispose()

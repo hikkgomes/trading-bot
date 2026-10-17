@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import insert, select
@@ -20,11 +24,37 @@ from src.data.database import control_event
 from src.domain._codec import json_value, non_empty, timestamp, to_primitive
 from src.observability.reports import read_persisted_platform_report
 from src.services.alerting import AlertSeverity, SqlAlertService
+from src.services.config import PLATFORM_PROCESS_SERVICES
 from src.services.health import DatabaseHeartbeatStore
 from src.services.scheduler import DatabaseJobQueue
 
 if TYPE_CHECKING:
     from src.services.agent_transport import AgentReviewTransport
+
+_HEALTHZ_CACHE_SECONDS = 5.0
+_HEALTHZ_FRESHNESS_SECONDS = 60.0
+_HEALTHZ_PROCESS_GROUPS = (
+    "market-gateway",
+    "data-writer",
+    "trading-runtime",
+    "scheduler-operations",
+)
+_HEALTHZ_REQUIRED_SERVICES = tuple(
+    sorted(
+        {
+            service
+            for group in _HEALTHZ_PROCESS_GROUPS
+            for service in PLATFORM_PROCESS_SERVICES[group]
+            if service != "report-worker"
+        }
+        | {"research-worker", "evaluation-worker"}
+    )
+)
+_HEALTHZ_REPORT_REASONS = {
+    "missing": "report_missing",
+    "stale": "report_stale",
+    "invalid": "report_invalid",
+}
 
 
 @dataclass(frozen=True)
@@ -59,6 +89,43 @@ class DatabaseControlPlane:
         self.configuration = json_value(configuration or {}, field="control configuration")
         self.alerts = alerts
         self.report_root = Path(report_root) if report_root is not None else None
+        self._healthz_lock = threading.Lock()
+        self._healthz_cache: dict[str, Any] | None = None
+        self._healthz_cached_at = 0.0
+        self._healthz_cached_node_id: str | None = None
+
+    def healthz(self, *, node_id: str, now: str | None = None) -> dict[str, Any]:
+        with self._healthz_lock:
+            current = monotonic()
+            if (
+                self._healthz_cache is not None
+                and self._healthz_cached_node_id == node_id
+                and current - self._healthz_cached_at < _HEALTHZ_CACHE_SECONDS
+            ):
+                return _copy_healthz_result(self._healthz_cache)
+            try:
+                checked_at = timestamp(now or datetime.now(UTC).isoformat(), field="checked_at")
+                result = self._build_healthz(checked_at, node_id=node_id)
+            except Exception:
+                checked_at = timestamp(datetime.now(UTC).isoformat(), field="checked_at")
+                result = _healthz_result(
+                    checked_at,
+                    {"health_check_unavailable"},
+                    set(_HEALTHZ_REQUIRED_SERVICES),
+                )
+            self._healthz_cache = result
+            self._healthz_cached_at = monotonic()
+            self._healthz_cached_node_id = node_id
+            return _copy_healthz_result(result)
+
+    def _build_healthz(self, checked_at: str, *, node_id: str) -> dict[str, Any]:
+        current = datetime.fromisoformat(checked_at)
+        reasons, unhealthy_services = _heartbeat_health(
+            self.heartbeat_store, current=current, node_id=node_id
+        )
+        snapshot = read_persisted_platform_report(self.report_root, now=checked_at)
+        reasons.update(_report_health_reasons(snapshot))
+        return _healthz_result(checked_at, reasons, unhealthy_services)
 
     def set_paused(
         self,
@@ -391,9 +458,138 @@ def _control_target(target: str) -> str:
     return clean
 
 
+def _healthz_result(
+    checked_at: str, reason_codes: set[str], unhealthy_services: set[str]
+) -> dict[str, Any]:
+    return {
+        "schema": "platform.healthz/v1",
+        "ok": not reason_codes,
+        "checked_at": checked_at,
+        "reason_codes": sorted(reason_codes),
+        "unhealthy_services": sorted(unhealthy_services),
+    }
+
+
+def _copy_healthz_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        **dict(result),
+        "reason_codes": list(result["reason_codes"]),
+        "unhealthy_services": list(result["unhealthy_services"]),
+    }
+
+
+def _heartbeat_health(
+    store: DatabaseHeartbeatStore, *, current: datetime, node_id: str
+) -> tuple[set[str], set[str]]:
+    latest_by_service: dict[str, tuple[datetime, bool]] = {}
+    for heartbeat in store.latest(include_payload=False):
+        service = heartbeat.service_name
+        if heartbeat.node_id != node_id or service not in _HEALTHZ_REQUIRED_SERVICES:
+            continue
+        observed = datetime.fromisoformat(
+            timestamp(heartbeat.observed_at, field="heartbeat observed_at")
+        )
+        previous = latest_by_service.get(service)
+        if (
+            previous is None
+            or observed > previous[0]
+            or (observed == previous[0] and not heartbeat.healthy)
+        ):
+            latest_by_service[service] = (observed, heartbeat.healthy)
+
+    reasons: set[str] = set()
+    unhealthy_services: set[str] = set()
+    for service in _HEALTHZ_REQUIRED_SERVICES:
+        latest = latest_by_service.get(service)
+        if latest is None:
+            reasons.add("heartbeat_missing")
+            unhealthy_services.add(service)
+            continue
+        observed, healthy = latest
+        age = (current - observed).total_seconds()
+        if age < 0 or age > _HEALTHZ_FRESHNESS_SECONDS:
+            reasons.add("heartbeat_stale")
+            unhealthy_services.add(service)
+        elif not healthy:
+            reasons.add("heartbeat_unhealthy")
+            unhealthy_services.add(service)
+    return reasons, unhealthy_services
+
+
+def _report_health_reasons(snapshot: Mapping[str, Any]) -> set[str]:
+    status = snapshot.get("snapshot_status")
+    if status != "fresh":
+        return {_HEALTHZ_REPORT_REASONS.get(str(status), "report_invalid")}
+    report = snapshot.get("report")
+    operations = report.get("operations") if isinstance(report, Mapping) else None
+    if not isinstance(operations, Mapping):
+        return {"report_invalid"}
+    return _report_operations_health_reasons(operations)
+
+
+def _report_operations_health_reasons(operations: Mapping[str, Any]) -> set[str]:
+    reasons = _report_resource_reasons(operations)
+    slis = operations.get("slis")
+    if not isinstance(slis, Mapping):
+        reasons.add("report_invalid")
+        return reasons
+    reasons.update(_report_sli_reasons(operations, slis))
+    return reasons
+
+
+def _report_resource_reasons(operations: Mapping[str, Any]) -> set[str]:
+    reasons: set[str] = set()
+    for section, missing, invalid, unhealthy in (
+        ("backups", "backup_status_missing", "backup_status_invalid", "backup_unhealthy"),
+        ("disk", "disk_status_missing", "disk_status_invalid", "disk_unhealthy"),
+    ):
+        value = operations.get(section)
+        if value is None:
+            reasons.add(missing)
+        elif not isinstance(value, Mapping) or not isinstance(value.get("healthy"), bool):
+            reasons.add(invalid)
+        elif value["healthy"] is False:
+            reasons.add(unhealthy)
+    return reasons
+
+
+def _report_sli_reasons(operations: Mapping[str, Any], slis: Mapping[str, Any]) -> set[str]:
+    reasons: set[str] = set()
+    _add_count_reason(reasons, slis.get("unresolved_recovery_count"), "recovery_unresolved")
+    for name, reason in (
+        ("stale_account_authority", "account_authority_stale"),
+        ("stale_market_data", "market_data_stale"),
+        ("missing_risk_data", "risk_data_missing"),
+    ):
+        value = slis.get(name)
+        if not isinstance(value, Mapping):
+            reasons.add("report_invalid")
+        else:
+            _add_count_reason(reasons, value.get("count"), reason)
+    conflicts = slis.get("execution_authority_conflicts")
+    if not isinstance(conflicts, Mapping) or not isinstance(conflicts.get("conflict"), bool):
+        reasons.add("report_invalid")
+    elif conflicts["conflict"]:
+        reasons.add("execution_authority_conflict")
+    _add_count_reason(
+        reasons, operations.get("alert_delivery_failure_count"), "alert_delivery_failed"
+    )
+    return reasons
+
+
+def _add_count_reason(reasons: set[str], value: Any, reason: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        reasons.add("report_invalid")
+    elif value < 0:
+        reasons.add("report_invalid")
+    elif value > 0:
+        reasons.add(reason)
+
+
 class ControlHTTPServer(ThreadingHTTPServer):
     control_plane: DatabaseControlPlane
     bearer_token: str
+    node_id: str
     agent_transport: AgentReviewTransport | None = None
 
 
@@ -439,14 +635,25 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/healthz":
+            if not _is_loopback_peer(self.client_address):
+                self._reply(HTTPStatus.FORBIDDEN, {"reason_code": "loopback_only"})
+                return
+            server = cast(ControlHTTPServer, self.server)
+            response = server.control_plane.healthz(node_id=server.node_id)
+            self._reply(
+                HTTPStatus.OK if response["ok"] else HTTPStatus.SERVICE_UNAVAILABLE,
+                response,
+            )
+            return
         if not self._authorised():
             self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
             return
-        response = _get_route(cast(ControlHTTPServer, self.server).control_plane, self.path)
-        if response is None:
+        route_response = _get_route(cast(ControlHTTPServer, self.server).control_plane, self.path)
+        if route_response is None:
             self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
             return
-        self._reply(HTTPStatus.OK, response)
+        self._reply(HTTPStatus.OK, route_response)
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path in {"/agent/requests/next", "/agent/responses"}:
@@ -498,6 +705,7 @@ def build_control_server(
     server = ControlHTTPServer(bind, ControlRequestHandler)
     server.control_plane = control_plane
     server.bearer_token = bearer_token
+    server.node_id = node_id
     server.agent_transport = transport
     return server
 
@@ -528,6 +736,16 @@ def _get_route(control_plane: DatabaseControlPlane, path: str) -> dict[str, Any]
     }
     handler = routes.get(path)
     return handler() if handler is not None else None
+
+
+def _is_loopback_peer(address: tuple[str, int]) -> bool:
+    try:
+        peer = ipaddress.ip_address(address[0])
+    except ValueError:
+        return False
+    if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped is not None:
+        peer = peer.ipv4_mapped
+    return peer.is_loopback
 
 
 def _request_payload(handler: BaseHTTPRequestHandler) -> dict[str, Any]:

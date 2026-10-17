@@ -24,6 +24,7 @@ from src.data.database import (
     active_strategy_assignment,
     agent_action,
     alert,
+    alert_delivery_attempt,
     alpha_forecast,
     balance_snapshot,
     dataset_bundle,
@@ -1512,6 +1513,14 @@ class DatabasePlatformReport:
                 active_strategy_assignment.c.execution_mode == "live",
             ),
         )
+        newer_attempt = alert_delivery_attempt.alias("newer_delivery_attempt")
+        unresolved_delivery = ~exists(
+            select(newer_attempt.c.id).where(
+                newer_attempt.c.alert_id == alert_delivery_attempt.c.alert_id,
+                newer_attempt.c.sink == alert_delivery_attempt.c.sink,
+                newer_attempt.c.attempt_no > alert_delivery_attempt.c.attempt_no,
+            )
+        )
         operations = {
             "detail_limit": REPORT_DETAIL_LIMIT,
             "detail_counts": {
@@ -1520,7 +1529,10 @@ class DatabasePlatformReport:
                 "alerts": alert_count,
             },
             "alert_delivery_failure_count": self._count_where(
-                alert, alert.c.payload["event_type"].as_string() == "delivery_failed"
+                alert_delivery_attempt,
+                alert_delivery_attempt.c.status.in_(("failed", "dead_letter")),
+                alert_delivery_attempt.c.acknowledged_at.is_(None),
+                unresolved_delivery,
             ),
             "job_queue": jobs,
             "job_queue_detail_limit": REPORT_DETAIL_LIMIT,

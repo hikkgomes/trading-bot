@@ -872,7 +872,7 @@ def test_registered_catalogue_enters_the_common_research_contract():
         product="active_income", dataset_snapshot_hashes=("sha256:" + "a" * 64,)
     )
 
-    assert len(candidates) >= 22
+    assert len(candidates) >= 19
     assert {candidate.provider for candidate in candidates} == {"registered_strategy_catalogue"}
     assert all(
         candidate.definition.source_type.value == "registered_python" for candidate in candidates

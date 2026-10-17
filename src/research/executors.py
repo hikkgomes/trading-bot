@@ -9,6 +9,7 @@ putting metrics in a queue payload.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import statistics
 from collections.abc import Callable, Mapping, Sequence
@@ -2875,6 +2876,7 @@ def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) 
     frame = context.get("market_frame")
     if frame is None:
         raise ExecutorError("registered Python execution requires a canonical market_frame")
+    _validate_registered_market_frame_inputs(candidate, frame)
     try:
         behaviour = RegisteredStrategyBehaviour.from_definition(candidate.definition)
         parity = behaviour.parity_receipt(frame, warmup=context.get("warmup_market_frame", ()))
@@ -2895,6 +2897,64 @@ def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) 
         },
         signals,
     )
+
+
+def _validate_registered_market_frame_inputs(candidate: Candidate, frame: Any) -> None:
+    signal_model = candidate.definition.signal_model
+    name = signal_model.get("registered_strategy")
+    parameters = signal_model.get("parameters")
+    parameters = parameters if isinstance(parameters, Mapping) else {}
+    column = None
+    if name == "regime_filter":
+        if _empty_regime_selection(parameters.get("regime_ids")):
+            raise UnsupportedExecutorError("registered regime_filter preset has no regime_ids")
+        column = str(parameters.get("regime_column") or "tf_1d_regime_id")
+    elif name == "fear_greed_contrarian":
+        column = str(parameters.get("column") or "fear_greed")
+    elif name == "condition_grid" and not parameters.get("conditions"):
+        raise UnsupportedExecutorError("registered condition_grid preset has no conditions")
+
+    if column is not None and not _market_frame_has_values(frame, column):
+        raise DataUnavailableError(f"registered strategy input column is unavailable: {column}")
+
+
+def _empty_regime_selection(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        selected = value.strip()
+        if not selected:
+            return True
+        if selected.startswith("["):
+            try:
+                return not bool(json.loads(selected))
+            except json.JSONDecodeError:
+                return False
+        return not any(part.strip() for part in selected.split(","))
+    return isinstance(value, Sequence | set | frozenset) and not value
+
+
+def _market_frame_has_values(frame: Any, column: str) -> bool:
+    columns = getattr(frame, "columns", None)
+    if columns is not None:
+        if column not in columns:
+            return False
+        values = frame[column]
+        notna = getattr(values, "notna", None)
+        return bool(notna().any()) if callable(notna) else True
+    if not isinstance(frame, list | tuple):
+        return False
+    for row in frame:
+        if not isinstance(row, Mapping):
+            continue
+        value = row.get(column)
+        if value is None:
+            continue
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            if not math.isfinite(float(value)):
+                continue
+        return True
+    return False
 
 
 def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:

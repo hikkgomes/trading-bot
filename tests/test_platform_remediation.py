@@ -612,6 +612,41 @@ def test_active_income_registered_time_series_candidates_are_symbol_isolated() -
     )
 
 
+def test_registered_catalogue_excludes_unbound_default_presets() -> None:
+    from src.research.catalogue import registered_strategy_catalogue_eligibility
+
+    candidates = registered_strategy_candidates(
+        product="active_income",
+        dataset_snapshot_hashes=("sha256:" + "1" * 64,),
+        instrument_universe=("BTCUSDT",),
+    )
+    names = {candidate.definition.identity for candidate in candidates}
+
+    assert "sma_cross" in names
+    assert not names.intersection({"fear_greed_contrarian", "regime_filter", "condition_grid"})
+    assert registered_strategy_catalogue_eligibility("fear_greed_contrarian") == {
+        "eligible": False,
+        "reason_code": "historical_sentiment_not_declared_by_data_plan",
+        "required_market_frame_columns": ("fear_greed",),
+    }
+    assert registered_strategy_catalogue_eligibility("regime_filter") == {
+        "eligible": False,
+        "reason_code": "regime_feature_and_default_ids_not_predeclared",
+        "required_market_frame_columns": ("tf_1d_regime_id",),
+    }
+    assert registered_strategy_catalogue_eligibility("condition_grid") == {
+        "eligible": False,
+        "reason_code": "default_condition_grid_has_no_conditions",
+        "required_parameters": ("conditions",),
+    }
+    assert (
+        registered_strategy_catalogue_eligibility(
+            "condition_grid", parameters={"conditions": [{"feature": "bar_return"}]}
+        )["eligible"]
+        is True
+    )
+
+
 def test_strategy_universe_rejects_legacy_and_wrong_btc_scope() -> None:
     definition = registered_strategy_candidates(
         product="btc_accumulation",

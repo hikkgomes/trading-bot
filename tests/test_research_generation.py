@@ -269,8 +269,9 @@ def test_catalogue_pages_round_robin_families_and_symbols() -> None:
         limit=12,
         submitted_at=NOW,
     )
-    assert len(first) == len(second) == 12
-    assert len({item.candidate_id for item in (*first, *second)}) == 24
+    assert 0 < len(first) <= 12
+    assert 0 < len(second) <= 12
+    assert len({item.candidate_id for item in (*first, *second)}) == len(first) + len(second)
     assert (
         len(
             {
@@ -284,8 +285,43 @@ def test_catalogue_pages_round_robin_families_and_symbols() -> None:
         >= 6
     )
     assert len({str(item.definition.universe["symbols"][0]) for item in first}) == 3
+    assert cursor == 12
+    assert next_cursor == 24
     assert not first_closed and next_cursor > cursor
     assert isinstance(second_closed, bool)
+
+
+def test_catalogue_resume_cursor_keeps_filtered_raw_slots() -> None:
+    from src.research.catalogue import (
+        _registered_strategy_candidates,
+        _round_robin_candidates,
+        registered_strategy_catalogue_eligibility,
+    )
+
+    arguments = {
+        "product": "active_income",
+        "dataset_snapshot_hashes": (canonical_hash({"snapshot": "catalogue-resume"}),),
+        "instrument_universe": ("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+        "submitted_at": NOW,
+    }
+    raw_candidates = _round_robin_candidates(_registered_strategy_candidates(**arguments))
+    for cursor in (3, 9):
+        limit = 6
+        expected = tuple(
+            candidate.candidate_id
+            for candidate in raw_candidates[cursor : cursor + limit]
+            if registered_strategy_catalogue_eligibility(
+                candidate.definition.identity,
+                parameters=candidate.definition.signal_model.get("parameters"),
+            )["eligible"]
+        )
+        page, next_cursor, closed = registered_strategy_candidate_page(
+            **arguments, cursor=cursor, limit=limit
+        )
+
+        assert tuple(candidate.candidate_id for candidate in page) == expected
+        assert next_cursor == min(cursor + limit, len(raw_candidates))
+        assert closed is (next_cursor == len(raw_candidates))
 
 
 def test_registration_reserves_catalogue_and_total_epoch_capacity(tmp_path) -> None:

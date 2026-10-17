@@ -525,6 +525,408 @@ def test_openclaw_http_transport_compiles_a_candidate_into_the_normal_queue(
     )
 
 
+def test_healthz_is_loopback_minimal_and_keeps_operator_routes_authenticated(
+    tmp_path, monkeypatch, capsys
+):
+    from unittest.mock import Mock
+
+    from scripts.check_platform_health import main as health_check_main
+    from src.data.atomic import write_json_atomic
+    from src.services.config import PLATFORM_PROCESS_SERVICES
+    from src.services.control_api import _is_loopback_peer
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'healthz-healthy.sqlite3'}")
+    database.create_schema()
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+    heartbeats = DatabaseHeartbeatStore(database.engine)
+    required_services = {
+        service
+        for group in ("market-gateway", "data-writer", "trading-runtime", "scheduler-operations")
+        for service in PLATFORM_PROCESS_SERVICES[group]
+        if service != "report-worker"
+    } | {"research-worker", "evaluation-worker"}
+    for service in required_services:
+        heartbeats.record(
+            service_name=service,
+            node_id="local",
+            observed_at=now,
+            healthy=True,
+            payload={"private_marker": "must-not-appear"},
+        )
+    latest = Mock(wraps=heartbeats.latest)
+    monkeypatch.setattr(heartbeats, "latest", latest)
+    report_root = tmp_path / "runtime" / "reports"
+    report_root.mkdir(parents=True)
+    write_json_atomic(
+        report_root / "latest.json",
+        {
+            "schema": "platform.operator_report/v1",
+            "generated_at": now,
+            "trading": {},
+            "research": {},
+            "products": {},
+            "operations": {
+                "disk": {"healthy": True},
+                "backups": {"healthy": True},
+                "alert_delivery_failure_count": 0,
+                "slis": {
+                    "unresolved_recovery_count": 0,
+                    "stale_account_authority": {"count": 0},
+                    "stale_market_data": {"count": 0},
+                    "missing_risk_data": {"count": 0},
+                    "execution_authority_conflicts": {"conflict": False},
+                },
+            },
+        },
+    )
+    server = build_control_server(
+        bind=("127.0.0.1", 0),
+        control_plane=DatabaseControlPlane(database.engine, heartbeats, report_root=report_root),
+        bearer_token="operator-health-test-token",
+        node_id="local",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/healthz"
+    try:
+        with urlopen(url, timeout=2) as response:
+            assert response.status == 200
+            body = response.read().decode()
+        payload = json.loads(body)
+        assert set(payload) == {
+            "schema",
+            "ok",
+            "checked_at",
+            "reason_codes",
+            "unhealthy_services",
+        }
+        assert payload["schema"] == "platform.healthz/v1"
+        assert payload["ok"] is True
+        assert payload["unhealthy_services"] == []
+        assert "must-not-appear" not in body
+        assert latest.call_count == 1
+        assert latest.call_args.kwargs == {"include_payload": False}
+
+        assert health_check_main(["--url", url]) == 0
+        assert capsys.readouterr().out == "NO_REPLY\n"
+        assert latest.call_count == 1
+        for path in ("/health", "/status", "/reports", "/configuration", "/agent/reviews"):
+            with pytest.raises(HTTPError) as denied:
+                urlopen(f"http://127.0.0.1:{server.server_port}{path}", timeout=2)
+            assert denied.value.code == 401
+        mutation = Request(
+            f"http://127.0.0.1:{server.server_port}/pause",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as denied:
+            urlopen(mutation, timeout=2)
+        assert denied.value.code == 401
+        assert _is_loopback_peer(("127.0.0.1", 0)) is True
+        assert _is_loopback_peer(("203.0.113.1", 0)) is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        database.dispose()
+
+
+def test_heartbeat_same_time_tie_prefers_unhealthy_record(tmp_path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'heartbeat-tie.sqlite3'}")
+    database.create_schema()
+    store = DatabaseHeartbeatStore(database.engine)
+    observed_at = "2026-08-30T00:00:00+00:00"
+    store.record(
+        service_name="research-worker",
+        node_id="fixture",
+        observed_at=observed_at,
+        healthy=True,
+        payload={"state": "healthy"},
+    )
+    store.record(
+        service_name="research-worker",
+        node_id="fixture",
+        observed_at=observed_at,
+        healthy=False,
+        payload={"state": "unhealthy"},
+    )
+
+    latest = store.latest()
+
+    assert len(latest) == 1
+    assert latest[0].healthy is False
+    assert latest[0].payload == {"state": "unhealthy"}
+    database.dispose()
+
+
+def test_healthz_fails_on_stale_inputs_critical_slis_and_missing_status(tmp_path, capsys):
+    from scripts.check_platform_health import main as health_check_main
+    from src.data.atomic import write_json_atomic
+    from src.services.config import PLATFORM_PROCESS_SERVICES
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'healthz-failures.sqlite3'}")
+    database.create_schema()
+    now_dt = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    now = now_dt.isoformat()
+    heartbeat_store = DatabaseHeartbeatStore(database.engine)
+    required_services = {
+        service
+        for group in ("market-gateway", "data-writer", "trading-runtime", "scheduler-operations")
+        for service in PLATFORM_PROCESS_SERVICES[group]
+        if service != "report-worker"
+    } | {"research-worker", "evaluation-worker"}
+    for service in required_services:
+        if service == "research-worker":
+            continue
+        observed_at = now
+        if service == "portfolio-engine":
+            observed_at = (now_dt - dt.timedelta(seconds=61)).isoformat()
+        heartbeat_store.record(
+            service_name=service,
+            node_id="local",
+            observed_at=observed_at,
+            healthy=service != "evaluation-worker",
+        )
+    heartbeat_store.record(
+        service_name="research-worker",
+        node_id="remote",
+        observed_at=now,
+        healthy=True,
+    )
+    report_root = tmp_path / "runtime" / "reports"
+    report_root.mkdir(parents=True)
+    report = {
+        "schema": "platform.operator_report/v1",
+        "generated_at": now,
+        "trading": {},
+        "research": {},
+        "products": {},
+        "operations": {
+            "disk": {"healthy": False},
+            "backups": {"healthy": False},
+            "alert_delivery_failure_count": 0,
+            "slis": {
+                "unresolved_recovery_count": 0,
+                "stale_account_authority": {"count": 0},
+                "stale_market_data": {"count": 0},
+                "missing_risk_data": {"count": 1},
+                "execution_authority_conflicts": {"conflict": False},
+            },
+        },
+    }
+    destination = report_root / "latest.json"
+    write_json_atomic(destination, report)
+    server = build_control_server(
+        bind=("127.0.0.1", 0),
+        control_plane=DatabaseControlPlane(
+            database.engine, heartbeat_store, report_root=report_root
+        ),
+        bearer_token="operator-health-test-token",
+        node_id="local",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/healthz"
+    try:
+        with pytest.raises(HTTPError) as failed:
+            urlopen(url, timeout=2)
+        assert failed.value.code == 503
+        first = json.loads(failed.value.read())
+        assert {
+            "heartbeat_stale",
+            "heartbeat_missing",
+            "heartbeat_unhealthy",
+            "risk_data_missing",
+            "backup_unhealthy",
+            "disk_unhealthy",
+        }.issubset(first["reason_codes"])
+        assert first["unhealthy_services"] == [
+            "evaluation-worker",
+            "portfolio-engine",
+            "research-worker",
+        ]
+
+        stale_report = {
+            **report,
+            "generated_at": (now_dt - dt.timedelta(seconds=1_000)).isoformat(),
+        }
+        write_json_atomic(destination, stale_report)
+        server.control_plane = DatabaseControlPlane(
+            database.engine, heartbeat_store, report_root=report_root
+        )
+        with pytest.raises(HTTPError) as failed:
+            urlopen(url, timeout=2)
+        assert failed.value.code == 503
+        stale = json.loads(failed.value.read())
+        assert "report_stale" in stale["reason_codes"]
+        assert health_check_main(["--url", url]) == 1
+        assert capsys.readouterr().err == (
+            "Platform health check failed: report stale; service heartbeat missing; "
+            "service heartbeat stale; service unhealthy.\n"
+        )
+
+        incomplete_report = {
+            **report,
+            "operations": {
+                key: value
+                for key, value in report["operations"].items()
+                if key not in {"disk", "backups"}
+            },
+        }
+        write_json_atomic(destination, incomplete_report)
+        server.control_plane = DatabaseControlPlane(
+            database.engine, heartbeat_store, report_root=report_root
+        )
+        with pytest.raises(HTTPError) as failed:
+            urlopen(url, timeout=2)
+        assert failed.value.code == 503
+        incomplete = json.loads(failed.value.read())
+        assert {"backup_status_missing", "disk_status_missing"}.issubset(incomplete["reason_codes"])
+
+        negative_count_report = {
+            **report,
+            "operations": {
+                **report["operations"],
+                "slis": {
+                    **report["operations"]["slis"],
+                    "missing_risk_data": {"count": -1},
+                },
+            },
+        }
+        write_json_atomic(destination, negative_count_report)
+        server.control_plane = DatabaseControlPlane(
+            database.engine, heartbeat_store, report_root=report_root
+        )
+        with pytest.raises(HTTPError) as failed:
+            urlopen(url, timeout=2)
+        assert failed.value.code == 503
+        negative = json.loads(failed.value.read())
+        assert "report_invalid" in negative["reason_codes"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        database.dispose()
+
+
+def test_healthz_database_failure_is_sanitised_and_failure_cache_is_bounded(
+    tmp_path, monkeypatch, capsys
+):
+    from unittest.mock import Mock
+
+    from scripts.check_platform_health import main as health_check_main
+    from src.services.control_api import _HEALTHZ_REQUIRED_SERVICES
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'healthz-database-error.sqlite3'}")
+    heartbeats = DatabaseHeartbeatStore(database.engine)
+    failing_latest = Mock(side_effect=RuntimeError("private database error marker"))
+    monkeypatch.setattr(heartbeats, "latest", failing_latest)
+    server = build_control_server(
+        bind=("127.0.0.1", 0),
+        control_plane=DatabaseControlPlane(database.engine, heartbeats),
+        bearer_token="operator-health-test-token",
+        node_id="local",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/healthz"
+    try:
+        with pytest.raises(HTTPError) as failed:
+            urlopen(url, timeout=2)
+        assert failed.value.code == 503
+        first_body = failed.value.read().decode()
+        first = json.loads(first_body)
+        assert first["reason_codes"] == ["health_check_unavailable"]
+        assert first["unhealthy_services"] == list(_HEALTHZ_REQUIRED_SERVICES)
+        assert "private database error marker" not in first_body
+
+        with pytest.raises(HTTPError) as failed:
+            urlopen(url, timeout=2)
+        assert failed.value.code == 503
+        second_body = failed.value.read().decode()
+        assert json.loads(second_body) == first
+        assert failing_latest.call_count == 1
+        assert failing_latest.call_args.kwargs == {"include_payload": False}
+
+        assert health_check_main(["--url", url]) == 1
+        assert capsys.readouterr().err == (
+            "Platform health check failed: health check unavailable.\n"
+        )
+        assert failing_latest.call_count == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        database.dispose()
+
+
+def test_health_cli_rejects_remote_urls_and_oversized_responses(monkeypatch, capsys):
+    from unittest.mock import MagicMock, Mock
+
+    from scripts import check_platform_health
+
+    opener = Mock()
+    build_opener = Mock(return_value=opener)
+    monkeypatch.setattr(check_platform_health, "build_opener", build_opener)
+    assert check_platform_health.main(["--url", "http://203.0.113.1:8088/healthz"]) == 1
+    build_opener.assert_not_called()
+
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = b"x" * (check_platform_health.MAX_RESPONSE_BYTES + 1)
+    response.__enter__.return_value = response
+    opener.open.return_value = response
+    assert check_platform_health.main(["--url", "http://127.0.0.1:9999/healthz"]) == 1
+    opener.open.assert_called_once_with("http://127.0.0.1:9999/healthz", timeout=10)
+    response.read.assert_called_once_with(check_platform_health.MAX_RESPONSE_BYTES + 1)
+    response.read.reset_mock()
+    response.read.return_value = json.dumps(
+        {
+            "schema": "platform.healthz/v1",
+            "ok": False,
+            "reason_codes": ["private account details"],
+        }
+    ).encode()
+    assert check_platform_health.main(["--url", "http://127.0.0.1:9999/healthz"]) == 1
+    output = capsys.readouterr()
+    assert output.err == (
+        "Platform health check failed.\n"
+        "Platform health check failed.\n"
+        "Platform health check failed.\n"
+    )
+    assert "private account details" not in output.err
+
+
+def test_health_cli_does_not_follow_loopback_redirects(tmp_path, capsys):
+    from functools import partial
+    from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+    from scripts.check_platform_health import main as health_check_main
+
+    root = tmp_path / "redirect-server"
+    (root / "healthz").mkdir(parents=True)
+    (root / "healthz" / "index.html").write_text(
+        json.dumps({"schema": "platform.healthz/v1", "ok": True}), encoding="utf-8"
+    )
+    server = HTTPServer(
+        ("127.0.0.1", 0),
+        partial(SimpleHTTPRequestHandler, directory=str(root)),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/healthz"
+    try:
+        assert health_check_main(["--url", url]) == 1
+        output = capsys.readouterr()
+        assert output.out == ""
+        assert output.err.splitlines()[-1] == "Platform health check failed."
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_data_blocked_agent_job_resumes_with_a_later_bundle_without_spending_retries(
     tmp_path, monkeypatch
 ):
