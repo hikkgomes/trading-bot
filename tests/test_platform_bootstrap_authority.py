@@ -15,6 +15,7 @@ from src.data.binance_market import normalise_public_event
 from src.data.database import (
     PlatformDatabase,
     account_snapshot,
+    balance_snapshot,
     cost_model_manifest,
     feature_manifest,
     instrument,
@@ -976,6 +977,7 @@ def test_authenticated_reconciliation_detects_external_product_exposure(
                 "balances": {"USDT": 1_000.0},
                 "free_balances": {"USDT": 900.0},
                 "positions": {"binance:futures:BTCUSDT:USDT": 0.1},
+                "position_entry_prices": {"binance:futures:BTCUSDT:USDT": 100_000.0},
                 "regular_orders": [
                     {
                         "symbol": "BTCUSDT",
@@ -994,10 +996,13 @@ def test_authenticated_reconciliation_detects_external_product_exposure(
                 ],
                 "used_margin": 100.0,
                 "maintenance_margin": 10.0,
+                "account_equity": 1000.0,
+                "account_equity_asset": "USDT",
                 "used_margin_fraction": 0.1,
                 "liquidation_buffer_fraction": 0.99,
                 "account_mode": "one_way",
                 "unknown_exposure": {},
+                "environment": "testnet",
                 "account_state_known": True,
                 "account_state_authority": "authenticated_rest",
                 "account_fingerprint": cls.account_fingerprint,
@@ -1018,6 +1023,9 @@ def test_authenticated_reconciliation_detects_external_product_exposure(
             "futures": {
                 "account_id": "futures",
                 "market": "usdt_futures",
+                "environment": "testnet",
+                "quote_assets": ["USDT"],
+                "settlement_assets": ["USDT"],
                 "api_key_env": "TEST_BINANCE_KEY",
                 "api_secret_env": "TEST_BINANCE_SECRET",
             }
@@ -1035,6 +1043,23 @@ def test_authenticated_reconciliation_detects_external_product_exposure(
         "external_order:BTCUSDT:external-order": "open",
         "external_order:BTCUSDT:external-stop": "open",
     }
+    with database.engine.connect() as connection:
+        saved_account = connection.execute(
+            select(account_snapshot.c.payload).where(
+                account_snapshot.c.account_id == "futures",
+                account_snapshot.c.observed_at == NOW,
+            )
+        ).scalar_one()
+        saved_balance = connection.execute(
+            select(balance_snapshot.c.payload).where(balance_snapshot.c.created_at == NOW)
+        ).scalar_one()
+    assert saved_account == saved_balance
+    assert saved_account["environment"] == "testnet"
+    assert saved_account["account_equity"] == 1000.0
+    assert saved_account["account_equity_asset"] == "USDT"
+    assert saved_account["position_entry_prices"] == {"binance:futures:BTCUSDT:USDT": 100_000.0}
+    assert saved_account["account_fingerprint"] == Broker.account_fingerprint
+    database.dispose()
 
 
 def test_spot_account_snapshot_detects_assets_and_orders_outside_product_scope() -> None:
@@ -1069,6 +1094,9 @@ def test_spot_account_snapshot_detects_assets_and_orders_outside_product_scope()
     snapshot = broker.account_snapshot(expected_symbols=("BTCUSDT",))
 
     assert snapshot["positions"] == {"binance:spot:BTCUSDT": 0.1}
+    assert snapshot["environment"] == "testnet"
+    assert "account_equity" not in snapshot
+    assert "account_equity_asset" not in snapshot
     assert snapshot["unknown_exposure"] == {
         "asset:ETH": 2.0,
         "ETHUSDT:external-order": "open",
@@ -1086,6 +1114,7 @@ def test_futures_account_snapshot_uses_platform_instrument_identity() -> None:
                     "totalInitialMargin": "100",
                     "totalMaintMargin": "10",
                     "totalMarginBalance": "1000",
+                    "totalWalletBalance": "1000",
                 },
             }
 
@@ -1098,19 +1127,214 @@ def test_futures_account_snapshot_uses_platform_instrument_identity() -> None:
         exchange="binanceusdm",
         market_type="futures",
         api_key="test-key",
-        testnet=True,
+        testnet=False,
         quote_asset="USDT",
     )
     broker._client = Client()
     broker.list_account_futures_positions = lambda: (  # type: ignore[method-assign]
         FuturesPositionIdentity(symbol="BTC/USDT:USDT", qty=0.1, avg_price=100000.0),
+        FuturesPositionIdentity(symbol="ETH/USDT:USDT", qty=-2.0, avg_price=3500.0),
     )
+    broker.list_account_open_orders = lambda *, conditional: ()  # type: ignore[method-assign]
+
+    snapshot = broker.account_snapshot(expected_symbols=("BTCUSDT", "ETHUSDT"))
+
+    assert snapshot["positions"] == {
+        "binance:futures:BTCUSDT:USDT": 0.1,
+        "binance:futures:ETHUSDT:USDT": -2.0,
+    }
+    assert snapshot["position_entry_prices"] == {
+        "binance:futures:BTCUSDT:USDT": 100000.0,
+        "binance:futures:ETHUSDT:USDT": 3500.0,
+    }
+    assert snapshot["balances"]["USDT"] == 1000.0
+    assert snapshot["free_balances"]["USDT"] == 900.0
+    assert snapshot["account_equity"] == 1000.0
+    assert snapshot["account_equity_asset"] == "USDT"
+    assert snapshot["environment"] == "production"
+    assert snapshot["unknown_exposure"] == {}
+
+
+@pytest.mark.parametrize(
+    "wallet_cash,margin_balance,ccxt_total",
+    [("1000", "1100", 1100.0), ("1000", "900", 900.0)],
+)
+def test_futures_snapshot_separates_wallet_cash_from_unrealised_equity(
+    wallet_cash, margin_balance, ccxt_total
+) -> None:
+    class Client:
+        @staticmethod
+        def fetch_balance():
+            return {
+                "total": {"USDT": ccxt_total},
+                "free": {"USDT": 800.0},
+                "info": {
+                    "totalInitialMargin": "100",
+                    "totalMaintMargin": "10",
+                    "totalWalletBalance": wallet_cash,
+                    "totalMarginBalance": margin_balance,
+                },
+            }
+
+        @staticmethod
+        def fetch_position_mode():
+            return {"hedged": False}
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(exchange="binanceusdm", market_type="futures")
+    broker._client = Client()
+    broker.list_account_futures_positions = lambda: ()  # type: ignore[method-assign]
     broker.list_account_open_orders = lambda *, conditional: ()  # type: ignore[method-assign]
 
     snapshot = broker.account_snapshot(expected_symbols=("BTCUSDT",))
 
-    assert snapshot["positions"] == {"binance:futures:BTCUSDT:USDT": 0.1}
-    assert snapshot["unknown_exposure"] == {}
+    assert snapshot["balances"] == {"USDT": 1000.0}
+    assert snapshot["free_balances"] == {"USDT": 800.0}
+    assert snapshot["account_equity"] == float(margin_balance)
+
+
+@pytest.mark.parametrize("wallet_cash", [None, "nan", "-1"])
+def test_futures_snapshot_fails_closed_without_valid_native_wallet_cash(wallet_cash) -> None:
+    info = {
+        "totalInitialMargin": "100",
+        "totalMaintMargin": "10",
+        "totalMarginBalance": "1000",
+    }
+    if wallet_cash is not None:
+        info["totalWalletBalance"] = wallet_cash
+
+    class Client:
+        @staticmethod
+        def fetch_balance():
+            return {"total": {"USDT": 1000.0}, "free": {"USDT": 900.0}, "info": info}
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(exchange="binanceusdm", market_type="futures")
+    broker._client = Client()
+
+    with pytest.raises((RuntimeError, ValueError), match="wallet cash"):
+        broker._account_balances()
+
+
+def test_futures_wallet_cash_uses_matching_asset_wallet_when_total_is_absent() -> None:
+    class Client:
+        @staticmethod
+        def fetch_balance():
+            return {
+                "total": {"USDT": 1100.0},
+                "free": {"USDT": 900.0},
+                "info": {"assets": [{"asset": "USDT", "walletBalance": "1000"}]},
+            }
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(exchange="binanceusdm", market_type="futures")
+    broker._client = Client()
+
+    _, balances, free_balances, _ = broker._account_balances()
+
+    assert balances == {"USDT": 1000.0}
+    assert free_balances == {"USDT": 900.0}
+
+
+@pytest.mark.parametrize(
+    "margin_balance,initial_margin,match",
+    [
+        ("0", "1", "not positive"),
+        ("-1", "0", "non-negative"),
+        ("nan", "0", "finite"),
+    ],
+)
+def test_ccxt_futures_account_equity_rejects_invalid_margin_balance(
+    margin_balance, initial_margin, match
+):
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(exchange="binanceusdm", market_type="futures")
+
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        broker._account_margin(
+            {},
+            {},
+            {
+                "totalInitialMargin": initial_margin,
+                "totalMaintMargin": "0",
+                "totalMarginBalance": margin_balance,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        ({"environment": "production"}, "environment"),
+        ({"account_equity_asset": "BTC"}, "equity asset"),
+        ({"account_equity": -1.0}, "equity is invalid"),
+    ],
+)
+def test_authenticated_reconciliation_rejects_mismatched_environment_or_equity(
+    tmp_path: Path, monkeypatch, change, match
+) -> None:
+    database = _database(tmp_path)
+    monkeypatch.setenv("TEST_BINANCE_KEY", "test-key")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "test-secret")
+
+    class Broker:
+        account_fingerprint = "sha256:" + "2" * 64
+
+        @classmethod
+        def account_snapshot(cls, *, expected_symbols):
+            assert expected_symbols == ("BTCUSDT",)
+            return {
+                "balances": {"USDT": 1000.0},
+                "free_balances": {"USDT": 900.0},
+                "positions": {},
+                "regular_orders": [],
+                "conditional_orders": [],
+                "used_margin": 0.0,
+                "maintenance_margin": 0.0,
+                "account_equity": 1000.0,
+                "account_equity_asset": "USDT",
+                "used_margin_fraction": 0.0,
+                "liquidation_buffer_fraction": 1.0,
+                "account_mode": "one_way",
+                "unknown_exposure": {},
+                "environment": "testnet",
+                "account_state_known": True,
+                "account_state_authority": "authenticated_rest",
+                "account_fingerprint": cls.account_fingerprint,
+                **change,
+            }
+
+    service = AccountReconciliationService(
+        engine=database.engine,
+        products={
+            "active_income": {
+                "product_id": "active_income",
+                "portfolio_id": "active-income-portfolio",
+                "account_id": "futures",
+                "execution_mode": "live",
+                "exchange_symbols": ["BTCUSDT"],
+            }
+        },
+        accounts={
+            "futures": {
+                "account_id": "futures",
+                "market": "usdt_futures",
+                "environment": "testnet",
+                "quote_assets": ["USDT"],
+                "api_key_env": "TEST_BINANCE_KEY",
+                "api_secret_env": "TEST_BINANCE_SECRET",
+            }
+        },
+        broker_factory=lambda _account, _market: Broker(),
+    )
+
+    with pytest.raises(AccountAuthorityError, match=match):
+        service._authenticated(
+            service.accounts["futures"],
+            service.products["active_income"],
+            observed_at=NOW,
+        )
+    database.dispose()
 
 
 def test_spot_account_snapshot_separates_conditional_order_legs() -> None:
@@ -1307,6 +1531,8 @@ def test_live_readiness_accepts_exact_connected_authority(tmp_path: Path, monkey
         "conditional_orders": [],
         "used_margin": 0.0,
         "maintenance_margin": 0.0,
+        "account_equity": 1000.0,
+        "account_equity_asset": "USDT",
         "used_margin_fraction": 0.0,
         "liquidation_buffer_fraction": 1.0,
         "account_mode": "one_way",
@@ -1314,6 +1540,7 @@ def test_live_readiness_accepts_exact_connected_authority(tmp_path: Path, monkey
         "account_state_known": True,
         "account_state_authority": "authenticated_rest",
         "account_fingerprint": fingerprint,
+        "environment": "production",
         "observed_at": gate_now,
     }
     report_payload = {

@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 
 from src.accounting.nav import usdt_nav
 from src.data.database import (
@@ -64,21 +64,6 @@ class PortfolioRiskCalculator:
     ) -> PortfolioRiskMeasurements:
         at = timestamp(at, field="risk measurement time")
         product_family = str(product.get("product_family") or product_id)
-        product_ids = tuple(sorted(str(value) for value in self._products_for_account(account_id)))
-        if product_id not in product_ids:
-            product_ids = tuple(sorted((*product_ids, product_id)))
-        effects = self._ledger_effects(
-            product_ids, at, account_id=account_id, include_unscoped=not product.get("book_id")
-        )
-        initial = self._initial_equity(
-            account_id=account_id,
-            product_id=product_id,
-            product=product,
-            account=account,
-            market=market,
-        )
-        product_effects = effects.get(product_id, ())
-        global_effects = tuple(item for values in effects.values() for item in values)
         position_terms = self._position_terms(
             portfolio_id=str(product.get("portfolio_id") or ""), at=at
         )
@@ -101,21 +86,18 @@ class PortfolioRiskCalculator:
             if product_family == "btc_accumulation"
             else current_equity
         )
-        nav_points = self._nav_values(
-            product_id=product_id,
-            at=at,
-            portfolio_id=str(product.get("portfolio_id") or ""),
-            include_unscoped=not product.get("book_id"),
-        )
-        nav_values = [value for _observed_at, value in nav_points]
-        if nav_values:
-            if not math.isclose(nav_values[-1], current_equity, rel_tol=0.0, abs_tol=1e-12):
-                nav_values.append(current_equity)
-            product_drawdown = _curve_drawdown(nav_values)
-            daily_pnl = _daily_nav_fraction(nav_points, current_equity=current_equity, at=at)
+        if product.get("execution_mode") == "live":
+            product_drawdown, daily_pnl = self._authenticated_account_performance(
+                account_id=account_id,
+                product_id=product_id,
+                product=product,
+                account=account,
+                at=at,
+            )
         else:
-            product_drawdown = _drawdown(product_effects, initial)
-            daily_pnl = _daily_pnl_fraction(product_effects, initial, at)
+            product_drawdown, daily_pnl = self._paper_performance(
+                product_id, account_id, product, account, market, current_equity, at
+            )
         clusters = self._clusters(tuple(str(key) for key in market))
         cluster_limit = _positive_number(product.get("maximum_cluster_fraction")) or 1.0
         correlations, beta, risk_data_missing, factor_estimates = self._factor_measurements(
@@ -128,19 +110,7 @@ class PortfolioRiskCalculator:
             product_drawdown_fraction=product_drawdown,
             factor_estimates=factor_estimates,
             daily_pnl_fraction=daily_pnl,
-            global_drawdown_fraction=_drawdown(
-                global_effects,
-                sum(
-                    self._initial_equity(
-                        account_id=account_id,
-                        product_id=value,
-                        product=product,
-                        account=account,
-                        market=market,
-                    )
-                    for value in product_ids
-                ),
-            ),
+            global_drawdown_fraction=product_drawdown,
             trades_today=self._trades_today(
                 product_id=product_id,
                 portfolio_id=str(product.get("portfolio_id") or ""),
@@ -166,21 +136,155 @@ class PortfolioRiskCalculator:
             ),
         )
 
-    def _products_for_account(self, account_id: str) -> tuple[str, ...]:
+    def _paper_performance(
+        self, product_id, account_id, product, account, market, current_equity, at
+    ):
+        product_ids = (product_id,)
+        effects = self._ledger_effects(
+            product_ids, at, account_id=account_id, include_unscoped=not product.get("book_id")
+        )
+        initial = self._initial_equity(
+            account_id=account_id,
+            product_id=product_id,
+            product=product,
+            account=account,
+            market=market,
+            at=at,
+        )
+        product_effects = effects.get(product_id, ())
+        nav_points = self._nav_values(
+            product_id=product_id,
+            at=at,
+            portfolio_id=str(product.get("portfolio_id") or ""),
+            include_unscoped=not product.get("book_id"),
+        )
+        nav_values = [value for _observed_at, value in nav_points]
+        if nav_values:
+            if not math.isclose(nav_values[-1], current_equity, rel_tol=0.0, abs_tol=1e-12):
+                nav_values.append(current_equity)
+            product_drawdown = _curve_drawdown(nav_values)
+            daily_pnl = _daily_nav_fraction(nav_points, current_equity=current_equity, at=at)
+        else:
+            product_drawdown = _drawdown(product_effects, initial)
+            daily_pnl = _daily_pnl_fraction(product_effects, initial, at)
+        return product_drawdown, daily_pnl
+
+    def _authenticated_account_performance(self, *, account_id, product_id, product, account, at):
+        if set(account.get("products", ())) != {product_id}:
+            raise ValueError("live account risk requires one declared economic product per account")
+        asset = "BTC" if product_id == "btc_accumulation" else "USDT"
+        payload = account_snapshot.c.payload
+        equity = payload["account_equity"].as_float()
+        fingerprint = payload["account_fingerprint"].as_string()
+        points = (
+            select(
+                account_snapshot.c.id,
+                account_snapshot.c.observed_at,
+                equity.label("equity"),
+                fingerprint.label("fingerprint"),
+            )
+            .where(
+                account_snapshot.c.account_id == account_id,
+                account_snapshot.c.observed_at <= at,
+                account_snapshot.c.source.in_(("authenticated_rest", "authenticated_reconciled")),
+                payload["account_id"].as_string() == account_id,
+                payload["product_id"].as_string() == product_id,
+                payload["environment"].as_string() == account.get("environment"),
+                payload["account_state_known"].as_boolean().is_(True),
+                payload["account_state_authority"].as_string() == account_snapshot.c.source,
+                payload["account_equity_asset"].as_string() == asset,
+                fingerprint.is_not(None),
+                fingerprint != "",
+                equity.is_not(None),
+            )
+            .subquery()
+        )
+        peaks = select(
+            points.c.equity,
+            points.c.fingerprint,
+            func.max(points.c.equity)
+            .over(order_by=(points.c.observed_at, points.c.id))
+            .label("peak"),
+        ).subquery()
         with self.engine.connect() as connection:
-            products = {
-                str(value)
-                for value in connection.execute(
-                    select(account_snapshot.c.payload["product_id"])
-                    .where(
-                        account_snapshot.c.account_id == account_id,
-                        account_snapshot.c.payload["account_id"].as_string() == account_id,
+            latest = (
+                connection.execute(
+                    select(points)
+                    .order_by(points.c.observed_at.desc(), points.c.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+            self._assert_current_account_curve(connection, latest, account_id, product, at)
+            measured = (
+                connection.execute(
+                    select(
+                        func.min(peaks.c.equity).label("minimum"),
+                        func.count(func.distinct(peaks.c.fingerprint)).label("identities"),
+                        func.max(
+                            case(
+                                (peaks.c.peak > 0, (peaks.c.peak - peaks.c.equity) / peaks.c.peak),
+                                else_=0.0,
+                            )
+                        ).label("drawdown"),
                     )
-                    .distinct()
-                ).scalars()
-                if value
-            }
-        return tuple(sorted(products))
+                )
+                .mappings()
+                .one()
+            )
+            if measured["identities"] != 1:
+                raise ValueError(
+                    "account credential identity changed; risk history requires reassessment"
+                )
+            if _finite_number(measured["minimum"], "account equity") < 0:
+                raise ValueError("authenticated account equity is negative")
+            opening = self._account_day_opening(connection, points, at)
+        assert latest is not None
+        daily = (float(latest["equity"]) - opening) / opening if opening > 0 else 0.0
+        return _finite_number(measured["drawdown"], "account drawdown"), daily
+
+    @staticmethod
+    def _assert_current_account_curve(connection, latest, account_id, product, at):
+        current_id = connection.execute(
+            select(account_snapshot.c.id)
+            .where(
+                account_snapshot.c.account_id == account_id, account_snapshot.c.observed_at <= at
+            )
+            .order_by(account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if latest is None or latest["id"] != current_id:
+            raise ValueError("live risk requires current authenticated account equity")
+        age = (
+            dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(latest["observed_at"])
+        ).total_seconds()
+        if not 0 <= age <= float(product.get("account_snapshot_max_age_seconds", 60)):
+            raise ValueError("authenticated account equity is stale")
+
+    @staticmethod
+    def _account_day_opening(connection, points, at):
+        day = (
+            dt.datetime.fromisoformat(at)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .isoformat()
+        )
+        opening = connection.execute(
+            select(points.c.equity)
+            .where(points.c.observed_at < day)
+            .order_by(points.c.observed_at.desc(), points.c.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if opening is None:
+            opening = connection.execute(
+                select(points.c.equity)
+                .where(points.c.equity > 0)
+                .order_by(points.c.observed_at, points.c.id)
+                .limit(1)
+            ).scalar_one_or_none()
+        if opening is None:
+            raise ValueError("account risk history has no positive capital observation")
+        return _finite_number(opening, "account opening equity")
 
     def _ledger_effects(
         self,
@@ -227,21 +331,19 @@ class PortfolioRiskCalculator:
         product: Mapping[str, object],
         account: Mapping[str, object],
         market: Mapping[str, Mapping[str, object]],
+        at: str,
     ) -> float:
         with self.engine.connect() as connection:
-            rows = connection.execute(
+            payload = connection.execute(
                 select(account_snapshot.c.payload)
-                .where(account_snapshot.c.account_id == account_id)
+                .where(
+                    account_snapshot.c.account_id == account_id,
+                    account_snapshot.c.observed_at <= at,
+                    account_snapshot.c.payload["product_id"].as_string() == product_id,
+                )
                 .order_by(account_snapshot.c.observed_at, account_snapshot.c.id)
-            ).scalars()
-            payload = next(
-                (
-                    value
-                    for value in rows
-                    if isinstance(value, Mapping) and str(value.get("product_id")) == product_id
-                ),
-                None,
-            )
+                .limit(1)
+            ).scalar_one_or_none()
         if not isinstance(payload, Mapping):
             payload = {"balances": account.get("paper_starting_balances", {})}
         balances = payload.get("balances")

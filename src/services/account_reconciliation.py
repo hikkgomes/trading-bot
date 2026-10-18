@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from sqlalchemy import insert, select
 
+from src.accounting.nav import btc_nav
 from src.accounting.paper_account import PaperAccountLedger
 from src.data.database import (
     account_snapshot,
@@ -21,6 +23,7 @@ from src.execution.ccxt_broker import CcxtBroker
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.execution.stops import SqlStopStore, StopManager
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.live_execution import _exchange_config
 
 
@@ -129,6 +132,61 @@ class AccountReconciliationService:
         payload = reader(expected_symbols=expected_symbols)
         if not isinstance(payload, Mapping):
             raise AccountAuthorityError("authenticated account snapshot is not an object")
+        payload = self._validate_authenticated_snapshot(payload, account, market=market)
+        self._validate_broker_fingerprint(payload, broker)
+        reconciled = self._reconcile_platform_exposure(payload=dict(payload), product=product)
+        if market == "spot":
+            reconciled = self._spot_account_equity(reconciled, product, observed_at)
+        return json_value(reconciled, field="authenticated account snapshot")
+
+    def _spot_account_equity(self, payload, product, observed_at):
+        """Account reconciliation continues when a valuation quote is unavailable."""
+        try:
+            identity, quote = SqlRiskSnapshotStore(self.engine).latest(
+                kind="market_data_input", product_id=str(product["product_id"]), at=observed_at
+            )
+            source_time = timestamp(str(quote["source_event_time"]), field="spot equity quote time")
+            age = (
+                dt.datetime.fromisoformat(observed_at) - dt.datetime.fromisoformat(source_time)
+            ).total_seconds()
+            if (
+                quote.get("instrument_id") != "binance:spot:BTCUSDT"
+                or quote.get("source_event_type") != "best_bid_ask"
+                or not 0 <= age <= 5
+            ):
+                return payload
+            price = finite(quote["values"]["close"], field="spot equity price", minimum=0.0)
+            balances = payload["balances"]
+            equity = btc_nav(
+                btc_balance=finite(balances.get("BTC", 0), field="account BTC", minimum=0),
+                stablecoin_balance=finite(balances.get("USDT", 0), field="account USDT", minimum=0),
+                stablecoin_per_btc=price,
+            )
+        except (KeyError, TypeError, ValueError):
+            return payload
+        return {
+            **payload,
+            "account_equity": equity,
+            "account_equity_asset": "BTC",
+            "equity_market_snapshot_id": identity,
+        }
+
+    @staticmethod
+    def _validate_broker_fingerprint(payload: Mapping[str, Any], broker: Any) -> None:
+        expected = str(getattr(broker, "account_fingerprint", ""))
+        actual = str(payload.get("account_fingerprint") or "")
+        if not expected or actual != expected:
+            raise AccountAuthorityError(
+                "authenticated account snapshot fingerprint does not match the configured account"
+            )
+
+    @staticmethod
+    def _validate_authenticated_snapshot(
+        payload: Mapping[str, Any], account: Mapping[str, Any], *, market: str
+    ) -> dict[str, Any]:
+        expected_environment = account.get("environment")
+        if expected_environment not in {"testnet", "production"}:
+            raise AccountAuthorityError("configured live account environment is invalid")
         required = {
             "balances",
             "free_balances",
@@ -144,19 +202,58 @@ class AccountReconciliationService:
             "account_state_known",
             "account_state_authority",
             "account_fingerprint",
+            "environment",
         }
+        if market == "futures":
+            required.update({"account_equity", "account_equity_asset"})
         if not required.issubset(payload) or payload.get("account_state_known") is not True:
             raise AccountAuthorityError("authenticated account snapshot is incomplete")
+        if payload.get("environment") != expected_environment:
+            raise AccountAuthorityError(
+                "authenticated account snapshot environment does not match the configured account"
+            )
         if payload.get("account_state_authority") != "authenticated_rest":
             raise AccountAuthorityError("account snapshot is not authenticated REST authority")
-        expected_fingerprint = str(getattr(broker, "account_fingerprint", ""))
-        actual_fingerprint = str(payload.get("account_fingerprint") or "")
-        if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
+        return AccountReconciliationService._validated_account_equity(
+            payload, account, market=market
+        )
+
+    @staticmethod
+    def _validated_account_equity(
+        payload: Mapping[str, Any], account: Mapping[str, Any], *, market: str
+    ) -> dict[str, Any]:
+        clean = dict(payload)
+        if market == "spot":
+            if "account_equity" in clean or "account_equity_asset" in clean:
+                raise AccountAuthorityError(
+                    "spot account snapshots cannot claim full account equity"
+                )
+            return clean
+        quote_assets = account.get("quote_assets")
+        if not isinstance(quote_assets, list | tuple) or not quote_assets:
+            raise AccountAuthorityError("live futures account has no configured quote asset")
+        expected_equity_asset = str(quote_assets[0]).strip().upper()
+        equity_asset = clean.get("account_equity_asset")
+        raw_equity = clean.get("account_equity")
+        if not expected_equity_asset or equity_asset != expected_equity_asset:
             raise AccountAuthorityError(
-                "authenticated account snapshot fingerprint does not match the configured account"
+                "authenticated futures equity asset does not match the configured quote asset"
             )
-        reconciled = self._reconcile_platform_exposure(payload=dict(payload), product=product)
-        return json_value(reconciled, field="authenticated account snapshot")
+        if isinstance(raw_equity, bool):
+            raise AccountAuthorityError("authenticated futures equity must be numeric")
+        if raw_equity is None:
+            raise AccountAuthorityError("authenticated futures equity is missing")
+        try:
+            equity = finite(
+                float(raw_equity),
+                field="authenticated futures account_equity",
+                minimum=0.0,
+            )
+        except (TypeError, ValueError) as exc:
+            raise AccountAuthorityError(f"authenticated futures equity is invalid: {exc}") from exc
+        clean["account_equity"] = equity
+        clean["account_equity_asset"] = expected_equity_asset
+        return clean
 
     def _expected_symbols(
         self,

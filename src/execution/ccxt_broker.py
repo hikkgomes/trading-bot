@@ -369,10 +369,14 @@ class CcxtBroker(Broker):
     def account_snapshot(self, *, expected_symbols: tuple[str, ...] = ()) -> dict:
         """Read the complete authenticated account state used by live gates."""
         balance, balances, free_balances, info = self._account_balances()
-        used_margin, maintenance_margin, used_fraction, liquidation_buffer = self._account_margin(
-            balance, balances, info
-        )
-        positions, unknown_positions, regular_orders, conditional_orders = (
+        (
+            used_margin,
+            maintenance_margin,
+            used_fraction,
+            liquidation_buffer,
+            account_equity,
+        ) = self._account_margin(balance, balances, info)
+        positions, position_entry_prices, unknown_positions, regular_orders, conditional_orders = (
             self._account_positions_and_orders(balances, expected_symbols)
         )
         unknown_orders = {
@@ -381,7 +385,7 @@ class CcxtBroker(Broker):
             if not any(self._symbols_match(item.symbol, symbol) for symbol in expected_symbols)
         }
         position_mode = self._account_position_mode()
-        return {
+        snapshot = {
             "balances": balances,
             "free_balances": free_balances,
             "positions": positions,
@@ -393,10 +397,16 @@ class CcxtBroker(Broker):
             "liquidation_buffer_fraction": liquidation_buffer,
             "account_mode": position_mode,
             "unknown_exposure": {**unknown_positions, **unknown_orders},
+            "environment": "testnet" if self.config.testnet else "production",
             "account_state_known": True,
             "account_state_authority": "authenticated_rest",
             "account_fingerprint": self.account_fingerprint,
         }
+        if self.config.market_type == "futures":
+            snapshot["account_equity"] = account_equity
+            snapshot["account_equity_asset"] = self.config.quote_asset.upper()
+            snapshot["position_entry_prices"] = position_entry_prices
+        return snapshot
 
     def _account_balances(self) -> tuple[dict, dict[str, float], dict[str, float], dict]:
         balance = self._client.fetch_balance()
@@ -418,7 +428,38 @@ class CcxtBroker(Broker):
         }
         raw_info = balance.get("info")
         info = raw_info if isinstance(raw_info, dict) else {}
+        if self.config.market_type == "futures":
+            quote_asset = self.config.quote_asset.upper()
+            for asset in tuple(balances):
+                if asset.upper() == quote_asset:
+                    del balances[asset]
+            balances[quote_asset] = self._futures_wallet_balance(info, quote_asset)
         return balance, balances, free_balances, info
+
+    def _futures_wallet_balance(self, info: dict, quote_asset: str) -> float:
+        value = info.get("totalWalletBalance")
+        if value is None:
+            assets = info.get("assets")
+            matches = (
+                [
+                    asset
+                    for asset in assets
+                    if isinstance(asset, dict)
+                    and str(asset.get("asset", "")).upper() == quote_asset
+                ]
+                if isinstance(assets, list)
+                else []
+            )
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"authenticated futures response has duplicate {quote_asset} wallet balances"
+                )
+            value = matches[0].get("walletBalance") if matches else None
+        if isinstance(value, bool) or value is None:
+            raise RuntimeError(
+                f"authenticated futures response is missing native {quote_asset} wallet cash"
+            )
+        return self._finite_number(value, "Futures wallet cash", non_negative=True)
 
     def _account_number(
         self, balance: dict, info: dict, *names: str, default: float | None = None
@@ -426,6 +467,10 @@ class CcxtBroker(Broker):
         for name in names:
             value = info.get(name, balance.get(name))
             if value is not None:
+                if isinstance(value, bool):
+                    raise ValueError(
+                        f"Account field {name} must be numeric, got a boolean. Refusing."
+                    )
                 return self._finite_number(value, f"Account field {name}", non_negative=True)
         if default is None:
             raise RuntimeError("authenticated account response is missing a required margin field")
@@ -433,9 +478,9 @@ class CcxtBroker(Broker):
 
     def _account_margin(
         self, balance: dict, balances: Mapping[str, float], info: dict
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         quote_total = self._finite_number(
-            balances.get(self.config.quote_asset, 0.0),
+            balances.get(self.config.quote_asset.upper(), 0.0),
             "Account quote balance",
             non_negative=True,
         )
@@ -458,18 +503,25 @@ class CcxtBroker(Broker):
             raise RuntimeError("authenticated account margin balance is not positive")
         used_fraction = used / margin_balance if margin_balance > 0 else 0.0
         buffer = max(0.0, 1.0 - maintenance / margin_balance) if margin_balance > 0 else 0.0
-        return used, maintenance, used_fraction, buffer
+        return used, maintenance, used_fraction, buffer, margin_balance
 
     def _account_positions_and_orders(
         self, balances: Mapping[str, float], expected_symbols: tuple[str, ...]
-    ) -> tuple[dict[str, float], dict[str, float], list, list]:
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], list, list]:
         positions: dict[str, float] = {}
+        position_entry_prices: dict[str, float] = {}
         unknown_positions: dict[str, float] = {}
         if self.config.market_type == "futures":
             position_rows = self.list_account_futures_positions()
             for item in position_rows:
                 if abs(float(item.qty)) > 1e-12:
-                    positions[self.platform_instrument_id(item.symbol)] = float(item.qty)
+                    instrument_id = self.platform_instrument_id(item.symbol)
+                    positions[instrument_id] = float(item.qty)
+                    position_entry_prices[instrument_id] = self._finite_number(
+                        item.avg_price,
+                        f"Futures position {instrument_id} entry price",
+                        positive=True,
+                    )
             unknown_positions = {
                 f"position:{item.symbol}": float(item.qty)
                 for item in position_rows
@@ -492,7 +544,13 @@ class CcxtBroker(Broker):
             }
         regular_orders = list(self.list_account_open_orders(conditional=False))
         conditional_orders = list(self.list_account_open_orders(conditional=True))
-        return positions, unknown_positions, regular_orders, conditional_orders
+        return (
+            positions,
+            position_entry_prices,
+            unknown_positions,
+            regular_orders,
+            conditional_orders,
+        )
 
     def _account_position_mode(self) -> str:
         if self.config.market_type != "futures":

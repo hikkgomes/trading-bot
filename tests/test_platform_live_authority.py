@@ -65,6 +65,10 @@ class _Broker:
             "account_state_known": True,
             "account_state_authority": "authenticated_rest",
             "account_fingerprint": self.account_fingerprint,
+            "environment": "testnet",
+            "account_equity": 1_000.0,
+            "account_equity_asset": "USDT",
+            "position_entry_prices": {},
         }
 
 

@@ -426,35 +426,143 @@ def test_unavailable_factor_measurements_block_new_targets() -> None:
         )
 
 
-def test_risk_account_scope_keeps_historical_products_and_excludes_other_accounts(tmp_path):
-    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'account-scope.sqlite3'}")
+@pytest.mark.parametrize(
+    "product_id,asset,capital",
+    [("active_income", "USDT", 10000.0), ("btc_accumulation", "BTC", 1.0)],
+)
+def test_live_drawdown_counts_authenticated_account_equity_once(
+    tmp_path, product_id, asset, capital
+):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'account-equity.sqlite3'}")
     database.create_schema()
+    current = "2026-10-18T00:01:00+00:00"
+    rows = [
+        (
+            "opening",
+            "authenticated_rest",
+            product_id,
+            "production",
+            capital,
+            "2026-10-17T23:59:00+00:00",
+        ),
+        ("loss", "authenticated_rest", product_id, "production", capital * 0.9, current),
+        (
+            "testnet",
+            "authenticated_rest",
+            product_id,
+            "testnet",
+            capital * 20,
+            "2026-10-17T23:58:00+00:00",
+        ),
+        (
+            "future",
+            "authenticated_rest",
+            product_id,
+            "production",
+            capital * 40,
+            "2026-10-19T00:00:00+00:00",
+        ),
+    ]
+    rows += [
+        (
+            f"smoke-{i}",
+            "paper_config",
+            product_id + f":smoke:{i}",
+            "production",
+            capital,
+            "2026-10-17T23:57:00+00:00",
+        )
+        for i in range(4)
+    ]
     try:
         with database.engine.begin() as connection:
-            for number, (account, product) in enumerate(
-                (
-                    ("account-a", "retired"),
-                    ("account-a", "current"),
-                    ("account-a", "current"),
-                    ("account-b", "foreign"),
-                    ("account-a", None),
-                )
-            ):
-                payload = {"account_id": account, "product_id": product, "number": number}
+            for identity, source, product, environment, equity, observed in rows:
+                payload = {
+                    "account_id": "account",
+                    "product_id": product,
+                    "environment": environment,
+                    "account_state_known": True,
+                    "account_state_authority": source,
+                    "account_fingerprint": "credential-1",
+                    "account_equity": equity,
+                    "account_equity_asset": asset,
+                }
                 connection.execute(
                     account_snapshot.insert().values(
-                        id=canonical_hash(payload),
-                        account_id=account,
-                        observed_at="2026-10-18T00:00:00+00:00",
-                        source="paper_config",
+                        id=identity,
+                        account_id="account",
+                        observed_at=observed,
+                        source=source,
                         content_hash=canonical_hash(payload),
                         payload=payload,
                     )
                 )
         calculator = PortfolioRiskCalculator(database.engine)
-        assert calculator._products_for_account("account-a") == ("current", "retired")
-        assert calculator._products_for_account("account-b") == ("foreign",)
-        assert calculator._products_for_account("absent") == ()
+        options = {
+            "account_id": "account",
+            "product_id": product_id,
+            "product": {"account_snapshot_max_age_seconds": 60},
+            "account": {"products": [product_id], "environment": "production"},
+        }
+        drawdown, daily = calculator._authenticated_account_performance(**options, at=current)
+        assert drawdown == pytest.approx(0.10)
+        assert daily == pytest.approx(-0.10)
+        with pytest.raises(ValueError, match="stale"):
+            calculator._authenticated_account_performance(**options, at="2026-10-18T00:03:00+00:00")
+        changed = {
+            **payload,
+            "product_id": product_id,
+            "account_state_authority": "authenticated_rest",
+            "account_fingerprint": "credential-2",
+            "account_equity": capital,
+        }
+        with database.engine.begin() as connection:
+            connection.execute(
+                account_snapshot.insert().values(
+                    id="changed-identity",
+                    account_id="account",
+                    observed_at="2026-10-18T00:02:00+00:00",
+                    source="authenticated_rest",
+                    content_hash=canonical_hash(changed),
+                    payload=changed,
+                )
+            )
+        with pytest.raises(ValueError, match="credential identity changed"):
+            calculator._authenticated_account_performance(**options, at="2026-10-18T00:02:00+00:00")
+    finally:
+        database.dispose()
+
+
+def test_spot_account_equity_uses_a_fresh_pinned_btc_quote(tmp_path):
+    from src.services.account_reconciliation import AccountReconciliationService
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'spot-equity.sqlite3'}")
+    database.create_schema()
+    try:
+        service = AccountReconciliationService(engine=database.engine, products={}, accounts={})
+        payload = {"balances": {"BTC": 1.0, "USDT": 1000.0}}
+        product = {"product_id": "btc_accumulation"}
+        now = "2026-10-18T00:00:00+00:00"
+        assert service._spot_account_equity(payload, product, now) == payload
+        quote = {
+            "kind": "market_data_input",
+            "product_id": "btc_accumulation",
+            "instrument_id": "binance:spot:BTCUSDT",
+            "source_event_type": "best_bid_ask",
+            "source_event_time": now,
+            "availability_time": now,
+            "values": {"close": 10000.0},
+        }
+        store = SqlRiskSnapshotStore(database.engine)
+        identity = store.save_market_input(quote, created_at=now, retention_at=now)
+        valued = service._spot_account_equity(payload, product, now)
+        assert valued["account_equity_asset"] == "BTC"
+        assert valued["account_equity"] == pytest.approx(1.1)
+        assert valued["equity_market_snapshot_id"] == identity
+        assert store.get(identity) == quote
+        assert (
+            service._spot_account_equity(payload, product, "2026-10-18T00:00:06+00:00") == payload
+        )
     finally:
         database.dispose()
 
@@ -715,7 +823,7 @@ def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path, bo
 
     assert measurements.product_drawdown_fraction == pytest.approx(0.05)
     assert measurements.daily_pnl_fraction == pytest.approx(-0.05)
-    assert measurements.global_drawdown_fraction == 0
+    assert measurements.global_drawdown_fraction == pytest.approx(0.05)
     database.dispose()
 
 
