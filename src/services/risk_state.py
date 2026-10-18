@@ -168,14 +168,18 @@ class PortfolioRiskCalculator:
 
     def _products_for_account(self, account_id: str) -> tuple[str, ...]:
         with self.engine.connect() as connection:
-            rows = connection.execute(select(account_snapshot.c.payload)).mappings()
-        products = {
-            str(payload.get("product_id"))
-            for row in rows
-            if isinstance((payload := row["payload"]), Mapping)
-            and str(payload.get("account_id")) == account_id
-            and str(payload.get("product_id") or "")
-        }
+            products = {
+                str(value)
+                for value in connection.execute(
+                    select(account_snapshot.c.payload["product_id"])
+                    .where(
+                        account_snapshot.c.account_id == account_id,
+                        account_snapshot.c.payload["account_id"].as_string() == account_id,
+                    )
+                    .distinct()
+                ).scalars()
+                if value
+            }
         return tuple(sorted(products))
 
     def _ledger_effects(

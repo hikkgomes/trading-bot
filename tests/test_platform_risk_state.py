@@ -426,6 +426,39 @@ def test_unavailable_factor_measurements_block_new_targets() -> None:
         )
 
 
+def test_risk_account_scope_keeps_historical_products_and_excludes_other_accounts(tmp_path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'account-scope.sqlite3'}")
+    database.create_schema()
+    try:
+        with database.engine.begin() as connection:
+            for number, (account, product) in enumerate(
+                (
+                    ("account-a", "retired"),
+                    ("account-a", "current"),
+                    ("account-a", "current"),
+                    ("account-b", "foreign"),
+                    ("account-a", None),
+                )
+            ):
+                payload = {"account_id": account, "product_id": product, "number": number}
+                connection.execute(
+                    account_snapshot.insert().values(
+                        id=canonical_hash(payload),
+                        account_id=account,
+                        observed_at="2026-10-18T00:00:00+00:00",
+                        source="paper_config",
+                        content_hash=canonical_hash(payload),
+                        payload=payload,
+                    )
+                )
+        calculator = PortfolioRiskCalculator(database.engine)
+        assert calculator._products_for_account("account-a") == ("current", "retired")
+        assert calculator._products_for_account("account-b") == ("foreign",)
+        assert calculator._products_for_account("absent") == ()
+    finally:
+        database.dispose()
+
+
 def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-state.sqlite3'}")
     database.create_schema()
