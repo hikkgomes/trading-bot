@@ -579,35 +579,46 @@ def test_portfolio_state_service_schedules_automatically_from_latest_sources(tmp
     store = SqlRiskSnapshotStore(database.engine)
     product_id = "active_income"
     values = {
-        "balances": {"USDT": 1000.0},
-        "positions": {},
-        "open_orders": [],
-        "used_margin_fraction": 0.0,
-        "liquidation_buffer_fraction": 1.0,
-        "unknown_exposure": {},
-        "market": {
-            "binance:futures:BTCUSDT:USDT": {
-                "price": 100.0,
-                "spread_bps": 1.0,
-                "visible_depth_quote": 10000.0,
-                "volatility": 0.2,
-                "funding": 0.0,
-            }
+        "balances": {"balances": {"USDT": 1000.0}},
+        "positions": {
+            "positions": {},
+            "product_drawdown_fraction": 0.0,
+            "daily_pnl_fraction": 0.0,
+            "global_drawdown_fraction": 0.0,
+            "clusters": {},
+            "cluster_fraction_caps": {},
+            "trades_today": 0,
+            "open_exposure_fraction": 0.0,
+            "pending_exposure_fraction": 0.0,
         },
-        "correlations": {},
-        "beta": {},
-        "risk_data_available": True,
-        "risk_data_missing": [],
-        "product_drawdown_fraction": 0.0,
-        "daily_pnl_fraction": 0.0,
-        "global_drawdown_fraction": 0.0,
-        "data_age_seconds": 0.0,
-        "clock_skew_seconds": 0.0,
-        "exchange_connected": True,
-        "database_healthy": True,
-        "execution_drift": False,
-        "model_drift": False,
-        "trades_today": 0,
+        "open_orders": {"open_orders": []},
+        "account": {
+            "used_margin_fraction": 0.0,
+            "liquidation_buffer_fraction": 1.0,
+            "unknown_exposure": {},
+        },
+        "market": {
+            "market": {
+                "binance:futures:BTCUSDT:USDT": {
+                    "price": 100.0,
+                    "spread_bps": 1.0,
+                    "visible_depth_quote": 10000.0,
+                    "volatility": 0.2,
+                    "funding": 0.0,
+                }
+            },
+            "correlations": {},
+            "beta": {},
+            "risk_data_available": True,
+            "risk_data_missing": [],
+        },
+        "health": {
+            "data_age_seconds": 0.0,
+            "clock_skew_seconds": 0.0,
+            "exchange_connected": True,
+            "database_healthy": True,
+        },
+        "drift": {"execution_drift": False, "model_drift": False},
     }
     for source in DatabasePortfolioStateWorker.REQUIRED_SOURCES:
         store.save(
@@ -615,7 +626,7 @@ def test_portfolio_state_service_schedules_automatically_from_latest_sources(tmp
                 "kind": source,
                 "product_id": product_id,
                 "observed_at": NOW,
-                "values": values if source == "balances" else {},
+                "values": values[source],
             },
             created_at=NOW,
         )
@@ -632,8 +643,6 @@ def test_portfolio_state_service_schedules_automatically_from_latest_sources(tmp
         "maximum_product_drawdown_fraction": 0.1,
         "maximum_depth_participation": 0.1,
         "sleeve_budgets": {"directional": 1.0},
-        "clusters": {},
-        "cluster_fraction_caps": {},
     }
     assert (
         worker.schedule_from_latest(

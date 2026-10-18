@@ -168,6 +168,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config = load_platform_config(args.config)
+    with acquire_file_update_lock(
+        Path(config.paths["backups"]) / "maintenance-backup", label="backup operation"
+    ):
+        _run_maintenance(args, config)
+
+
+def _run_maintenance(args: argparse.Namespace, config) -> None:
     if args.mode == "verify":
         _run_command(args)
         return

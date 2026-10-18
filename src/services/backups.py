@@ -292,8 +292,8 @@ class BackupStore:
                 else:
                     digest = file_hash(source)
                     shutil.copyfile(source, target)
-                if not move_sources and file_hash(target) != digest:
-                    raise RuntimeError(f"backup verification failed: {logical_name}")
+                if file_hash(target) != digest:
+                    raise RuntimeError(f"backup input changed while verifying: {logical_name}")
                 with target.open("rb") as handle:
                     os.fsync(handle.fileno())
                 if moved_identity is not None and _file_identity(target) != moved_identity:

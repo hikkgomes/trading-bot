@@ -302,10 +302,21 @@ revision and core table counts, then writes a separate hash-bound restore
 receipt. The rehearsal does not connect to or change the production database.
 
 Daily offsite backups use restic through a private rclone Google Drive remote.
-They capture a fresh PostgreSQL dump, all canonical data and public configuration
-in one encrypted incremental snapshot. The database capture is pinned with a
-hard link, so normal hourly retention cannot remove an in-progress input.
-The old daily full-tar timer is retired; manual local archives remain available.
+Before capturing the database, the job checks remote repository access with
+`restic snapshots --json`; rclone repository opening has a five-minute timeout.
+The job reuses the newest verified local PostgreSQL dump created in the last
+hour, including the one-hour boundary, or creates a fresh dump when none
+qualifies. It pins that dump with a hard link, so local retention cannot remove
+an in-progress input. Each successful offsite snapshot therefore uses a database
+dump no more than one hour old at capture time. A failed upload leaves the last
+verified offsite receipt unchanged.
+
+The encrypted snapshot contains canonical data and public configuration as well
+as the pinned database dump. The old daily full-tar timer is retired; manual
+local archives remain available.
+The backup command entry points share one operation lock, so hourly dumps,
+offsite uploads and restore rehearsals run one at a time within the background
+memory and disk budget.
 
 Install the maintained `restic` and `rclone` packages. Configure only `drive.file`
 on the dedicated Google OAuth client. Store its configuration at
@@ -318,10 +329,12 @@ The root-owned `/etc/trading-platform/offsite.env` supplies `RCLONE_CONFIG`,
 Keep the encryption password outside the server. The installed recovery copy
 is in Henrique's Mac login Keychain, service `Trading Platform encrypted backups`,
 account `hikkgomes/trading-bot/optiplex`.
+The OAuth client recovery copy is in the same Keychain, service
+`Trading Platform Google backup client`, account `trading-platform-backups-hg`.
 
-Every offsite run checks the repository and restores the captured database dump
-and a canonical Parquet file into a private temporary directory. Both hashes
-must match before retention runs. The first run and each subsequent week read
+Every offsite run restores the pinned database dump and a canonical Parquet file
+into a private temporary directory. Both hashes must match before retention
+runs. The first run and each subsequent week read
 all encrypted repository data; intervening runs rotate through seven subsets.
 `runtime/backups/offsite-latest.json` records the verified snapshot and checks.
 Readiness rejects a missing, corrupt, future-dated or stale offsite receipt.
@@ -410,6 +423,13 @@ High-rate market observations use a 15-minute PostgreSQL buffer. Any observation
 used in a durable decision or required feature job is verified and copied to the
 immutable risk evidence store before its reference is published. Expiry removes
 only unpinned buffer rows, in bounded batches. Closed candles remain permanent.
+
+Only this disposable buffer is PostgreSQL `UNLOGGED`. An unclean database stop
+empties it; fresh capture must repopulate the required inputs before trading
+can resume. Pins, decisions, orders and financial records remain logged, and
+their commits retain normal durability. Live readers must use the primary
+database; the buffer is not available on a standby. This keeps unused quotes
+from forcing synchronous disk commits while backups or research use the disk.
 
 Live candle, feature and native funding Parquet stores publish a complete daily
 `current.parquet` through an atomic replacement under a partition writer lock.

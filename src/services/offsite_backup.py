@@ -17,7 +17,7 @@ from typing import Any
 from src.data.atomic import write_json_atomic
 from src.data.locking import acquire_file_update_lock
 from src.services.backup_service import create_database_backup
-from src.services.backups import BackupStore, _fsync_directory, file_hash
+from src.services.backups import BackupBundle, BackupStore, _fsync_directory, file_hash
 from src.services.config import load_platform_config
 
 _HOST = "linux-optiplex"
@@ -54,8 +54,12 @@ def offsite_status(root: Path, *, now: dt.datetime, maximum_age_seconds: int) ->
 def _restic(root: Path, *arguments: str) -> list[dict[str, Any]]:
     # Keep potentially large progress output off the service's memory and journal.
     with tempfile.TemporaryFile(mode="w+") as output, tempfile.TemporaryFile(mode="w+") as errors:
+        command = ["restic"]
+        if os.environ.get("RESTIC_REPOSITORY", "").startswith("rclone:"):
+            command.extend(("-o", "rclone.timeout=5m"))
+        command.extend(arguments)
         result = subprocess.run(
-            ["restic", *arguments],
+            command,
             stdout=output,
             stderr=errors,
             timeout=8 * 60 * 60,
@@ -66,28 +70,85 @@ def _restic(root: Path, *arguments: str) -> list[dict[str, Any]]:
             (root / "offsite-last-error.txt").write_text(errors.read(64 * 1024))
             raise RuntimeError(f"restic {arguments[0]} failed with exit {result.returncode}")
         output.seek(0)
-        return [
-            value
-            for line in output
-            if line.startswith("{")
-            if isinstance((value := json.loads(line)), dict)
-            and value.get("message_type") == "summary"
-        ]
+        first = ""
+        while character := output.read(1):
+            if not character.isspace():
+                first = character
+                break
+        output.seek(0)
+        if first == "[":
+            values = json.load(output)
+            if not isinstance(values, list) or not all(isinstance(value, dict) for value in values):
+                raise RuntimeError("restic returned an invalid JSON array")
+            return values
+        summaries = []
+        for line in output:
+            if not line.startswith("{"):
+                continue
+            value = json.loads(line)
+            if isinstance(value, dict) and value.get("message_type") == "summary":
+                summaries.append(value)
+        return summaries
 
 
-def _pin_database(config_path: Path, root: Path) -> tuple[Path, dict[str, Any]]:
+def _recent_verified_database_bundle(
+    store: BackupStore, *, now: dt.datetime
+) -> BackupBundle | None:
+    candidates = []
+    if not store.root.exists():
+        return None
+    for directory in sorted(store.root.iterdir()):
+        if (
+            not directory.name.startswith("postgresql-")
+            or directory.is_symlink()
+            or not directory.is_dir()
+        ):
+            continue
+        try:
+            bundle = store._read_bundle(directory.name)
+            created_at = dt.datetime.fromisoformat(bundle.created_at)
+        except (OSError, ValueError, TypeError):
+            continue
+        if tuple(sorted(bundle.files)) != ("database.dump",) or created_at.tzinfo is None:
+            continue
+        age = (now - created_at.astimezone(dt.UTC)).total_seconds()
+        if 0 <= age <= 3600:
+            candidates.append((created_at, bundle.backup_id))
+    for _created_at, backup_id in sorted(candidates, reverse=True):
+        try:
+            return store.verify(backup_id)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _pin_database(
+    config_path: Path, root: Path, *, now: dt.datetime | None = None
+) -> tuple[Path, dict[str, Any]]:
+    store = BackupStore(root)
+    if now is not None and now.tzinfo is None:
+        raise ValueError("offsite database selection time must include a timezone")
     with acquire_file_update_lock(
         root / "maintenance-postgresql", label="offsite database capture"
     ):
-        identity = create_database_backup(config_path=config_path)
-        bundle = BackupStore(root).verify(identity)
+        current = now or dt.datetime.now(dt.UTC)
+        bundle = _recent_verified_database_bundle(store, now=current.astimezone(dt.UTC))
+        if bundle is None:
+            identity = create_database_backup(config_path=config_path)
+            bundle = store.verify(identity)
+        if tuple(sorted(bundle.files)) != ("database.dump",):
+            raise ValueError("offsite database input must contain only database.dump")
         pinned = root / ".offsite-source"
         pinned.mkdir(mode=0o700, exist_ok=True)
         temporary = pinned / "database.dump.new"
         temporary.unlink(missing_ok=True)
-        os.link(root / identity / "database.dump", temporary)
+        os.link(root / bundle.backup_id / "database.dump", temporary)
         os.replace(temporary, pinned / "database.dump")
-        manifest = {"backup_id": identity, "created_at": bundle.created_at, "files": bundle.files}
+        manifest = {
+            "backup_id": bundle.backup_id,
+            "created_at": bundle.created_at,
+            "files": bundle.files,
+        }
         write_json_atomic(pinned / "manifest.json", manifest)
     return pinned, manifest
 
@@ -141,11 +202,15 @@ def run_offsite_backup(config_path: Path) -> dict[str, Any]:
     config = load_platform_config(config_path)
     root = Path(config.paths["backups"]).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    with acquire_file_update_lock(root / "maintenance-offsite", label="offsite backup"):
+    with (
+        acquire_file_update_lock(root / "maintenance-backup", label="backup operation"),
+        acquire_file_update_lock(root / "maintenance-offsite", label="offsite backup"),
+    ):
         return _capture_offsite(config_path, config, root)
 
 
 def _capture_offsite(config_path: Path, config: Any, root: Path) -> dict[str, Any]:
+    _restic(root, "snapshots", "--json")
     now = dt.datetime.now(dt.UTC)
     previous = offsite_status(root, now=now, maximum_age_seconds=7 * 86400)
     prior = json.loads((root / "offsite-latest.json").read_text()) if previous["ok"] else {}

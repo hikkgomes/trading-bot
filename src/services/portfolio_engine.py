@@ -796,10 +796,18 @@ def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> 
     return clean
 
 
+class IncompletePortfolioState(ValueError):
+    """An immutable portfolio state is missing measured source values."""
+
+    def __init__(self, missing_fields: tuple[str, ...]) -> None:
+        self.missing_fields = missing_fields
+        super().__init__("canonical portfolio/risk state is missing: " + ", ".join(missing_fields))
+
+
 def _validate_state_identity(state: Mapping[str, Any], product_id: str) -> None:
     missing = sorted(_PORTFOLIO_STATE_FIELDS - set(state))
     if missing:
-        raise ValueError("canonical portfolio/risk state is missing: " + ", ".join(missing))
+        raise IncompletePortfolioState(tuple(missing))
     if state["kind"] != "canonical_portfolio_risk_state" or state["product_id"] != product_id:
         raise ValueError("canonical portfolio/risk state has the wrong identity")
 

@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from src.data.binance_market import normalise_public_event
 from src.data.database import PlatformDatabase, job, risk_snapshot, service_heartbeat
-from src.domain._codec import to_primitive
+from src.domain._codec import canonical_hash, to_primitive
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.data_writer import DatabaseMarketDataWriter
@@ -24,9 +24,6 @@ NOW = "2026-08-24T00:00:00+00:00"
 def _policy() -> dict[str, object]:
     return {
         "maximum_state_age_seconds": 30,
-        "product_drawdown_fraction": 0.0,
-        "daily_pnl_fraction": 0.0,
-        "global_drawdown_fraction": 0.0,
         "risk_policy_ids": ["policy"],
         "portfolio_risk_budget": 1.0,
         "maximum_symbol_fraction": 1.0,
@@ -37,9 +34,6 @@ def _policy() -> dict[str, object]:
         "maximum_product_drawdown_fraction": 1.0,
         "maximum_depth_participation": 1.0,
         "sleeve_budgets": {},
-        "clusters": {},
-        "cluster_fraction_caps": {},
-        "trades_today": 0,
     }
 
 
@@ -57,7 +51,17 @@ def test_unchanged_portfolio_sources_remain_idle_for_10000_cycles(tmp_path) -> N
     store = SqlRiskSnapshotStore(database.engine)
     values = {
         "balances": {"balances": {"USDT": 100.0}},
-        "positions": {"positions": {}},
+        "positions": {
+            "positions": {},
+            "product_drawdown_fraction": 0.0,
+            "daily_pnl_fraction": 0.0,
+            "global_drawdown_fraction": 0.0,
+            "trades_today": 0,
+            "clusters": {},
+            "cluster_fraction_caps": {},
+            "open_exposure_fraction": 0.0,
+            "pending_exposure_fraction": 0.0,
+        },
         "open_orders": {"open_orders": []},
         "account": {
             "used_margin_fraction": 0.0,
@@ -123,6 +127,308 @@ def test_unchanged_portfolio_sources_remain_idle_for_10000_cycles(tmp_path) -> N
             connection.execute(select(func.count()).select_from(service_heartbeat)).scalar_one()
             == 32
         )
+
+
+def test_incomplete_immutable_state_is_terminal_and_new_measurements_publish(tmp_path):
+    from src.data.database import job_attempt
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'incomplete-state.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="state-worker",
+        node_id="linux-optiplex",
+        role="portfolio-state-service",
+        capabilities=("portfolio_state_publish",),
+        observed_at=NOW,
+    )
+    store = SqlRiskSnapshotStore(database.engine)
+    product_id = "active_income"
+    instrument_id = "binance:futures:BTCUSDT:USDT"
+    source_values = {
+        "balances": {"balances": {"USDT": 1000.0}},
+        "positions": {"positions": {}},
+        "open_orders": {"open_orders": []},
+        "account": {
+            "used_margin_fraction": 0.0,
+            "liquidation_buffer_fraction": 1.0,
+            "unknown_exposure": {},
+        },
+        "market": {
+            "market": {
+                instrument_id: {
+                    "price": 100.0,
+                    "spread_bps": 1.0,
+                    "visible_depth_quote": 100_000.0,
+                    "volatility": 0.01,
+                    "funding": 0.0,
+                }
+            },
+            "correlations": {},
+            "beta": {},
+            "risk_data_available": True,
+            "risk_data_missing": [],
+        },
+        "health": {
+            "data_age_seconds": 0.0,
+            "clock_skew_seconds": 0.0,
+            "exchange_connected": True,
+            "database_healthy": True,
+        },
+        "drift": {"execution_drift": False, "model_drift": False},
+    }
+    for kind, values in source_values.items():
+        store.save(
+            {
+                "kind": kind,
+                "product_id": product_id,
+                "observed_at": NOW,
+                "values": values,
+            },
+            created_at=NOW,
+        )
+    worker = DatabasePortfolioStateWorker(queue=queue, worker_id="state-worker", store=store)
+    state_policy = _policy()
+    assert (
+        worker.schedule_from_latest(
+            products={product_id: {}}, state_policies={product_id: state_policy}, now=NOW
+        )
+        == 1
+    )
+    with database.engine.connect() as connection:
+        old_job_id = connection.execute(
+            select(job.c.id).where(
+                job.c.name == "portfolio_state_publish", job.c.state == "pending"
+            )
+        ).scalar_one()
+
+    rejected = worker.run_once(now=NOW)
+
+    assert rejected["reason_code"] == "portfolio_state_publish_rejected"
+    assert rejected["missing_fields"] == [
+        "cluster_fraction_caps",
+        "clusters",
+        "daily_pnl_fraction",
+        "global_drawdown_fraction",
+        "product_drawdown_fraction",
+        "trades_today",
+    ]
+    with database.engine.connect() as connection:
+        state, attempts = connection.execute(
+            select(job.c.state, job.c.attempts).where(job.c.id == old_job_id)
+        ).one()
+        outcome = connection.execute(
+            select(job_attempt.c.payload).where(job_attempt.c.job_id == old_job_id)
+        ).scalar_one()
+    assert state == "completed" and attempts == 1
+    assert outcome == {
+        "outcome_category": "blocked_data",
+        "reason_code": "portfolio_state_source_incomplete",
+        "missing_fields": rejected["missing_fields"],
+    }
+    with pytest.raises(KeyError, match="canonical_portfolio_risk_state"):
+        store.latest(kind="canonical_portfolio_risk_state", product_id=product_id, at=NOW)
+    assert (
+        worker.schedule_from_latest(
+            products={product_id: {}}, state_policies={product_id: state_policy}, now=NOW
+        )
+        == 0
+    )
+
+    later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=1)).isoformat()
+    measured_positions = {
+        "positions": {},
+        "product_drawdown_fraction": 0.04,
+        "daily_pnl_fraction": -0.02,
+        "global_drawdown_fraction": 0.03,
+        "trades_today": 4,
+        "clusters": {instrument_id: "btc"},
+        "cluster_fraction_caps": {"btc": 0.4},
+        "open_exposure_fraction": 0.0,
+        "pending_exposure_fraction": 0.0,
+    }
+    store.save(
+        {
+            "kind": "positions",
+            "product_id": product_id,
+            "observed_at": later,
+            "values": measured_positions,
+        },
+        created_at=later,
+    )
+
+    assert (
+        worker.schedule_from_latest(
+            products={product_id: {}}, state_policies={product_id: state_policy}, now=later
+        )
+        == 1
+    )
+    with database.engine.connect() as connection:
+        new_job_id = connection.execute(
+            select(job.c.id).where(
+                job.c.name == "portfolio_state_publish", job.c.state == "pending"
+            )
+        ).scalar_one()
+    assert new_job_id != old_job_id
+    assert worker.run_once(now=later)["reason_code"] == "canonical_portfolio_state_published"
+    _, published = store.latest(
+        kind="canonical_portfolio_risk_state", product_id=product_id, at=later
+    )
+    assert published["product_drawdown_fraction"] == pytest.approx(0.04)
+    assert published["daily_pnl_fraction"] == pytest.approx(-0.02)
+    assert published["global_drawdown_fraction"] == pytest.approx(0.03)
+    assert published["trades_today"] == 4
+    assert published["clusters"] == {instrument_id: "btc"}
+    assert published["cluster_fraction_caps"] == {"btc": 0.4}
+    database.dispose()
+
+
+def test_portfolio_policy_cannot_override_measured_health_fields(tmp_path):
+    from src.data.database import job_attempt
+    from src.services.portfolio_state import InvalidPortfolioStatePolicy
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'invalid-state-policy.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="state-worker",
+        node_id="linux-optiplex",
+        role="portfolio-state-service",
+        capabilities=("portfolio_state_publish",),
+        observed_at=NOW,
+    )
+    store = SqlRiskSnapshotStore(database.engine)
+    product_id = "active_income"
+    instrument_id = "binance:futures:BTCUSDT:USDT"
+    source_values = {
+        "balances": {"balances": {"USDT": 1000.0}},
+        "positions": {
+            "positions": {},
+            "product_drawdown_fraction": 0.04,
+            "daily_pnl_fraction": -0.02,
+            "global_drawdown_fraction": 0.03,
+            "trades_today": 4,
+            "clusters": {instrument_id: "btc"},
+            "cluster_fraction_caps": {"btc": 0.4},
+            "open_exposure_fraction": 0.0,
+            "pending_exposure_fraction": 0.0,
+        },
+        "open_orders": {"open_orders": []},
+        "account": {
+            "used_margin_fraction": 0.0,
+            "liquidation_buffer_fraction": 1.0,
+            "unknown_exposure": {"unresolved": 10.0},
+        },
+        "market": {
+            "market": {
+                instrument_id: {
+                    "price": 100.0,
+                    "spread_bps": 1.0,
+                    "visible_depth_quote": 100_000.0,
+                    "volatility": 0.01,
+                    "funding": 0.0,
+                }
+            },
+            "correlations": {},
+            "beta": {},
+            "risk_data_available": False,
+            "risk_data_missing": ["factor_estimates"],
+        },
+        "health": {
+            "data_age_seconds": 0.0,
+            "clock_skew_seconds": 0.0,
+            "exchange_connected": False,
+            "database_healthy": False,
+        },
+        "drift": {"execution_drift": False, "model_drift": False},
+    }
+    for kind, values in source_values.items():
+        store.save(
+            {
+                "kind": kind,
+                "product_id": product_id,
+                "observed_at": NOW,
+                "values": values,
+            },
+            created_at=NOW,
+        )
+
+    state_policy = _policy()
+    malicious_policy = {
+        **state_policy,
+        "balances": {"USDT": 1000.0},
+        "cluster_fraction_caps": {"btc": 1.0},
+        "clusters": {instrument_id: "btc"},
+        "database_healthy": True,
+        "exchange_connected": True,
+        "factor_estimates": {},
+        "positions": {},
+        "product_drawdown_fraction": 0.0,
+        "risk_data_available": True,
+        "risk_data_missing": [],
+        "trades_today": 0,
+        "unknown_exposure": {},
+    }
+    worker = DatabasePortfolioStateWorker(queue=queue, worker_id="state-worker", store=store)
+
+    with pytest.raises(InvalidPortfolioStatePolicy):
+        worker.schedule_from_latest(
+            products={product_id: {}},
+            state_policies={product_id: malicious_policy},
+            now=NOW,
+        )
+    with database.engine.connect() as connection:
+        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 0
+
+    source_ids = {
+        source: store.latest(
+            kind=source, product_id=product_id, at=NOW, require_source_envelope=True
+        )[0]
+        for source in worker.REQUIRED_SOURCES
+    }
+    policy_hash = canonical_hash(malicious_policy)
+    job_id = "portfolio-state:" + canonical_hash(
+        {
+            "product_id": product_id,
+            "source_snapshot_ids": source_ids,
+            "risk_policy_hash": policy_hash,
+        }
+    ).removeprefix("sha256:")
+    queue.enqueue(
+        job_id=job_id,
+        name="portfolio_state_publish",
+        payload={
+            "product_id": product_id,
+            "observed_at": NOW,
+            "source_snapshot_ids": source_ids,
+            "risk_policy": malicious_policy,
+            "risk_policy_hash": policy_hash,
+        },
+        available_at=NOW,
+        priority=25,
+        producer_identity="portfolio-state-service",
+    )
+
+    rejected = worker.run_once(now=NOW)
+
+    assert rejected["reason_code"] == "portfolio_state_publish_rejected"
+    assert rejected["error_type"] == "InvalidPortfolioStatePolicy"
+    with database.engine.connect() as connection:
+        state, attempts = connection.execute(
+            select(job.c.state, job.c.attempts).where(job.c.id == job_id)
+        ).one()
+        outcome = connection.execute(
+            select(job_attempt.c.payload).where(job_attempt.c.job_id == job_id)
+        ).scalar_one()
+    assert state == "completed" and attempts == 1
+    assert outcome == {
+        "outcome_category": "blocked_infrastructure",
+        "reason_code": "portfolio_state_policy_invalid",
+        "invalid_fields": sorted(set(malicious_policy) - set(state_policy)),
+    }
+    with pytest.raises(KeyError, match="canonical_portfolio_risk_state"):
+        store.latest(kind="canonical_portfolio_risk_state", product_id=product_id, at=NOW)
+    database.dispose()
 
 
 def test_heartbeat_retention_is_bounded(tmp_path) -> None:
@@ -566,6 +872,16 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
     assert accounting.run_once(now=NOW)["reason_code"] == "accounting_event_recorded"
 
     snapshots = SqlRiskSnapshotStore(database.engine)
+    legacy_positions_at = (dt.datetime.fromisoformat(NOW) - dt.timedelta(seconds=1)).isoformat()
+    legacy_positions_id = snapshots.save(
+        {
+            "kind": "positions",
+            "product_id": "active_income",
+            "observed_at": legacy_positions_at,
+            "values": {"positions": {}},
+        },
+        created_at=legacy_positions_at,
+    )
     source_service = DatabasePortfolioSourceService(
         engine=database.engine,
         store=snapshots,
@@ -594,6 +910,22 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
         )
         == 1
     )
+    current_positions_id, current_positions = snapshots.latest(
+        kind="positions",
+        product_id="active_income",
+        at=NOW,
+        require_source_envelope=True,
+    )
+    assert current_positions_id != legacy_positions_id
+    assert current_positions["observed_at"] == NOW
+    assert {
+        "product_drawdown_fraction",
+        "daily_pnl_fraction",
+        "global_drawdown_fraction",
+        "trades_today",
+        "clusters",
+        "cluster_fraction_caps",
+    }.issubset(current_positions["values"])
     assert worker.run_once(now=NOW)["reason_code"] == "canonical_portfolio_state_published"
     with database.engine.connect() as connection:
         risk_snapshot_count = connection.execute(

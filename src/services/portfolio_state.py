@@ -25,9 +25,35 @@ from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
 from src.risk.engine import SqlRiskSnapshotStore
 from src.risk.policy import risk_policy_identity
 from src.services.accounting_service import AccountingService
-from src.services.portfolio_engine import _canonical_portfolio_state
+from src.services.portfolio_engine import IncompletePortfolioState, _canonical_portfolio_state
 from src.services.risk_state import PortfolioRiskCalculator
 from src.services.scheduler import DatabaseJobQueue
+
+_PORTFOLIO_STATE_POLICY_FIELDS = frozenset(
+    {
+        "maximum_state_age_seconds",
+        "risk_policy_ids",
+        "portfolio_risk_budget",
+        "maximum_symbol_fraction",
+        "maximum_abs_beta",
+        "maximum_correlation",
+        "maximum_turnover_fraction",
+        "maximum_cluster_fraction",
+        "maximum_product_drawdown_fraction",
+        "maximum_depth_participation",
+        "sleeve_budgets",
+    }
+)
+
+
+class InvalidPortfolioStatePolicy(ValueError):
+    """A state job policy contains fields outside the configured limits."""
+
+    def __init__(self, invalid_fields: tuple[str, ...]) -> None:
+        self.invalid_fields = invalid_fields
+        super().__init__(
+            "portfolio state risk policy contains unsupported fields: " + ", ".join(invalid_fields)
+        )
 
 
 def _marked_equity_amount(nav: NavSnapshot | None) -> float | None:
@@ -214,7 +240,9 @@ class DatabasePortfolioSourceService:
         self.publish(
             product_id=product_id,
             kind="positions",
-            observed_at=positions_at or observed_at,
+            # Risk measurements in this source also depend on balance, order,
+            # and market inputs, so its timestamp must cover those inputs.
+            observed_at=observed_at,
             values={
                 "positions": positions,
                 "product_drawdown_fraction": measurements.product_drawdown_fraction,
@@ -943,6 +971,9 @@ class DatabasePortfolioStateWorker:
             policy = state_policies.get(product_id)
             if not isinstance(policy, Mapping):
                 raise ValueError(f"portfolio state policy is missing for {product_id}")
+            invalid_policy_fields = tuple(sorted(set(policy) - _PORTFOLIO_STATE_POLICY_FIELDS))
+            if invalid_policy_fields:
+                raise InvalidPortfolioStatePolicy(invalid_policy_fields)
             policy_hash = canonical_hash(dict(policy))
             observed_at = max(source_observed_at, default=now)
             payload = {
@@ -1018,25 +1049,10 @@ class DatabasePortfolioStateWorker:
             raise ValueError("portfolio state job requires immutable risk policy values")
         if policy_hash != canonical_hash(dict(policy)):
             raise ValueError("portfolio state risk policy hash is invalid")
-        measured_fields = {
-            key: assembled[key]
-            for key in {
-                "product_drawdown_fraction",
-                "daily_pnl_fraction",
-                "global_drawdown_fraction",
-                "trades_today",
-                "correlations",
-                "factor_estimates",
-                "beta",
-                "clusters",
-                "cluster_fraction_caps",
-                "open_exposure_fraction",
-                "pending_exposure_fraction",
-            }
-            if key in assembled
-        }
+        invalid_policy_fields = tuple(sorted(set(policy) - _PORTFOLIO_STATE_POLICY_FIELDS))
+        if invalid_policy_fields:
+            raise InvalidPortfolioStatePolicy(invalid_policy_fields)
         assembled.update(policy)
-        assembled.update(measured_fields)
         return self.publisher.publish(assembled)
 
     def _validated_job_identity(
@@ -1083,6 +1099,34 @@ class DatabasePortfolioStateWorker:
 
     def _handle_failure(self, claimed, now: str, exc: Exception) -> dict[str, Any]:
         error = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, IncompletePortfolioState):
+            outcome = {
+                "outcome_category": "blocked_data",
+                "reason_code": "portfolio_state_source_incomplete",
+                "missing_fields": list(exc.missing_fields),
+            }
+            self.queue.complete(claimed, completed_at=now, outcome=outcome)
+            return {
+                "reason_code": "portfolio_state_publish_rejected",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": error,
+                "missing_fields": list(exc.missing_fields),
+            }
+        if isinstance(exc, InvalidPortfolioStatePolicy):
+            outcome = {
+                "outcome_category": "blocked_infrastructure",
+                "reason_code": "portfolio_state_policy_invalid",
+                "invalid_fields": list(exc.invalid_fields),
+            }
+            self.queue.complete(claimed, completed_at=now, outcome=outcome)
+            return {
+                "reason_code": "portfolio_state_publish_rejected",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": error,
+                "invalid_fields": list(exc.invalid_fields),
+            }
         if str(exc) == "exchange and database health are required for new exposure":
             self.queue.complete(claimed, completed_at=now)
             return {

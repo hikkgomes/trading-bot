@@ -633,7 +633,7 @@ def test_scoped_backup_enumeration_skips_opposite_kind_removed_after_listing(tmp
     assert (store.root / "parquet-latest").is_dir()
 
 
-def test_backup_move_hashes_once_and_rejects_source_changes(tmp_path, monkeypatch):
+def test_backup_move_preserves_inode_and_rejects_source_changes(tmp_path, monkeypatch):
     import hashlib
 
     from src.services import backups
@@ -641,14 +641,7 @@ def test_backup_move_hashes_once_and_rejects_source_changes(tmp_path, monkeypatc
     source = tmp_path / "source.dump"
     source.write_bytes(b"verified backup bytes")
     source_inode = source.stat().st_ino
-    hash_calls = []
     file_hash = backups.file_hash
-
-    def count_hash(path):
-        hash_calls.append(path)
-        return file_hash(path)
-
-    monkeypatch.setattr(backups, "file_hash", count_hash)
     store = backups.BackupStore(tmp_path / "backups")
     bundle = store.create(
         backup_id="moved",
@@ -657,7 +650,6 @@ def test_backup_move_hashes_once_and_rejects_source_changes(tmp_path, monkeypatc
         move_sources=True,
     )
     destination = store.root / "moved/database.dump"
-    assert hash_calls == [source]
     assert destination.stat().st_ino == source_inode
     assert (
         bundle.files["database.dump"]
@@ -666,6 +658,8 @@ def test_backup_move_hashes_once_and_rejects_source_changes(tmp_path, monkeypatc
 
     changed_source = tmp_path / "changed.dump"
     changed_source.write_bytes(b"before")
+    unchanged_metadata = backups._file_identity(changed_source)
+    monkeypatch.setattr(backups, "_file_identity", lambda _path: unchanged_metadata)
     real_hash = file_hash
 
     def change_while_hashing(path):
@@ -674,7 +668,7 @@ def test_backup_move_hashes_once_and_rejects_source_changes(tmp_path, monkeypatc
         return digest
 
     monkeypatch.setattr(backups, "file_hash", change_while_hashing)
-    with pytest.raises(RuntimeError, match="changed while hashing"):
+    with pytest.raises(RuntimeError, match="changed while verifying"):
         store.create(
             backup_id="changed",
             created_at="2026-01-02T00:00:00+00:00",
@@ -775,7 +769,7 @@ def test_backup_restart_removes_only_unpublished_builds(tmp_path, monkeypatch):
     assert (root / ".parquet-build-link").is_symlink()
 
 
-def test_postgresql_maintenance_overlaps_parquet_and_scopes_cleanup(tmp_path, monkeypatch):
+def test_backup_commands_serialise_operations_and_scope_cleanup(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     from unittest.mock import Mock
@@ -802,12 +796,15 @@ def test_postgresql_maintenance_overlaps_parquet_and_scopes_cleanup(tmp_path, mo
     arguments = ["--mode", "postgresql", "--config", str(tmp_path / "config")]
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        with acquire_file_update_lock(root / "maintenance-parquet", label="test parquet writer"):
+        with acquire_file_update_lock(root / "maintenance-backup", label="test backup operation"):
             future = executor.submit(backup_service.main, arguments)
-            future.result(timeout=5)
-            assert created.is_set()
+            assert not created.wait(timeout=0.1)
             assert parquet_active.is_dir()
-            assert not postgres_abandoned.exists()
+            assert postgres_abandoned.exists()
+        future.result(timeout=5)
+        assert created.is_set()
+        assert parquet_active.is_dir()
+        assert not postgres_abandoned.exists()
 
         postgres_active = root / ".postgresql-build-running"
         postgres_active.mkdir()
@@ -822,6 +819,21 @@ def test_postgresql_maintenance_overlaps_parquet_and_scopes_cleanup(tmp_path, mo
         future.result(timeout=5)
         assert created.is_set()
         assert not postgres_active.exists()
+
+        from src.services import offsite_backup
+
+        monkeypatch.setattr(offsite_backup, "load_platform_config", lambda _: config)
+        for name in ("RESTIC_REPOSITORY", "RESTIC_PASSWORD_FILE", "RCLONE_CONFIG"):
+            monkeypatch.setenv(name, "unused-by-mocked-capture")
+        monkeypatch.setattr(
+            offsite_backup, "_capture_offsite", Mock(side_effect=lambda *_: created.set() or {})
+        )
+        created.clear()
+        with acquire_file_update_lock(root / "maintenance-backup", label="test database backup"):
+            future = executor.submit(offsite_backup.run_offsite_backup, tmp_path / "config")
+            assert not created.wait(timeout=0.1)
+        assert future.result(timeout=5) == {}
+        assert created.is_set()
 
 
 def test_backup_verification_rehearses_newest_database_and_writes_bound_receipt(
@@ -982,7 +994,187 @@ def test_failed_cloud_restore_preserves_verified_receipt_and_retained_snapshots(
     with pytest.raises(ValueError, match="regular file"):
         offsite_backup._capture_offsite(tmp_path / "config/platform.json", config, tmp_path)
     assert (tmp_path / "offsite-latest.json").read_bytes() == old_receipt
-    assert [call.args[1] for call in restic.call_args_list] == ["backup", "check", "restore"]
+    assert [call.args[1] for call in restic.call_args_list] == [
+        "snapshots",
+        "backup",
+        "check",
+        "restore",
+    ]
+
+
+def test_restic_uses_long_rclone_open_timeout_and_parses_json_arrays(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+
+    outputs = iter(
+        (
+            '[{"id":"snapshot-id","time":"2026-10-18T00:00:00Z"}]\n',
+            '{"message_type":"status","percent_done":0.5}\n'
+            '{"message_type":"summary","snapshot_id":"' + "a" * 64 + '"}\n',
+        )
+    )
+    run = Mock(
+        side_effect=lambda _command, **kwargs: (
+            kwargs["stdout"].write(next(outputs)),
+            SimpleNamespace(returncode=0),
+        )[1]
+    )
+    monkeypatch.setattr(offsite_backup.subprocess, "run", run)
+    monkeypatch.setenv("RESTIC_REPOSITORY", "rclone:drive:platform")
+
+    snapshots = offsite_backup._restic(tmp_path, "snapshots", "--json")
+
+    assert snapshots == [{"id": "snapshot-id", "time": "2026-10-18T00:00:00Z"}]
+    assert run.call_args.args[0] == [
+        "restic",
+        "-o",
+        "rclone.timeout=5m",
+        "snapshots",
+        "--json",
+    ]
+
+    monkeypatch.setenv("RESTIC_REPOSITORY", str(tmp_path / "local-repository"))
+    summaries = offsite_backup._restic(tmp_path, "backup", "--json")
+
+    assert summaries == [{"message_type": "summary", "snapshot_id": "a" * 64}]
+    assert run.call_args.args[0] == ["restic", "backup", "--json"]
+
+
+def test_offsite_preflights_cloud_before_database_capture(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+
+    restic = Mock(side_effect=RuntimeError("repository unavailable"))
+    pin_database = Mock()
+    monkeypatch.setattr(offsite_backup, "_restic", restic)
+    monkeypatch.setattr(offsite_backup, "_pin_database", pin_database)
+    config = SimpleNamespace(
+        paths={"parquet": str(tmp_path / "data"), "artefacts": str(tmp_path / "artefacts")},
+        backup={"hourly_retention_hours": 6, "retention_days": 7},
+    )
+
+    with pytest.raises(RuntimeError, match="repository unavailable"):
+        offsite_backup._capture_offsite(tmp_path / "config/platform.json", config, tmp_path)
+
+    restic.assert_called_once_with(tmp_path, "snapshots", "--json")
+    pin_database.assert_not_called()
+
+
+def test_offsite_reuses_newest_verified_postgresql_dump_within_one_hour(tmp_path, monkeypatch):
+    import datetime as dt
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+    from src.services.backups import BackupStore
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    store = BackupStore(root)
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    source = tmp_path / "database.dump"
+    backups = (
+        ("postgresql-boundary", 3600, b"exactly-one-hour"),
+        ("postgresql-stale", 3601, b"too-old"),
+        ("postgresql-reused", 600, b"newest-verified"),
+        ("postgresql-corrupt", 120, b"corrupt-latest"),
+        ("postgresql-future", -1, b"future"),
+    )
+    for backup_id, age_seconds, contents in backups:
+        source.write_bytes(contents)
+        store.create(
+            backup_id=backup_id,
+            created_at=(now - dt.timedelta(seconds=age_seconds)).isoformat(),
+            files={"database.dump": source},
+        )
+        if backup_id == "postgresql-corrupt":
+            (root / backup_id / "database.dump").write_bytes(b"changed-after-publish")
+    source.write_bytes(b"multi-file-database")
+    extra = tmp_path / "extra.receipt"
+    extra.write_bytes(b"extra")
+    store.create(
+        backup_id="postgresql-mixed",
+        created_at=(now - dt.timedelta(seconds=60)).isoformat(),
+        files={"database.dump": source, "extra.receipt": extra},
+    )
+    monkeypatch.setattr(
+        offsite_backup,
+        "create_database_backup",
+        Mock(side_effect=AssertionError("recent verified dump should be reused")),
+    )
+
+    pinned, manifest = offsite_backup._pin_database(
+        tmp_path / "config/platform.json", root, now=now
+    )
+
+    assert manifest["backup_id"] == "postgresql-reused"
+    assert manifest["files"] == {
+        "database.dump": offsite_backup.file_hash(root / "postgresql-reused/database.dump")
+    }
+    assert (pinned / "database.dump").read_bytes() == b"newest-verified"
+    assert (pinned / "database.dump").stat().st_ino == (
+        root / "postgresql-reused/database.dump"
+    ).stat().st_ino
+
+    boundary_root = tmp_path / "boundary-backups"
+    boundary_store = BackupStore(boundary_root)
+    source.write_bytes(b"one-hour-boundary")
+    boundary_store.create(
+        backup_id="postgresql-boundary",
+        created_at=(now - dt.timedelta(seconds=3600)).isoformat(),
+        files={"database.dump": source},
+    )
+    boundary_pinned, boundary_manifest = offsite_backup._pin_database(
+        tmp_path / "config/platform.json", boundary_root, now=now
+    )
+    assert boundary_manifest["backup_id"] == "postgresql-boundary"
+    assert (boundary_pinned / "database.dump").read_bytes() == b"one-hour-boundary"
+
+
+def test_offsite_falls_back_to_fresh_dump_when_local_dumps_are_stale_or_future(
+    tmp_path, monkeypatch
+):
+    import datetime as dt
+    from unittest.mock import Mock
+
+    from src.services import offsite_backup
+    from src.services.backups import BackupStore
+
+    root = tmp_path / "backups"
+    store = BackupStore(root)
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    source = tmp_path / "old.dump"
+    for backup_id, age_seconds in (("postgresql-stale", 3601), ("postgresql-future", -1)):
+        source.write_text(backup_id)
+        store.create(
+            backup_id=backup_id,
+            created_at=(now - dt.timedelta(seconds=age_seconds)).isoformat(),
+            files={"database.dump": source},
+        )
+    fresh_source = tmp_path / "fresh.dump"
+    fresh_source.write_bytes(b"new-capture")
+    fresh_id = "postgresql-fresh"
+    create = Mock(
+        side_effect=lambda **_: (
+            store.create(
+                backup_id=fresh_id,
+                created_at=now.isoformat(),
+                files={"database.dump": fresh_source},
+            ),
+            fresh_id,
+        )[1]
+    )
+    monkeypatch.setattr(offsite_backup, "create_database_backup", create)
+
+    pinned, manifest = offsite_backup._pin_database(
+        tmp_path / "config/platform.json", root, now=now
+    )
+
+    create.assert_called_once_with(config_path=tmp_path / "config/platform.json")
+    assert manifest["backup_id"] == fresh_id
+    assert (pinned / "database.dump").read_bytes() == b"new-capture"
 
 
 def test_cloud_restore_checks_both_database_and_canonical_data_bytes(tmp_path, monkeypatch):

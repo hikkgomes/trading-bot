@@ -880,9 +880,6 @@ def _install_risk_policy(database: PlatformDatabase, policy_id: str, account_id:
 def _smoke_state_policy(product: dict[str, Any], instrument: Instrument) -> dict[str, Any]:
     return {
         "maximum_state_age_seconds": 5,
-        "product_drawdown_fraction": 0.0,
-        "daily_pnl_fraction": 0.0,
-        "global_drawdown_fraction": 0.0,
         "risk_policy_ids": [str(product["risk_policy_id"])],
         "portfolio_risk_budget": 0.5,
         "maximum_symbol_fraction": 0.2,
@@ -893,9 +890,6 @@ def _smoke_state_policy(product: dict[str, Any], instrument: Instrument) -> dict
         "maximum_product_drawdown_fraction": 0.2,
         "maximum_depth_participation": 0.1,
         "sleeve_budgets": {"directional": 1.0},
-        "clusters": {instrument.instrument_id: "btc"},
-        "cluster_fraction_caps": {"btc": 1.0},
-        "trades_today": 0,
     }
 
 

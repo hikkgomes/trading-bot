@@ -338,6 +338,103 @@ def lifecycle_database(request, tmp_path):
         admin.dispose()
 
 
+def test_candidate_stage_job_lookups_preserve_candidate_stage_and_state_boundaries(
+    lifecycle_database,
+):
+    from sqlalchemy import insert, update
+
+    from src.data.database import job
+
+    database = lifecycle_database
+    scheduler = PlatformScheduler(
+        engine=database.engine,
+        products={"active_income": {"product_id": "active_income"}},
+        node_id="fixture",
+    )
+    rows = (
+        (
+            "pending-target",
+            "pending",
+            {"candidate_id": "target", "requested_stage": "development"},
+        ),
+        (
+            "running-target",
+            "running",
+            {"candidate_id": "target", "requested_stage": "screening"},
+        ),
+        (
+            "completed-target",
+            "completed",
+            {"candidate_id": "target", "requested_stage": "screening"},
+        ),
+        (
+            "dead-target",
+            "dead_letter",
+            {"candidate_id": "target", "requested_stage": "development"},
+        ),
+        (
+            "dead-other-stage",
+            "dead_letter",
+            {"candidate_id": "target", "requested_stage": "screening"},
+        ),
+        (
+            "pending-other-candidate",
+            "pending",
+            {"candidate_id": "other", "requested_stage": "screening"},
+        ),
+        (
+            "pending-numeric-candidate",
+            "pending",
+            {"candidate_id": 123, "requested_stage": "screening"},
+        ),
+        (
+            "pending-numeric-stage",
+            "pending",
+            {"candidate_id": "123", "requested_stage": 1},
+        ),
+    )
+    with database.engine.begin() as connection:
+        for job_id, state, payload in rows:
+            connection.execute(
+                insert(job).values(
+                    id=job_id,
+                    name="evaluate_candidate",
+                    state=state,
+                    priority=0,
+                    available_at=NOW,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    attempts=0,
+                    max_attempts=3,
+                    terminal_reason=None,
+                    producer_identity="fixture",
+                    content_hash=canonical_hash({"job_id": job_id}),
+                    payload=payload,
+                )
+            )
+
+    assert scheduler._candidate_stage_job_pending("target", "screening") is True
+    assert scheduler._candidate_stage_job_pending("target", "development") is True
+    assert scheduler._candidate_stage_job_pending("target", "protected") is False
+    assert scheduler._candidate_stage_job_pending("123", "screening") is False
+    assert scheduler._candidate_stage_job_pending("target", "1") is False
+    assert scheduler._candidate_stage_dead_letter("target", "development") is True
+    assert scheduler._candidate_stage_dead_letter("target", "screening") is True
+    assert scheduler._candidate_stage_dead_letter("target", "protected") is False
+
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(job)
+            .where(job.c.id.in_(("pending-target", "running-target")))
+            .values(state="completed")
+        )
+        connection.execute(update(job).where(job.c.id == "dead-target").values(state="completed"))
+
+    assert scheduler._candidate_stage_job_pending("target", "screening") is False
+    assert scheduler._candidate_stage_job_pending("target", "development") is False
+    assert scheduler._candidate_stage_dead_letter("target", "development") is False
+
+
 def _bundle(database, *, source_revision=0, extra_market_scale=None, data_plan_id=None):
     instrument = Instrument(
         venue="binance",

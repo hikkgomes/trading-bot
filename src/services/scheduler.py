@@ -637,31 +637,55 @@ class PlatformScheduler:
             )
 
     def _candidate_stage_job_pending(self, candidate_id: str, stage: str) -> bool:
+        conditions = [
+            job.c.name == "evaluate_candidate",
+            job.c.state.in_(("pending", "running")),
+            job.c.payload["candidate_id"].as_string() == candidate_id,
+            job.c.payload["requested_stage"].as_string() == stage,
+        ]
+        if self.engine.dialect.name == "postgresql":
+            conditions.extend(
+                (
+                    func.jsonb_typeof(job.c.payload.op("->")("candidate_id")) == "string",
+                    func.jsonb_typeof(job.c.payload.op("->")("requested_stage")) == "string",
+                )
+            )
+        elif self.engine.dialect.name == "sqlite":
+            conditions.extend(
+                (
+                    func.json_type(job.c.payload, "$.candidate_id") == "text",
+                    func.json_type(job.c.payload, "$.requested_stage") == "text",
+                )
+            )
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(job.c.state, job.c.payload).where(job.c.name == "evaluate_candidate")
-            ).mappings()
-        return any(
-            str(row["state"]) in {"pending", "running"}
-            and isinstance(row["payload"], Mapping)
-            and row["payload"].get("candidate_id") == candidate_id
-            and row["payload"].get("requested_stage") == stage
-            for row in rows
-        )
+            return (
+                connection.execute(select(job.c.id).where(*conditions).limit(1)).first() is not None
+            )
 
     def _candidate_stage_dead_letter(self, candidate_id: str, stage: str) -> bool:
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(job.c.payload).where(
-                    job.c.name == "evaluate_candidate",
-                    job.c.state == "dead_letter",
+        conditions = [
+            job.c.name == "evaluate_candidate",
+            job.c.state == "dead_letter",
+            job.c.payload["candidate_id"].as_string() == candidate_id,
+            job.c.payload["requested_stage"].as_string() == stage,
+        ]
+        if self.engine.dialect.name == "postgresql":
+            conditions.extend(
+                (
+                    func.jsonb_typeof(job.c.payload.op("->")("candidate_id")) == "string",
+                    func.jsonb_typeof(job.c.payload.op("->")("requested_stage")) == "string",
                 )
-            ).scalars()
-            return any(
-                isinstance(payload, Mapping)
-                and payload.get("candidate_id") == candidate_id
-                and payload.get("requested_stage") == stage
-                for payload in rows
+            )
+        elif self.engine.dialect.name == "sqlite":
+            conditions.extend(
+                (
+                    func.json_type(job.c.payload, "$.candidate_id") == "text",
+                    func.json_type(job.c.payload, "$.requested_stage") == "text",
+                )
+            )
+        with self.engine.connect() as connection:
+            return (
+                connection.execute(select(job.c.id).where(*conditions).limit(1)).first() is not None
             )
 
     def _mark_candidate_dead_letter(self, candidate_id: str, stage: str, now: str) -> None:
